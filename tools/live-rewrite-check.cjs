@@ -234,7 +234,7 @@ async function main() {
   console.log("расширение в профиле: %s", EXT_ID);
 
   const settings = {};
-  for (const k of ["aiKey", "aiBaseUrl", "aiModel", "aiEnabled", "aiPrompt", "aiPreset", "pixabayKey", "imgSource"]) {
+  for (const k of ["aiKey", "aiBaseUrl", "aiModel", "aiEnabled", "aiPrompt", "aiPreset"]) {
     if (st[k] !== undefined) settings[k] = st[k];
   }
   // Адрес и модель можно подставить, чтобы проверить «а если поправить» — не

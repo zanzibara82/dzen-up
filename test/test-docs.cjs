@@ -144,11 +144,7 @@ const NUMERIC = [
   ["background.js", bg, "CHANNEL_TTL", (v) => v / 3600000 + " часов", "кэш карты канала", ["README.md", "popup.html"]],
   ["background.js", bg, "CHANNEL_MAX_PAGES", (v) => "до " + v + " страниц", "лимит обхода ленты"],
   ["background.js", bg, "SITEMAP_MAX_URLS", (v) => "до " + v + " адресов", "лимит адресов карты"],
-  ["background.js", bg, "IMAGE_COUNT", (v) => v + " картинок", "сколько картинок за запрос"],
-  ["background.js", bg, "IMAGE_CACHE_TTL", (v) => v / 3600000 + " часа", "срок жизни кэша картинок"],
-  ["background.js", bg, "IMAGE_QUERIES_MAX", (v) => "до " + v + " коротких фраз", "сколько фраз предлагает модель"],
   ["content.js", content, "EDITOR_MIN_CHARS", (v) => "от " + v + " символов", "порог «это редактор»"],
-  ["content.js", content, "IMAGE_MAX_IN_ARTICLE", (v) => "не больше " + v + " картинок", "лимит картинок на статью"],
   ["content.js", content, "EDGE_ZONE", (v) => "ближе " + v + " px", "зона бокового режима"]
 ];
 
@@ -328,11 +324,7 @@ const SETTING_DOC = {
   aiModel: "модель",
   aiKey: "ключ",
   aiPreset: "Стиль рерайта",
-  aiPrompt: "Промпт рерайтера",
-  imgKey: "Ключ Yandex Search API",
-  imgFolder: "folder ID Яндекс Облака",
-  imgSource: "Источник картинок",
-  pixabayKey: "Ключ Pixabay"
+  aiPrompt: "Промпт рерайтера"
 };
 
 const keys = defaultsKeys(bg);
@@ -372,30 +364,29 @@ for (const n of presetNames) check("стиль «" + n + "» есть в presets
 
 // ----------------------------- 2г. кнопка проверки ключа: README и попап ---
 // Кнопка — часть того же экрана настроек, и в README она описана. Держим вместе
-// три вещи, которые разъезжаются по отдельности: сама надпись, по кнопке на
-// каждый ключ и строка рядом, куда падает ответ.
+// три вещи, которые разъезжаются по отдельности: сама надпись, кнопка у поля
+// ключа и строка рядом, куда падает ответ.
 const CHECK_LABEL = "Проверить ключ";
 check("README называет кнопку проверки ключа", inReadme(CHECK_LABEL), "«" + CHECK_LABEL + "»");
 const checkButtons = (popupHtml.match(/class="ghost check"/g) || []).length;
-check("в попапе по кнопке на каждый ключ", checkButtons === 2, "кнопок: " + checkButtons);
-check("надпись кнопки дословно есть в попапе", (popupHtml.match(new RegExp(CHECK_LABEL, "g")) || []).length >= 2);
+check("в попапе кнопка у поля ключа одна", checkButtons === 1, "кнопок: " + checkButtons);
+check("надпись кнопки дословно есть в попапе", (popupHtml.match(new RegExp(CHECK_LABEL, "g")) || []).length >= 1);
 const checkStatus = (popupHtml.match(/check-status/g) || []).length;
-check("под каждой кнопкой есть строка для ответа", checkStatus >= 2, "строк: " + checkStatus);
+check("под кнопкой есть строка для ответа", checkStatus >= 1, "строк: " + checkStatus);
 
 // README обещает две вещи, которые легко потерять при правке кода. Обещания
 // проверяем как обещания: если поведение изменится, README придётся поправить.
 check("README: проверка берёт то, что вписано в поля сейчас", inReadme("вписано в поля сейчас"));
 check("README: без ключа в сеть никто не идёт", inReadme("в сеть никто не идёт"));
-check("README: сказано, что запросы платные и идут по нажатию", inReadme("только по нажатию") && inReadme("платные"));
+check("README: сказано, что запрос платный и идёт по нажатию", inReadme("только по нажатию") && inReadme("платный"));
 
-// ------------------------------------------- 2д. где брать ключи: адреса ---
-// Живой случай: README писал «свой ключ с pixabay.com», и человек всё равно
+// ------------------------------------------- 2д. где брать ключ: адреса ---
+// Живой случай: README писал «ключ на pixabay.com», и человек всё равно
 // спросил, где именно его взять. Адрес — это и есть инструкция, и он нужен в
 // обоих текстах: попап человек читает раньше, чем README.
 const KEY_SOURCES = [
-  ["pixabay.com/api/docs", "страница ключа Pixabay"],
-  ["AI Studio", "консоль, где выдаётся ключ Яндекса"],
-  ["Создать API-ключ", "кнопка, которой ключ Яндекса выдаётся"]
+  ["platform.openai.com/api-keys", "страница ключей OpenAI"],
+  ["openrouter.ai/keys", "страница ключей OpenRouter"]
 ];
 for (const [frag, what] of KEY_SOURCES) {
   check("ключи: в README назван " + what, inReadme(frag), "«" + frag + "»");
@@ -404,7 +395,7 @@ for (const [frag, what] of KEY_SOURCES) {
 
 // --------------------------------------------- 3. хранилища разложены как в README ---
 const localKeys = constArray(bg, "LOCAL_KEYS");
-const LOCAL_DOC = { glossary: "Глоссарий", aiKey: "API-ключ", imgKey: "Ключ Yandex Search API", imgFolder: "folder ID Яндекс Облака", pixabayKey: "Ключ Pixabay", linkSites: "список сайтов", linkChannels: "список каналов" };
+const LOCAL_DOC = { glossary: "Глоссарий", aiKey: "API-ключ", linkSites: "список сайтов", linkChannels: "список каналов" };
 for (const k of localKeys) {
   const frag = LOCAL_DOC[k];
   check("локальный ключ " + k + " назван в README", !!frag && inReadme(frag), frag ? "«" + frag + "»" : "нет описания в тесте");

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Дзен Рерайтер — перевод и рерайт статей",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "Выделите текст в редакторе Яндекс Дзен и нажмите иконку внизу окна — текст будет переведён и отрерайчен.",
   "minimum_chrome_version": "102",
   "permissions": ["storage", "contextMenus", "activeTab", "scripting"],
@@ -12,10 +12,7 @@
     "https://translate.googleapis.com/*",
     "https://api.mymemory.translated.net/*",
     "https://api.openai.com/*",
-    "https://openrouter.ai/*",
-    "https://searchapi.api.cloud.yandex.net/*",
-    "https://pixabay.com/*",
-    "https://api.openverse.org/*"
+    "https://openrouter.ai/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -20,10 +20,6 @@
     "aiKey",
     "aiPrompt",
     "aiPreset",
-    "imgKey",
-    "imgFolder",
-    "pixabayKey",
-    "imgSource",
     "linkSites",
     "linkChannels",
     "linkCount"
@@ -141,8 +137,6 @@
     $("preview").checked = settings.preview !== false;
     // пропуск уже переведённого включён по умолчанию — та же логика
     $("skipSameLang").checked = settings.skipSameLang !== false;
-    // Поля источника картинок — по сохранённому выбору, а не по порядку в списке.
-    showImgSource();
 
     // Стиль рерайта показываем по факту сохранённого промпта: если он не совпал
     // с текстом пресета, значит его правили руками (или он остался от прошлой
@@ -211,12 +205,12 @@
   // Проверяем то, что вписано в поля прямо сейчас, а не то, что сохранено:
   // иначе кнопка проверяла бы прошлую версию настроек, и человек чинил бы не то.
   // Запрос уходит в фон — у попапа нет прав на чужие домены.
-  async function checkKey(kind, btn, st, overrides) {
+  async function checkKey(btn, st, overrides) {
     btn.disabled = true;
     st.className = "hint";
     st.textContent = "⏳ Проверяю…";
     try {
-      var res = await send({ type: "checkKey", kind: kind, overrides: overrides });
+      var res = await send({ type: "checkKey", overrides: overrides });
       st.className = "hint" + (res.ok ? "" : " err");
       st.textContent = res.ok ? "✅ " + res.text : "❌ " + res.error;
     } catch (e) {
@@ -226,32 +220,6 @@
       btn.disabled = false;
     }
   }
-
-  // ---- подбор картинок: источник и его поля --------------------------------
-  // Показываем только поля выбранного источника: у Яндекса их два (ключ и
-  // folder ID), у Pixabay один (ключ), у Openverse ни одного. Держать на экране
-  // поля, которые ни на что не влияют, — верный способ вписать ключ не туда.
-  var IMG_CHECK_HINT = {
-    yandex:
-      "Проверка делает один настоящий поисковый запрос и просит одну картинку — этого " +
-      "хватает, чтобы отличить рабочий ключ от чужого или просроченного folder ID. " +
-      "Запрос платный, поэтому идёт только по нажатию.",
-    pixabay:
-      "Проверка делает один настоящий запрос к Pixabay. Он бесплатный: лимит — " +
-      "100 запросов в минуту на ключ.",
-    openverse:
-      "Ключ не нужен: Openverse отвечает анонимно (20 запросов в минуту и 200 в сутки). " +
-      "Кнопка проверяет, что сервис жив и отдаёт картинки."
-  };
-
-  function showImgSource() {
-    var src = $("imgSource").value;
-    $("img-yandex").hidden = src !== "yandex";
-    $("img-pixabay").hidden = src !== "pixabay";
-    $("img-check-hint").textContent = IMG_CHECK_HINT[src] || IMG_CHECK_HINT.yandex;
-  }
-
-  $("imgSource").addEventListener("change", showImgSource);
 
   // Домен AI-сервиса. В манифесте перечислены только openai и openrouter, а
   // адрес API настраивается — значит для своего адреса (z.ai, прокси, локальная
@@ -319,20 +287,10 @@
         return;
       }
     }
-    checkKey("ai", $("ai-check"), $("ai-check-status"), {
+    checkKey($("ai-check"), $("ai-check-status"), {
       aiBaseUrl: $("aiBaseUrl").value,
       aiModel: $("aiModel").value,
       aiKey: $("aiKey").value
-    });
-  });
-
-  $("img-check").addEventListener("click", function () {
-    // Источник тоже передаём: у каждого своя проверка, и кнопка одна на всех.
-    checkKey("images", $("img-check"), $("img-check-status"), {
-      imgSource: $("imgSource").value,
-      imgKey: $("imgKey").value,
-      imgFolder: $("imgFolder").value,
-      pixabayKey: $("pixabayKey").value
     });
   });
 
@@ -568,16 +526,11 @@
   });
 
   // ---- кэш -----------------------------------------------------------------
-  // Кэшей два, и кнопка одна: переводы и наборы картинок. В счётчике называем
-  // оба — иначе непонятно, что именно обнулилось.
+  // Кэш один — переводы. Счётчик называет его: иначе непонятно, что обнулилось.
   async function refreshCacheInfo() {
-    var st = await chrome.storage.local.get({ dzrCache: {}, dzrImages: {} });
+    var st = await chrome.storage.local.get({ dzrCache: {} });
     var n = Object.keys(st.dzrCache || {}).length;
-    var m = Object.keys(st.dzrImages || {}).length;
-    var bits = [];
-    if (n) bits.push("переводов: " + n);
-    if (m) bits.push("наборов картинок: " + m);
-    $("cache-info").textContent = bits.length ? "Сохранено " + bits.join(", ") : "Кэш пуст";
+    $("cache-info").textContent = n ? "Сохранено переводов: " + n : "Кэш пуст";
   }
 
   $("clear-cache").addEventListener("click", async function () {
@@ -585,7 +538,7 @@
     await refreshCacheInfo();
     var st = $("settings-status");
     st.className = "status";
-    st.textContent = "🧹 Кэш очищен: переводы и наборы картинок.";
+    st.textContent = "🧹 Кэш переводов очищен.";
   });
 
   refreshCacheInfo();
