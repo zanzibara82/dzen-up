@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Дзен Рерайтер</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        width: 420px;
+        margin: 0;
+        padding: 16px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        background: #0f0d1a;
+        color: #f4f2ff;
+        font-size: 13px;
+      }
+      h1 {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 15px;
+        margin: 0 0 4px;
+      }
+      .logo {
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, #7c3aed, #d946ef 55%, #f59e0b);
+        display: grid;
+        place-items: center;
+        font-weight: 800;
+        font-size: 13px;
+        color: #fff;
+      }
+      p.hint,
+      .hint {
+        margin: 0 0 14px;
+        color: #a39fc0;
+        font-size: 11.5px;
+        line-height: 1.45;
+      }
+      .row .hint {
+        margin: 0;
+      }
+      label {
+        display: block;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #8d88b0;
+        margin: 10px 0 4px;
+      }
+      select,
+      input,
+      textarea {
+        width: 100%;
+        background: #1a1730;
+        border: 1px solid #2e2a4d;
+        color: #f4f2ff;
+        border-radius: 10px;
+        padding: 8px 10px;
+        font-size: 12.5px;
+        font-family: inherit;
+        outline: none;
+      }
+      select:focus,
+      input:focus,
+      textarea:focus {
+        border-color: #7c3aed;
+      }
+      textarea {
+        resize: vertical;
+        min-height: 78px;
+        line-height: 1.45;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+      }
+      .row > * {
+        flex: 1;
+      }
+      button {
+        width: 100%;
+        margin-top: 12px;
+        padding: 10px 14px;
+        border: 0;
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 13px;
+        color: #fff;
+        cursor: pointer;
+        background: linear-gradient(135deg, #7c3aed, #d946ef 60%, #f59e0b);
+      }
+      button.ghost {
+        background: #1a1730;
+        border: 1px solid #2e2a4d;
+        font-weight: 600;
+      }
+      .tabs {
+        display: flex;
+        gap: 6px;
+        background: #17142a;
+        padding: 4px;
+        border-radius: 12px;
+        margin-bottom: 12px;
+      }
+      .tabs button {
+        margin: 0;
+        padding: 7px 10px;
+        background: transparent;
+        color: #a39fc0;
+        font-size: 12px;
+      }
+      .tabs button.active {
+        background: #2a2547;
+        color: #fff;
+      }
+      .panel[hidden] {
+        display: none;
+      }
+      .switch {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 12px;
+        font-size: 12.5px;
+        color: #d7d3f0;
+      }
+      .switch input {
+        width: auto;
+      }
+      .status {
+        margin-top: 10px;
+        font-size: 11.5px;
+        color: #86efac;
+        min-height: 15px;
+      }
+      .status.err {
+        color: #fca5a5;
+      }
+      /* Кнопки проверки стоят рядом с подсказкой, а не отдельной строкой:
+         общее правило button растягивает кнопку на всю ширину. */
+      button.check {
+        width: auto;
+        margin: 0;
+        padding: 6px 12px;
+        font-size: 12px;
+        flex: 0 0 auto;
+      }
+      .hint.err {
+        color: #fca5a5;
+      }
+      .badge {
+        display: inline-block;
+        font-size: 10.5px;
+        padding: 2px 7px;
+        border-radius: 999px;
+        background: #2a2547;
+        color: #c4b5fd;
+        margin-left: 6px;
+      }
+      kbd {
+        background: #2a2547;
+        border-radius: 5px;
+        padding: 1px 5px;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1><span class="logo">Д</span> Дзен Рерайтер <span class="badge">v1.0</span></h1>
+    <p class="hint">
+      Откройте редактор статьи на dzen.ru, выделите текст и нажмите иконку внизу окна или <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd>.
+    </p>
+
+    <div class="tabs">
+      <button id="tab-quick" class="active">Быстрый рерайт</button>
+      <button id="tab-settings">Настройки</button>
+    </div>
+
+    <div id="panel-quick" class="panel">
+      <label for="src">Исходный текст</label>
+      <textarea id="src" placeholder="Вставьте текст статьи на любом языке…"></textarea>
+      <button id="run">Перевести и отрерайтить</button>
+      <label for="out">Результат</label>
+      <textarea id="out" placeholder="Здесь появится готовый текст…"></textarea>
+      <button id="copy" class="ghost">Скопировать результат</button>
+      <div id="quick-status" class="status"></div>
+    </div>
+
+    <div id="panel-settings" class="panel" hidden>
+      <div class="row">
+        <div>
+          <label for="targetLang">Переводить на</label>
+          <select id="targetLang">
+            <option value="ru">Русский</option>
+            <option value="en">English</option>
+            <option value="de">Deutsch</option>
+            <option value="es">Español</option>
+            <option value="tr">Türkçe</option>
+            <option value="uk">Українська</option>
+            <option value="zh-CN">中文</option>
+          </select>
+        </div>
+        <div>
+          <label for="sourceLang">Язык оригинала</label>
+          <select id="sourceLang">
+            <option value="auto">Определять автоматически</option>
+            <option value="en">English</option>
+            <option value="ru">Русский</option>
+            <option value="de">Deutsch</option>
+            <option value="fr">Français</option>
+            <option value="es">Español</option>
+            <option value="zh-CN">中文</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="mode">Режим</label>
+          <select id="mode">
+            <option value="translate+rewrite">Перевод + рерайт</option>
+            <option value="translate">Только перевод</option>
+            <option value="rewrite">Только рерайт</option>
+          </select>
+        </div>
+        <div>
+          <label for="strength">Глубина рерайта</label>
+          <select id="strength">
+            <option value="light">Лёгкая</option>
+            <option value="medium">Средняя</option>
+            <option value="strong">Сильная</option>
+          </select>
+        </div>
+      </div>
+
+      <label for="engine">Движок перевода</label>
+      <select id="engine">
+        <option value="google">Google Translate (быстро, без ключа)</option>
+        <option value="mymemory">MyMemory (резервный, без ключа)</option>
+      </select>
+
+      <div class="switch">
+        <input type="checkbox" id="preview" />
+        <label for="preview" style="margin: 0; text-transform: none; letter-spacing: 0; font-size: 12.5px; color: #d7d3f0">
+          Показывать предпросмотр перед вставкой
+        </label>
+      </div>
+      <p class="hint" style="margin: 6px 0 0">
+        Текст статьи не меняется, пока вы не нажмёте «Применить».
+      </p>
+
+      <div class="switch">
+        <input type="checkbox" id="skipSameLang" />
+        <label for="skipSameLang" style="margin: 0; text-transform: none; letter-spacing: 0; font-size: 12.5px; color: #d7d3f0">
+          Не переводить текст, уже написанный на целевом языке
+        </label>
+      </div>
+      <p class="hint" style="margin: 6px 0 0">
+        Русский абзац при переводе на русский не уходит в переводчик — это экономит
+        запросы и не портит формулировки. Язык определяется по письменности и
+        служебным словам; при сомнении текст всё равно переводится.
+      </p>
+
+      <label for="stripLinks" style="margin-top: 14px">Ссылки в тексте оригинала</label>
+      <select id="stripLinks">
+        <option value="keep">Убрать ссылку, текст оставить</option>
+        <option value="drop">Убрать ссылку вместе с текстом</option>
+        <option value="off">Не трогать ссылки</option>
+      </select>
+      <p class="hint" style="margin: 6px 0 0">
+        Когда вы копируете статью с другого сайта, вместе с текстом приезжают и ссылки —
+        на источник, на соседние материалы. В переводе они не нужны: ссылка снимается
+        до отправки текста переводчику, а текст ссылки остаётся на месте, чтобы фраза
+        не рассыпалась. Режим <b>вместе с текстом</b> убирает и его — удобно для строки
+        вида «Читайте также: …». Картинки внутри ссылки остаются в любом режиме.
+      </p>
+
+      <div class="switch" style="margin-top: 14px">
+        <input type="checkbox" id="signature" />
+        <label for="signature" style="margin: 0; text-transform: none; letter-spacing: 0; font-size: 12.5px; color: #d7d3f0">
+          Добавлять приписку в конце статьи
+        </label>
+      </div>
+      <div id="signature-fields" hidden>
+        <label for="signatureText">Текст приписки</label>
+        <textarea id="signatureText" rows="3"></textarea>
+        <p class="hint" style="margin: 6px 0 0">
+          Дописывается отдельным абзацем в самом конце статьи — но только если статья
+          обрабатывается целиком. Работаете с фрагментом в середине — приписки не будет.
+          Текст уходит в статью как есть, переводчик его не трогает, поэтому формулировки
+          остаются вашими. Если приписка уже есть в тексте, второй раз не добавится.
+        </p>
+      </div>
+
+      <label for="glossary" style="margin-top: 14px">Глоссарий — что не переводить</label>
+      <textarea id="glossary" rows="4" placeholder="Subaru&#10;Outback = Аутбэк&#10;Boxer engine = оппозитный двигатель"></textarea>
+      <p class="hint" style="margin: 6px 0 0">
+        По строке на термин: <b>Оригинал</b> — оставить как есть,
+        <b>Оригинал = Замена</b> — подставить своё. Строки с <b>#</b> игнорируются.
+        Бренды и модели не будут исковерканы переводчиком.
+      </p>
+      <p class="hint" style="margin: 4px 0 0">
+        Глоссарий хранится локально и не ограничен 8 КБ, так что можно вписать
+        хоть сотню терминов. Он не синхронизируется между устройствами.
+      </p>
+
+      <label for="linkSites" style="margin-top: 14px">Сайты для перелинковки</label>
+      <textarea id="linkSites" rows="3" placeholder="https://auto-dom24.ru&#10;https://example.com"></textarea>
+      <p class="hint" style="margin: 6px 0 0">
+        По строке на сайт, строки с <b>#</b> игнорируются. Кнопка «Перелинковка» в панели
+        превращает упоминания моделей в статье в ссылки на материалы этих сайтов: адрес
+        подбирается по <b>sitemap.xml</b> сайта. Если карты нет — ссылка ведёт на сам сайт.
+        Каналы Дзена вписывайте в поле ниже: у них нет <b>sitemap.xml</b>.
+      </p>
+      <div class="row" style="margin-top: 8px; align-items: center; gap: 10px">
+        <button id="link-allow" type="button" class="ghost">Разрешить доступ к сайтам</button>
+        <span id="link-perm" class="hint"></span>
+      </div>
+
+      <label for="linkChannels" style="margin-top: 14px">Каналы Дзена для перелинковки</label>
+      <textarea id="linkChannels" rows="2" placeholder="https://dzen.ru/auto-dom24.ru&#10;https://dzen.ru/id/6a80211e5150b44d74a55d27"></textarea>
+      <p class="hint" style="margin: 6px 0 0">
+        По строке на канал, строки с <b>#</b> игнорируются. У канала на Дзене нет
+        <b>sitemap.xml</b> — карта статей собирается обходом его ленты (до ~120 самых
+        свежих статей), заголовки сохраняются, и модель ищется по ним. Карта живёт
+        12 часов; обновить вручную — кнопкой ниже. Если обход не удался, ссылка ведёт
+        на сам канал.
+      </p>
+      <div class="row" style="margin-top: 8px; align-items: center; gap: 10px">
+        <button id="channels-refresh" type="button" class="ghost">Обновить карты каналов</button>
+        <button id="channels-export" type="button" class="ghost">Выгрузить sitemap.xml</button>
+        <span id="channels-status" class="hint"></span>
+      </div>
+      <p class="hint" style="margin: 6px 0 0">
+        «Выгрузить sitemap.xml» сохраняет уже собранную карту файлом в папку загрузок —
+        по файлу на канал. Заголовки статей записаны комментариями: в схеме sitemap для
+        них места нет, а по адресу вида <b>/a/…</b> не понять, о чём статья.
+      </p>
+
+      <label for="linkCount" style="margin-top: 12px">Сколько ссылок на статью</label>
+      <input id="linkCount" type="number" min="1" max="10" step="1" placeholder="2" />
+      <p class="hint" style="margin: 6px 0 0">
+        Ссылки ставятся не в первый абзац и не в соседних абзацах, не в заголовки и не
+        больше одной на абзац. Если упоминаний моделей в тексте меньше — поставим сколько есть.
+      </p>
+
+      <div class="switch">
+        <input type="checkbox" id="aiEnabled" />
+        <label for="aiEnabled" style="margin: 0; text-transform: none; letter-spacing: 0; font-size: 12.5px; color: #d7d3f0">
+          Использовать AI-рерайт (OpenAI-совместимый API)
+        </label>
+      </div>
+
+      <div id="ai-fields" hidden>
+        <label for="aiBaseUrl">API Base URL</label>
+        <input id="aiBaseUrl" placeholder="https://api.openai.com/v1" />
+        <div class="row">
+          <div>
+            <label for="aiModel">Модель</label>
+            <input id="aiModel" placeholder="gpt-4o-mini" />
+          </div>
+          <div>
+            <label for="aiKey">API-ключ</label>
+            <input id="aiKey" type="password" placeholder="sk-…" />
+          </div>
+        </div>
+        <div class="row" style="margin-top: 8px; align-items: center; gap: 10px">
+          <button id="ai-check" type="button" class="ghost check">Проверить ключ</button>
+          <span id="ai-check-status" class="hint"></span>
+        </div>
+        <p class="hint" style="margin: 6px 0 0">
+          Проверка отправляет один настоящий запрос тем же путём, что и рерайт: тем же
+          адресом, ключом и моделью. Так всплывает и неверное название модели. Запрос
+          платный (крошечный — ответ ограничен восемью токенами), поэтому идёт только
+          по нажатию.
+        </p>
+        <p class="hint" style="margin: 6px 0 0">
+          Адрес API указывайте до <code>/chat/completions</code>: расширение дописывает
+          его само. Для своего сервиса (не OpenAI и не OpenRouter) нажмите «Проверить
+          ключ» — расширение спросит доступ к его домену, без этого запрос не уйдёт.
+          Локальная модель (Ollama) — адрес вида <code>http://127.0.0.1:11434/v1</code>:
+          по http доступ даётся только к localhost и 127.0.0.1, ключ оставляйте пустым,
+          ждать ответа придётся минутами — панель покажет, сколько уже идёт рерайт.
+        </p>
+        <label for="aiPreset">Стиль рерайта</label>
+        <select id="aiPreset"></select>
+        <p class="hint" id="aiPresetHint" style="margin: 6px 0 0"></p>
+
+        <label for="aiPrompt" style="margin-top: 14px">Промпт рерайтера</label>
+        <textarea id="aiPrompt"></textarea>
+        <p class="hint" style="margin: 6px 0 0">
+          Промпт уходит в модель системным сообщением и применяется ко всей статье.
+          Правьте его руками — стиль переключится на «Свой промпт», и выбор пресета
+          больше не будет затирать вашу правку.
+        </p>
+        <div class="row" style="margin-top: 8px">
+          <button id="aiPromptReset" type="button" class="ghost">Вернуть текст пресета</button>
+        </div>
+      </div>
+
+      <label for="imgSource" style="margin-top: 18px">Источник картинок</label>
+      <select id="imgSource">
+        <option value="yandex">Яндекс — поиск по Картинкам, платный</option>
+        <option value="pixabay">Pixabay — фотосток, бесплатный, нужен свой ключ</option>
+        <option value="openverse">Openverse — свободные лицензии, без ключа</option>
+      </select>
+
+      <div id="img-yandex">
+        <label for="imgKey" style="margin-top: 10px">Ключ Yandex Search API</label>
+        <input id="imgKey" type="password" placeholder="AQVN…" />
+        <label for="imgFolder" style="margin-top: 10px">folder ID Яндекс Облака</label>
+        <input id="imgFolder" placeholder="b1g…" />
+        <p class="hint" style="margin: 4px 0 0">
+          Ключ выдаётся в консоли Яндекса: AI Studio → <b>«Создать API-ключ»</b> (роль
+          search-api.webSearch.user). Folder ID лежит рядом, в консоли Яндекс Облака.
+        </p>
+      </div>
+
+      <div id="img-pixabay">
+        <label for="pixabayKey" style="margin-top: 10px">Ключ Pixabay</label>
+        <input id="pixabayKey" type="password" placeholder="12345678-…" />
+        <p class="hint" style="margin: 4px 0 0">
+          Ключ бесплатный: войдите на pixabay.com и откройте <b>pixabay.com/api/docs</b> —
+          он напечатан в таблице параметров, в строке key.
+        </p>
+      </div>
+
+      <div class="row" style="margin-top: 8px; align-items: center; gap: 10px">
+        <button id="img-check" type="button" class="ghost check">Проверить ключ</button>
+        <span id="img-check-status" class="hint"></span>
+      </div>
+      <p class="hint" style="margin: 6px 0 0" id="img-check-hint">
+        Проверка делает один поисковый запрос и просит одну картинку — этого хватает,
+        чтобы отличить рабочий ключ от чужого или просроченного folder ID.
+      </p>
+      <p class="hint" style="margin: 6px 0 0">
+        Кнопка «Подобрать картинки» в панели ищет иллюстрации к статье — только
+        <b>горизонтальные</b>. Источник выбирается выше:
+        <b>Яндекс</b> ищет по индексу Картинок, запрос платный (нужен ключ
+        <b>Yandex Search API</b> и folder ID из Яндекс Облака, у сервисного аккаунта —
+        роль <b>search-api.webSearch.user</b>); <b>Pixabay</b> бесплатный, но нужен свой
+        ключ с сайта pixabay.com и источник обязательно указывать;
+        <b>Openverse</b> работает вообще без ключа — там картинки со свободными
+        лицензиями, автор и лицензия показаны под каждой. Ключи хранятся локально
+        и не синхронизируются.
+      </p>
+      <p class="hint" style="margin: 4px 0 0">
+        Запрос собирается из заголовка статьи. Если включён AI-рерайт, модель предложит
+        ещё и фразы по смыслу текста — переключать их можно прямо в панели.
+      </p>
+
+      <button id="save">Сохранить настройки</button>
+      <div id="settings-status" class="status"></div>
+
+      <div class="row" style="margin-top:14px; align-items:center; gap:10px">
+        <button id="clear-cache" type="button">Очистить кэш</button>
+        <span id="cache-info" class="hint"></span>
+      </div>
+    </div>
+
+    <script src="presets.js"></script>
+    <script src="rewriter.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

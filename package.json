@@ -1,0 +1,29 @@
+{
+  "name": "dzen-rewriter",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Расширение Chrome: рерайт статьи в редакторе Дзена, перелинковка и подбор картинок",
+  "type": "module",
+  "scripts": {
+    "ext:build": "node tools/build-extension.cjs",
+    "ext:build:nosip": "node tools/build-extension.cjs --no-zip",
+    "test": "bash test/run-suite.sh",
+    "test:only": "bash test/run-suite.sh --only",
+    "test:list": "bash test/run-suite.sh --list",
+    "clean:profiles": "node tools/clean-profiles.cjs",
+    "clean:profiles:dry": "node tools/clean-profiles.cjs --dry-run",
+    "test:docs": "node test/test-docs.cjs",
+    "test:reliability": "node test/test-reliability.cjs",
+    "test:storage": "node test/test-storage.cjs",
+    "test:glossary": "node test/test-glossary.cjs",
+    "test:copy": "node test/test-copy.cjs",
+    "test:skiplang": "node test/test-skiplang.cjs",
+    "test:links": "node test/test-links.cjs",
+    "test:channels": "node test/test-channels.cjs",
+    "test:images": "node test/test-images.cjs",
+    "test:images:ui": "node test/test-images-ui.cjs",
+    "test:linkify": "node test/test-linkify.cjs",
+    "test:strip": "node test/test-strip.cjs",
+    "test:signature": "node test/test-signature.cjs"
+  }
+}

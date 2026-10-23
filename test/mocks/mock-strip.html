@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Статья со ссылками — чистка при переводе (мок)</title>
+<style>
+  body { font: 16px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #fff; color: #1a1a1a; }
+  .page { max-width: 760px; margin: 0 auto; padding: 32px 24px 160px; }
+  .title { font-size: 26px; font-weight: 700; outline: none; margin-bottom: 28px; }
+  .body { outline: none; min-height: 460px; }
+  .body h2 { font-size: 20px; margin: 24px 0 8px; }
+  .body p { margin: 12px 0; }
+  .body ul { margin: 8px 0 8px 22px; }
+  .body li { margin: 6px 0; }
+  .body figure { margin: 16px 0; }
+  .body img { max-width: 320px; display: block; border-radius: 8px; }
+  .body figcaption { font-size: 12px; color: #666; margin-top: 6px; }
+  .body table { border-collapse: collapse; margin: 12px 0; }
+  .body td { border: 1px solid #ccc; padding: 4px 10px; }
+  .body a { color: #2f6fb2; }
+</style>
+</head>
+<body>
+  <div class="page">
+    <div class="title" contenteditable="true">Обзор Subaru Outback 2026</div>
+    <!--
+      Восемь ссылок, и каждая идёт своим путём через разбор блоков:
+      обычный текст, жирный внутри ссылки, картинка внутри ссылки, подпись
+      к картинке, пункт списка, ячейка таблицы, абзац целиком из ссылки и
+      ссылка в заголовке. Чистка обязана отработать во всех восьми.
+    -->
+    <div class="body" contenteditable="true">
+      <h2>Subaru Outback: <a href="https://example.com/h2">what changed</a></h2>
+      <p>The 2026 Subaru Outback keeps the familiar 2.4-liter Boxer engine.</p>
+      <p>According to <a href="https://www.subaru.com/">the official page</a>, the towing capacity is <strong>3,500 lbs</strong>.</p>
+      <p>Read the <a href="https://example.com/parts"><strong>full parts list</strong></a> before you order.</p>
+      <!-- Две соседние обёртки через пробел: пробел обязан остаться СНАРУЖИ.
+           Склейка общих предков легко втягивает его внутрь — это регрессия. -->
+      <p>Colors: <strong>red</strong> <em>blue</em> and <strong>green</strong>.</p>
+      <figure>
+        <a href="https://example.com/photo"><img alt="Subaru Outback" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='180'%3E%3Crect width='320' height='180' fill='%232f6fb2'/%3E%3Ctext x='160' y='96' font-size='18' fill='white' text-anchor='middle'%3EOutback%3C/text%3E%3C/svg%3E" /></a>
+        <figcaption>Photo: <a href="https://example.com/credits">press service</a></figcaption>
+      </figure>
+      <ul>
+        <li>Ground clearance is <a href="https://example.com/clearance">9.5 inches</a>.</li>
+      </ul>
+      <table>
+        <tr><td>Trim</td><td><a href="https://example.com/trim">Wilderness</a></td></tr>
+      </table>
+      <p><a href="https://example.com/also">Читайте также: обзор рынка</a></p>
+    </div>
+  </div>
+</body>
+</html>

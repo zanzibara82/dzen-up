@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Редактор — мок с «модельным» выделением (как ProseMirror)</title>
+<style>
+  body { font: 16px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #fff; color: #1a1a1a; }
+  .page { max-width: 760px; margin: 0 auto; padding: 32px 24px 160px; }
+  .title { font-size: 26px; font-weight: 700; outline: none; margin-bottom: 28px; }
+  .body { outline: none; min-height: 420px; }
+  .body h2 { font-size: 20px; margin: 24px 0 8px; }
+  .body ul { margin: 8px 0 8px 22px; }
+  .body li { margin: 6px 0; }
+  .body p { margin: 12px 0; }
+</style>
+</head>
+<body>
+  <div class="page">
+    <div class="title" contenteditable="true">2026 Subaru Outback Wilderness Has 9.5-Inches of Ground Clearance &amp; Adventure-Ready Gear</div>
+    <div class="body" contenteditable="true">
+      <h2>2026 Subaru Outback Wilderness Summary Points</h2>
+      <ul>
+        <li>The Wilderness trim is the most rugged and off-road capable version of the 2026 Outback.</li>
+        <li>Standard features include electronic dampers, chunk all-terrain tires, 9.5 inches of ground clearance, and a turbocharged Boxer engine.</li>
+        <li>The Subaru Outback Wilderness has inherited its predecessor's 3,500 lbs. towing capacity, but its updated SUV body offers more cargo space.</li>
+      </ul>
+      <p>The 2026 Subaru Outback Wilderness has a potent yet familiar turbocharged 2.4-liter Boxer engine.</p>
+    </div>
+  </div>
+
+  <script>
+    // Мок ведёт себя как ProseMirror:
+    //  - держит СВОЁ выделение (model), синхронизируя его из DOM с задержкой;
+    //  - вставку из paste обрабатывает сам и вставляет ПО СВОЕМУ выделению.
+    // Если расширение не даст модели время синхронизироваться, текст уедет в конец.
+    const body = document.querySelector(".body");
+    let model = null;          // снимок выделения «внутри редактора»
+    const SYNC_MS = 30;        // задержка синхронизации, как у редакторов
+
+    function snapshot() {
+      const s = window.getSelection();
+      if (!s || !s.rangeCount) return null;
+      const r = s.getRangeAt(0);
+      if (!body.contains(r.commonAncestorContainer)) return null;
+      return r.cloneRange();
+    }
+
+    document.addEventListener("selectionchange", () => {
+      clearTimeout(window.__syncT);
+      window.__syncT = setTimeout(() => { model = snapshot(); }, SYNC_MS);
+    });
+
+    body.addEventListener("focusout", () => { window.getSelection().removeAllRanges(); });
+
+    // как многие редакторы: при возврате фокуса внутренний курсор встаёт в конец.
+    // Именно из-за этого вставка «уезжает» вниз статьи, если не дать модели
+    // синхронизироваться с настоящим выделением.
+    body.addEventListener("focus", () => {
+      const r = document.createRange();
+      r.selectNodeContents(body);
+      r.collapse(false);
+      model = r;
+    });
+
+    body.addEventListener("paste", (e) => {
+      e.preventDefault();
+      const html = e.clipboardData.getData("text/html");
+      const text = e.clipboardData.getData("text/plain");
+      // вставляем строго по «модельному» выделению, а не по DOM
+      const target = model && model.startContainer.isConnected ? model : snapshot();
+      if (!target) return;
+      const frag = document.createDocumentFragment();
+      if (html) {
+        const parsed = new DOMParser().parseFromString(html, "text/html");
+        Array.from(parsed.body.childNodes).forEach((n) => frag.appendChild(document.importNode(n, true)));
+      } else {
+        frag.appendChild(document.createTextNode(text));
+      }
+      target.deleteContents();
+      target.insertNode(frag);
+      body.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      window.__lastInsertMode = "paste-html";
+    });
+
+    // для отладки: куда реально попала вставка
+    window.__peek = () => ({ model: model ? model.toString().slice(0, 40) : null, lastInsert: window.__lastInsertMode || null });
+  </script>
+</body>
+</html>
