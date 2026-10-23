@@ -63,7 +63,8 @@ const api = new Function(
   fs.readFileSync(SRC, "utf8") +
     "\nreturn { DEFAULTS, channelName, channelUrl, parseChannelList, channelPageArticles, " +
     "loadChannel, channelArticles, refreshChannels, pickArticle, findModels, buildLinks, " +
-    "escapeXml, xmlComment, channelSitemap, sitemapFileName, exportChannelMaps };"
+    "escapeXml, xmlComment, channelSitemap, sitemapFileName, exportChannelMaps, " +
+    "sitemapFor, SITEMAP_CACHE_KEY, CHANNEL_CACHE_KEY };"
 )(chrome);
 
 const {
@@ -81,7 +82,10 @@ const {
   xmlComment,
   channelSitemap,
   sitemapFileName,
-  exportChannelMaps
+  exportChannelMaps,
+  sitemapFor,
+  SITEMAP_CACHE_KEY,
+  CHANNEL_CACHE_KEY
 } = api;
 
 // ------------------------------------------------------------- подставной fetch
@@ -633,6 +637,56 @@ async function main() {
     reply3.ok === false && /не указаны/i.test(String(reply3.error)),
     JSON.stringify(reply3).slice(0, 140)
   );
+
+  // ---- 13. параллельные записи кэша ---------------------------------------
+  // Карты сайтов и каналов пишутся в chrome.storage.local по одному образцу:
+  // «прочитал снимок → сходил в сеть → вернул снимок целиком». Если перелинковка
+  // по сайту и переобход каналов идут одновременно, тот, кто вернулся из сети
+  // позже, перезатирает снимком с прежним содержимым карту раннего. Проверка
+  // требует, чтобы после параллельного чтения обе карты остались в хранилище.
+  {
+    const prevFetch = globalThis.fetch;
+    const textRes = (body) => ({
+      ok: true, status: 200, headers: { get: () => null },
+      json: async () => ({}), text: async () => body
+    });
+    const xml = (host) =>
+      '<?xml version="1.0"?><urlset><url><loc>https://' + host + '/post</loc></url></urlset>';
+    const API = EXPORT.split("?")[0];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u === "https://site-a.example/sitemap.xml") return textRes(xml("site-a.example"));
+      if (u === "https://site-b.example/sitemap.xml") return textRes(xml("site-b.example"));
+      if (u.indexOf(API) === 0) {
+        const name = decodeURIComponent((u.match(/channel_name=([^&]*)/) || [])[1] || "");
+        return jsonRes({ items: [card(DZ + "c" + name, "Статья " + name)] });
+      }
+      return textRes("");
+    };
+    delete localStore[SITEMAP_CACHE_KEY];
+    delete localStore[CHANNEL_CACHE_KEY];
+
+    await Promise.all([
+      sitemapFor("https://site-a.example/sitemap.xml", null, true),
+      sitemapFor("https://site-b.example/sitemap.xml", null, true)
+    ]);
+    const smap = localStore[SITEMAP_CACHE_KEY] || {};
+    check(
+      "сайты: обе карты уцелели после параллельного чтения",
+      !!smap["site-a.example/sitemap.xml"] && !!smap["site-b.example/sitemap.xml"],
+      JSON.stringify(Object.keys(smap))
+    );
+
+    await Promise.all([channelArticles("alpha", null, true), channelArticles("beta", null, true)]);
+    const cmap = localStore[CHANNEL_CACHE_KEY] || {};
+    check(
+      "каналы: обе карты уцелели после параллельного обхода",
+      !!cmap.alpha && !!cmap.beta,
+      JSON.stringify(Object.keys(cmap))
+    );
+
+    globalThis.fetch = prevFetch;
+  }
 
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);

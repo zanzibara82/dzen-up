@@ -389,7 +389,7 @@ async function mapPool(items, limit, worker, signal) {
 
 let cacheMap = null;
 let cacheDirty = false;
-let cacheTimer = null;
+let cacheSaving = null;
 
 function hashStr(s) {
   let h = 2166136261;
@@ -415,12 +415,23 @@ async function loadCache() {
   return cacheMap;
 }
 
+/**
+ * Записать кэш переводов сразу, без паузы. Прежний дебаунс таймером на 1,5 с
+ * терял готовые переводы: воркер MV3 убивается в простое, и таймер дожить
+ * мог не успеть. Записи коалесцируются: если запись добавили, пока запись
+ * уже идёт, за ней следует вторая — но не каждая сотня миллисекунд, как при
+ * дебаунсе, а ровно столько, сколько нужно.
+ */
 function scheduleCacheSave() {
   cacheDirty = true;
-  if (cacheTimer) return;
-  cacheTimer = setTimeout(async () => {
-    cacheTimer = null;
-    if (!cacheDirty || !cacheMap) return;
+  if (cacheSaving) return;
+  cacheSaving = flushCache().finally(() => {
+    cacheSaving = null;
+  });
+}
+
+async function flushCache() {
+  while (cacheDirty && cacheMap) {
     cacheDirty = false;
     try {
       if (cacheMap.size > CACHE_MAX) {
@@ -431,14 +442,12 @@ function scheduleCacheSave() {
     } catch (e) {
       /* кэш — не критично, молча пропускаем */
     }
-  }, 1500);
+  }
 }
 
 async function clearCache() {
   cacheMap = new Map();
   cacheDirty = false;
-  if (cacheTimer) clearTimeout(cacheTimer);
-  cacheTimer = null;
   try {
     await chrome.storage.local.remove(["dzrCache"]);
   } catch (e) {}
@@ -746,6 +755,7 @@ const SITEMAP_TTL = 12 * 60 * 60 * 1000; // sitemap большого сайта 
 const SITEMAP_CACHE_KEY = "dzrSitemaps";
 const SITEMAP_MAX_URLS = 5000; // больше в статьях не нужно, а кэш растёт
 const SITEMAP_MAX_FILES = 6; // вложенные карты читаем не бесконечно
+const SITE_TIMEOUT_MS = 30000; // один файл карты: повторять нечего, но и висеть нельзя
 
 /** Кэш в local под произвольным ключом: карты сайтов и карты каналов. */
 async function readLocalCache(key) {
@@ -765,6 +775,26 @@ async function writeLocalCache(key, cache) {
   }
 }
 
+/**
+ * Добавить в кэш одну запись, не затирая чужие. Снимок перечитывается
+ * непосредственно перед записью, а не до похода в сеть, и все дописки идут
+ * через одну очередь: параллельные читатели (перелинковка по сайту и
+ * переобход каналов) иначе снимают снимок в один и тот же миг, пока первая
+ * запись ещё не легла, — и чужая карта теряется.
+ */
+let localCacheQueue = Promise.resolve();
+
+function mergeLocalCache(key, entryKey, value) {
+  localCacheQueue = localCacheQueue
+    .then(async () => {
+      const fresh = await readLocalCache(key);
+      fresh[entryKey] = value;
+      await writeLocalCache(key, fresh);
+    })
+    .catch(() => {});
+  return localCacheQueue;
+}
+
 /** Адрес карты: если пользователь указал .xml явно — берём его, иначе типовые пути. */
 function sitemapCandidates(site) {
   if (/\.xml(\?|$)/i.test(site)) return [site];
@@ -773,10 +803,32 @@ function sitemapCandidates(site) {
   );
 }
 
+/**
+ * Текст ответа с таймаутом. Без него сайт, принявший соединение и замолчавший,
+ * вешает чтение карты навсегда — и сообщение перелинковки остаётся без ответа.
+ * Повторов здесь нет намеренно: loadSitemap сам пробует следующий адрес,
+ * а висячий сервер со второй попытки быстрее не ответит.
+ */
 async function fetchText(url, signal) {
-  const res = await fetch(url, { signal, credentials: "omit", redirect: "follow" });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  return await res.text();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error("timeout")), SITE_TIMEOUT_MS);
+  const onOuterAbort = () => ac.abort(abortErr());
+  if (signal) {
+    if (signal.aborted) onOuterAbort();
+    else signal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  try {
+    const res = await fetch(url, { signal: ac.signal, credentials: "omit", redirect: "follow" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.text();
+  } catch (e) {
+    if (signal && signal.aborted) throw abortErr();
+    if (ac.signal.aborted) throw new Error("таймаут " + SITE_TIMEOUT_MS / 1000 + " с");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onOuterAbort);
+  }
 }
 
 /** Читает карту сайта: urlset или sitemapindex с вложенными картами. */
@@ -819,8 +871,7 @@ async function sitemapFor(site, signal, refresh) {
 
   const res = await loadSitemap(site, signal);
   if (res.urls.length) {
-    cache[key] = { at: Date.now(), urls: res.urls };
-    await writeLocalCache(SITEMAP_CACHE_KEY, cache);
+    await mergeLocalCache(SITEMAP_CACHE_KEY, key, { at: Date.now(), urls: res.urls });
   }
   return res.urls;
 }
@@ -968,8 +1019,7 @@ async function channelArticles(name, signal, refresh) {
   const articles = await loadChannel(name, signal);
   // Пустой обход не затирает прежнюю карту: сеть могла просто отвалиться.
   if (articles.length) {
-    cache[name] = { at: Date.now(), articles };
-    await writeLocalCache(CHANNEL_CACHE_KEY, cache);
+    await mergeLocalCache(CHANNEL_CACHE_KEY, name, { at: Date.now(), articles });
   }
   return articles;
 }
