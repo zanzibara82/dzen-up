@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Регрессия расширения "Дзен Рерайтер".
 #
-#   bash test/run-suite.sh                       # все 22 набора (~10 мин)
+#   bash test/run-suite.sh                       # все 20 наборов (~9 мин)
 #   bash test/run-suite.sh --list                # напечатать имена наборов
 #   bash test/run-suite.sh --only ui,popup       # только те наборы, в имени
 #                                                # которых есть ui или popup
-#   bash test/run-suite.sh --only images [путь]  # фильтр и путь-к-расширению
+#   bash test/run-suite.sh --only links [путь]   # фильтр и путь-к-расширению
 #
 # Зачем --only. После правки обычно нужно проверить одно нововведение, а не всю
 # регрессию: полный прогон — это десять минут на ровном месте. Но частичный
@@ -31,10 +31,10 @@ winpath() { (cd "$1" && pwd -W 2>/dev/null) || (cd "$1" && pwd); }
 # отдельно от вызовов, чтобы посчитать, сколько наборов реально пойдёт: иначе
 # при фильтре заголовки печатали бы «3/21», когда запущено три набора.
 NAMES=(
-  docs reliability links channels images
+  docs reliability links channels
   format-mock4 format-mock5 format-mock6
   preview collapse glossary storage copy popup skiplang
-  linkify images-ui strip signature ai-local ui mocks
+  linkify strip signature ai-local ui mocks
 )
 
 ONLY=""
@@ -126,7 +126,6 @@ want docs        && run docs        "README против кода"          node
 want reliability && run reliability "юнит: надёжность перевода"   node test-reliability.cjs
 want links       && run links       "юнит: перелинковка"          node test-links.cjs
 want channels    && run channels    "юнит: карта канала Дзена"    node test-channels.cjs
-want images      && run images      "юнит: подбор картинок"       node test-images.cjs
 want format-mock4 && run format-mock4 "mock4: формат A/B/C"        node test-format.cjs "$EXT" mock4.html
 want format-mock5 && run format-mock5 "mock5: сложная структура"   node test-format.cjs "$EXT" mock5.html
 want format-mock6 && run format-mock6 "mock6: отмена и прогресс"   node test-format.cjs "$EXT" mock6.html
@@ -138,7 +137,6 @@ want copy        && run copy        "клик по уведомлению"      
 want popup       && run popup       "попап расширения"            node test-popup.cjs "$EXT"
 want skiplang    && run skiplang    "пропуск уже переведённого"   node test-skiplang.cjs "$EXT"
 want linkify     && run linkify     "перелинковка в редакторе"    node test-linkify.cjs "$EXT"
-want images-ui   && run images-ui   "картинки в редакторе"        node test-images-ui.cjs "$EXT"
 want strip       && run strip       "чистка ссылок при переводе"  node test-strip.cjs "$EXT"
 want signature   && run signature   "приписка в конце статьи"     node test-signature.cjs "$EXT"
 want ai-local    && run ai-local    "своя модель (Ollama) в панели" node test-ai-local.cjs "$EXT"

@@ -27,17 +27,6 @@ const DEFAULTS = {
   aiBaseUrl: "https://api.openai.com/v1",
   aiModel: "gpt-4o-mini",
   aiKey: "",
-  // Подбор картинок: ключ Yandex Search API и folder ID Яндекс Облака. Оба
-  // лежат в local (см. LOCAL_KEYS) — ключ секретный, а folder ID без него
-  // бесполезен, держать их врозь смысла нет.
-  imgKey: "",
-  imgFolder: "",
-  // Откуда берём картинки. yandex — платный поиск по индексу Картинок;
-  // pixabay — бесплатный фотосток, нужен свой ключ; openverse — агрегатор
-  // свободных лицензий, ключа не требует вовсе.
-  imgSource: "yandex",
-  // Ключ Pixabay лежит рядом с остальными ключами, а не в sync: он секретный.
-  pixabayKey: "",
   // id стиля из presets.js («Свой промпт» = custom). Нужен только попапу и панели,
   // чтобы показать выбранный пункт списка: воркер работает с готовым aiPrompt.
   aiPreset: "editor",
@@ -62,7 +51,7 @@ const DEFAULTS = {
 // При превышении set() падает с ошибкой, и длинный глоссарий молча терялся бы
 // при сохранении. В local лимит около 5 МБ на всё расширение.
 
-const LOCAL_KEYS = ["glossary", "aiKey", "imgKey", "imgFolder", "pixabayKey", "linkSites", "linkChannels"];
+const LOCAL_KEYS = ["glossary", "aiKey", "linkSites", "linkChannels"];
 
 function isLocalKey(key) {
   return LOCAL_KEYS.indexOf(key) !== -1;
@@ -450,9 +439,7 @@ async function clearCache() {
   if (cacheTimer) clearTimeout(cacheTimer);
   cacheTimer = null;
   try {
-    // Кэш картинок чистится здесь же: он мешает ровно так же — та же фраза
-    // отдаёт тот же набор, — и держать для этого вторую кнопку незачем.
-    await chrome.storage.local.remove(["dzrCache", IMAGE_CACHE_KEY]);
+    await chrome.storage.local.remove(["dzrCache"]);
   } catch (e) {}
 }
 
@@ -1495,479 +1482,9 @@ async function aiRewrite(text, settings, opts = {}) {
   return out.trim();
 }
 
-// ------------------------------------------------------ подбор картинок ---
-// Источник один — Яндекс, и это осознанный выбор, а не упрощение: Google
-// Custom Search JSON API закрыт для новых клиентов (действующим дали срок до
-// 1 января 2027), а бесплатных фотостоков в проекте нет. Картинки берём
-// официальным Search API — он платный, поэтому нужны ключ и folder ID.
-//
-// Горизонтальность просим у самого поиска (`imageSpec.orientation`), а не
-// отсеиваем по размерам: так вертикальные не попадают в выдачу вовсе, и мы не
-// зависим от того, вернёт ли XML ширину с высотой. Если вернёт — отфильтруем
-// ещё раз, лишним не будет.
-//
-// Значения enum — ТОЛЬКО в полной форме. Пример запроса в документации Яндекса
-// показывает короткие («ru», «vertical»), но живой API их не принимает:
-// «query.search_type: invalid value "ru" for type …SearchQuery.SearchType».
-// Проверено запросом без ключа: на полной форме тело проходит проверку и ответ
-// меняется на «API key has to be passed». Короткую форму не пробуем — это
-// заведомо мёртвый путь, а мёртвая ветка выдавала бы себя за страховку.
-//
-// Право на этот домен обязательно: CORS у searchapi нет (проверено — на 400 и 401
-// нет Access-Control-Allow-Origin, тогда как контрольный api.github.com его отдаёт),
-// поэтому без host_permissions фон получил бы отказ ещё до ответа.
-
-const YANDEX_IMAGE_API = "https://searchapi.api.cloud.yandex.net/v2/image/search";
-const IMAGE_COUNT = 12; // сколько картинок показываем в панели за один запрос
-const IMAGE_QUERIES_MAX = 3; // сколько поисковых фраз предлагаем на выбор
-
-// Источников три, и они не равны ни по цене, ни по правам на картинку:
-//   • yandex — платный поиск по индексу Яндекс Картинок (915 ₽ за 1000 запросов);
-//   • pixabay — бесплатный фотосток, нужен свой ключ. Лицензия Pixabay Content
-//     License: пользоваться можно, но источник надо назвать, а постоянная прямая
-//     ссылка на их CDN запрещена — картинку положено забрать себе;
-//   • openverse — агрегатор изображений со свободными лицензиями (Flickr,
-//     Wikimedia и другие), ключа не требует: анонимно 20 запросов в минуту и
-//     200 в сутки. Лицензию и автора показываем рядом с картинкой.
-// Общее у всех — только горизонтальные кадры: вертикальный ломает вёрстку
-// статьи, и это требование панели, а не вкус.
-const PIXABAY_API = "https://pixabay.com/api/";
-const OPENVERSE_API = "https://api.openverse.org/v1/images/";
-
-const IMG_SOURCES = {
-  yandex: { label: "Яндекс", keyName: "Yandex Search API", needsKey: true, needsFolder: true },
-  pixabay: { label: "Pixabay", keyName: "Pixabay", needsKey: true, needsFolder: false },
-  openverse: { label: "Openverse", keyName: "", needsKey: false, needsFolder: false }
-};
-
-// Что сказать пользователю вместе с найденными картинками. Молчать про
-// лицензию нельзя: у Pixabay это условие использования, у Openverse — то, ради
-// чего источник и выбирали.
-const IMG_NOTICE = {
-  yandex: "",
-  pixabay:
-    "Картинки с Pixabay: назовите источник и не оставляйте прямую ссылку на их CDN — " +
-    "загрузите выбранную картинку в Дзен заново.",
-  openverse:
-    "Свободные лицензии: под каждой картинкой видно автора и лицензию — сохраните подпись в статье."
-};
-
-// Кэш ответов поиска картинок. Это не оптимизация, а условие чужого API:
-// Pixabay требует держать ответы в кэше 24 часа, у Openverse анонимный лимит —
-// 200 запросов в сутки. Заодно не платим дважды за одну и ту же фразу у Яндекса
-// (0,92 ₽ за запрос). Обратная сторона честная и называется вслух: та же фраза
-// в течение суток даёт тот же набор, и в окне про это сказано. Нужны другие
-// картинки — кэш чистится кнопкой в настройках, как кэш переводов.
-const IMAGE_CACHE_KEY = "dzrImages";
-const IMAGE_CACHE_TTL = 24 * 60 * 60 * 1000;
-const IMAGE_CACHE_MAX = 30; // запись — 12 картинок с подписями, больше не нужно
-
-/** Настройка imgSource приходит из хранилища, поэтому ей нельзя верить на слово. */
-function imgSourceInfo(settings) {
-  const id = String((settings && settings.imgSource) || "").trim();
-  return IMG_SOURCES[id] ? { id: id, ...IMG_SOURCES[id] } : { id: "yandex", ...IMG_SOURCES.yandex };
-}
-
-const IMAGE_ENUMS = {
-  searchType: "SEARCH_TYPE_RU",
-  familyMode: "FAMILY_MODE_STRICT",
-  fixTypoMode: "FIX_TYPO_MODE_OFF",
-  format: "IMAGE_FORMAT_JPEG",
-  size: "IMAGE_SIZE_LARGE",
-  orientation: "IMAGE_ORIENTATION_HORIZONTAL"
-};
-
-function imageSearchBody(query, settings, count) {
-  return JSON.stringify({
-    query: {
-      searchType: IMAGE_ENUMS.searchType,
-      queryText: String(query || "").trim().slice(0, 400), // лимит поля — 400 знаков
-      familyMode: IMAGE_ENUMS.familyMode,
-      fixTypoMode: IMAGE_ENUMS.fixTypoMode
-    },
-    imageSpec: {
-      format: IMAGE_ENUMS.format,
-      size: IMAGE_ENUMS.size,
-      orientation: IMAGE_ENUMS.orientation
-    },
-    docsOnPage: String(count || IMAGE_COUNT),
-    folderId: settings.imgFolder
-  });
-}
-
-async function imageSearch(query, settings, count, signal) {
-  const data = await fetchJson(YANDEX_IMAGE_API, {
-    signal,
-    label: "Поиск картинок",
-    tries: 1, // запрос платный: повторы только путали бы счёт
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: "Api-Key " + settings.imgKey
-    },
-    body: imageSearchBody(query, settings, count),
-    errorBody: true // причина 400 приходит в теле, а не в коде
-  });
-  // Ответ — XML, завёрнутый в base64. Через atob нельзя: он вернёт байты как
-  // символы, и кириллица в заголовках превратится в мусор.
-  return decodeBase64(data && data.rawData);
-}
-
-function decodeBase64(b64) {
-  const clean = String(b64 || "").replace(/\s+/g, "");
-  if (!clean) return "";
-  const bin = atob(clean);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new TextDecoder("utf-8").decode(bytes);
-}
-
-/** Обратное к escapeXml. «&amp;» разворачиваем последним, иначе «&amp;lt;» станет «<». */
-function decodeXmlEntities(s) {
-  return String(s == null ? "" : s)
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(parseInt(d, 10)))
-    .replace(/&amp;/g, "&");
-}
-
-function xmlAttr(tag, name) {
-  const m =
-    tag.match(new RegExp(name + '\\s*=\\s*"([^"]*)"', "i")) ||
-    tag.match(new RegExp(name + "\\s*=\\s*'([^']*)'", "i"));
-  return m ? decodeXmlEntities(m[1]) : "";
-}
-
-function xmlText(s) {
-  return decodeXmlEntities(String(s || "").replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]*>/g, ""))
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function looksLikeImageUrl(u) {
-  return /^https?:\/\/\S+$/i.test(String(u || "").trim());
-}
-
-/** Есть расширение картинки — значит это точно не адрес страницы. */
-function hasImageExt(u) {
-  return /\.(jpe?g|png|gif|webp|avif)(\?|#|$)/i.test(String(u || ""));
-}
-
-/**
- * Разбираем XML-ответ. Регулярки, а не DOMParser: в service worker DOM нет —
- * так же устроен разбор sitemap.
- *
- * Разбор намеренно терпимый: Яндекс не гарантирует состав полей («ответ может
- * меняться без предупреждения»), а точный вид тега с адресом картинки в
- * документации не показан. Поэтому адрес ищем во всех правдоподобных местах,
- * но НЕ в <url> — там адрес страницы, на которой лежит картинка, и подставить
- * его в src значит получить битую иллюстрацию. Из найденных адресов первым
- * берём тот, что похож на файл картинки.
- */
-function parseImageXml(xml) {
-  const src = String(xml || "");
-  if (!src.trim()) return [];
-
-  const docs = src.match(/<doc\b[^>]*>[\s\S]*?<\/doc>/gi);
-  // Нет <doc> — разбираем ответ целиком: пустая галерея без причины хуже,
-  // чем лишняя попытка.
-  const chunks = docs && docs.length ? docs : [src];
-
-  const out = [];
-  const seen = new Set();
-
-  for (const chunk of chunks) {
-    const urls = [];
-    // <img src="…"> / <image url="…"> / <thumbnail src="…">
-    const tags = chunk.match(/<(?:img|image|thumbnail|picture)\b[^>]*>/gi) || [];
-    for (const tag of tags) {
-      for (const a of ["src", "url", "href"]) {
-        const v = xmlAttr(tag, a);
-        if (looksLikeImageUrl(v)) urls.push(v);
-      }
-    }
-    // <image>http://…</image> — адрес текстом внутри тега
-    const inner = chunk.match(/<image\b[^>]*>([\s\S]*?)<\/image>/gi) || [];
-    for (const el of inner) {
-      const v = xmlText(el);
-      if (looksLikeImageUrl(v)) urls.push(v);
-    }
-
-    if (!urls.length) continue;
-    const url = urls.find(hasImageExt) || urls[0];
-    if (seen.has(url)) continue;
-    seen.add(url);
-
-    const imgTag = (chunk.match(/<img\b[^>]*>/i) || [])[0] || "";
-    const imageTag = (chunk.match(/<image\b[^>]*>/i) || [])[0] || "";
-    const sizeFrom = (t) => ({
-      width: parseInt(xmlAttr(t, "width"), 10) || 0,
-      height: parseInt(xmlAttr(t, "height"), 10) || 0
-    });
-    const a = sizeFrom(imgTag);
-    const b = sizeFrom(imageTag);
-
-    out.push({
-      url: url,
-      title: xmlText((chunk.match(/<title>([\s\S]*?)<\/title>/i) || [])[1]).slice(0, 160),
-      width: a.width || b.width,
-      height: a.height || b.height
-    });
-  }
-
-  return horizontalOnly(out);
-}
-
-/**
- * Только горизонтальные кадры. Поиск мы уже просим об этом (у Яндекса —
- * imageSpec, у Pixabay — orientation, у Openverse — aspect_ratio), но ответ
- * приходит от чужой системы, поэтому проверяем сами — если размеры в ответе
- * есть. Размеров нет — ничего не выбрасываем: иначе честный ответ без размеров
- * дал бы пустую панель, а «пусто» и «сломалось» для пользователя одно и то же.
- */
-function horizontalOnly(items) {
-  const sized = items.filter((i) => i.width && i.height);
-  if (!sized.length) return items;
-  return items.filter((i) => !i.width || !i.height || i.width > i.height);
-}
-
-// ------------------------------------------------------- Pixabay и Openverse ---
-// Оба отдают JSON, поэтому разбор простой — но поля у них разные, и сводим мы
-// их к одной форме: { url, title, width, height, credit, creditUrl }. Поля
-// credit/creditUrl добавлены к прежней форме, а не вместо неё: панель и
-// вставка картинки работают с url, и ломать их ради подписи незачем.
-
-/** Язык запроса у Pixabay — это язык самих слов. Русские слова ищем как русские. */
-function pixabayLang(query) {
-  return /[а-яё]/i.test(String(query || "")) ? "ru" : "";
-}
-
-function pixabayUrl(query, settings, count) {
-  const p = new URLSearchParams();
-  p.set("key", String((settings && settings.pixabayKey) || ""));
-  p.set("q", String(query || "").trim().slice(0, 100)); // лимит поля — 100 знаков
-  p.set("image_type", "photo");
-  p.set("orientation", "horizontal");
-  p.set("safesearch", "true");
-  const lang = pixabayLang(query);
-  if (lang) p.set("lang", lang);
-  p.set("per_page", String(Math.max(3, Math.min(200, count || IMAGE_COUNT))));
-  return PIXABAY_API + "?" + p.toString();
-}
-
-function parsePixabayImages(data) {
-  const hits = (data && data.hits) || [];
-  const out = [];
-  const seen = new Set();
-
-  for (const h of hits) {
-    if (!h) continue;
-    // largeImageURL — 1280 px по длинной стороне, webformatURL — 640.
-    const url = String(h.largeImageURL || h.webformatURL || h.previewURL || "").trim();
-    if (!looksLikeImageUrl(url) || seen.has(url)) continue;
-    seen.add(url);
-
-    const tags = String(h.tags || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .slice(0, 3)
-      .join(", ");
-
-    out.push({
-      url: url,
-      title: tags.slice(0, 160),
-      width: parseInt(h.imageWidth, 10) || 0,
-      height: parseInt(h.imageHeight, 10) || 0,
-      credit: h.user ? "Pixabay · " + h.user : "Pixabay",
-      creditUrl: looksLikeImageUrl(h.pageURL) ? String(h.pageURL) : ""
-    });
-  }
-
-  return horizontalOnly(out);
-}
-
-function openverseUrl(query, count) {
-  const p = new URLSearchParams();
-  p.set("q", String(query || "").trim().slice(0, 400));
-  p.set("page_size", String(Math.max(1, Math.min(500, count || IMAGE_COUNT))));
-  p.set("aspect_ratio", "wide");
-  // Для статьи нужны картинки, которые можно и использовать, и менять:
-  // «by-nc» (нельзя коммерчески) и «by-nd» (нельзя менять) отсекаем сразу,
-  // а не объясняем потом, почему картинку нельзя ставить.
-  p.set("license_type", "commercial,modification");
-  p.set("mature", "false");
-  return OPENVERSE_API + "?" + p.toString();
-}
-
-function parseOpenverseImages(data) {
-  const list = (data && data.results) || [];
-  const out = [];
-  const seen = new Set();
-
-  for (const r of list) {
-    if (!r) continue;
-    const url = String(r.url || r.thumbnail || "").trim();
-    if (!looksLikeImageUrl(url) || seen.has(url)) continue;
-    seen.add(url);
-
-    const bits = [];
-    if (r.creator) bits.push(String(r.creator).slice(0, 60));
-    if (r.license) bits.push(String(r.license).toUpperCase() + (r.license_version ? " " + r.license_version : ""));
-    if (r.provider) bits.push(String(r.provider));
-
-    out.push({
-      url: url,
-      title: String(r.title || "").trim().slice(0, 160),
-      width: parseInt(r.width, 10) || 0,
-      height: parseInt(r.height, 10) || 0,
-      credit: bits.join(" · "),
-      creditUrl: looksLikeImageUrl(r.foreign_landing_url) ? String(r.foreign_landing_url) : ""
-    });
-  }
-
-  return horizontalOnly(out);
-}
-
 /** Начало ответа для текста ошибки: без него форма ответа не видна. */
 function headOf(xml) {
   return String(xml || "").replace(/\s+/g, " ").trim().slice(0, 300);
-}
-
-// ------------------------------------------------------- кэш ответов поиска ---
-// Источник в ключе обязателен: один и тот же заголовок у Яндекса и Pixabay —
-// это разные наборы картинок, и общий ключ подсунул бы чужие. Регистр фразы
-// не важен — «Subaru» и «subaru» ищут одно и то же.
-function imageCacheKey(source, query, count) {
-  return [source, String(query || "").trim().toLowerCase(), count].join("|");
-}
-
-/** Свежая запись кэша или null. Просроченную не отдаём и не удаляем: её
- *  затрёт следующая запись, а лишняя запись в local ничего не стоит. */
-async function readImageCache(key) {
-  const cache = await readLocalCache(IMAGE_CACHE_KEY);
-  const hit = cache[key];
-  if (!hit || !hit.at || !Array.isArray(hit.images) || !hit.images.length) return null;
-  if (Date.now() - hit.at > IMAGE_CACHE_TTL) return null;
-  return hit.images;
-}
-
-async function writeImageCache(key, images) {
-  const cache = await readLocalCache(IMAGE_CACHE_KEY);
-  cache[key] = { at: Date.now(), images: images };
-  const keys = Object.keys(cache);
-  if (keys.length > IMAGE_CACHE_MAX) {
-    // Вытесняем самые старые: кэш — не ценность, а local не резиновый.
-    keys.sort((a, b) => ((cache[a] && cache[a].at) || 0) - ((cache[b] && cache[b].at) || 0));
-    for (const k of keys.slice(0, keys.length - IMAGE_CACHE_MAX)) delete cache[k];
-  }
-  await writeLocalCache(IMAGE_CACHE_KEY, cache);
-}
-
-async function findImages(query, settings, opts = {}) {
-  const src = imgSourceInfo(settings);
-  const q = String(query || "").trim();
-
-  if (src.needsKey && !settings[src.id === "yandex" ? "imgKey" : "pixabayKey"]) {
-    throw new Error("Не указан ключ " + src.keyName + " — добавьте его в настройках расширения");
-  }
-  if (src.needsFolder && !settings.imgFolder) {
-    throw new Error("Не указан folder ID Яндекс Облака — добавьте его в настройках расширения");
-  }
-  if (!q) throw new Error("Не из чего собирать запрос: в статье не нашлось ни заголовка, ни текста");
-
-  // Проверки настроек идут раньше кэша: без ключа человеку нужно объяснение,
-  // а не молчаливая выдача из прошлого раза.
-  const cacheKey = imageCacheKey(src.id, q, IMAGE_COUNT);
-  const cached = await readImageCache(cacheKey);
-  if (cached) {
-    return { images: cached, query: q, source: src.label, notice: IMG_NOTICE[src.id] || "", cached: true };
-  }
-
-  let images;
-  let raw;
-
-  if (src.id === "yandex") {
-    raw = await imageSearch(q, settings, IMAGE_COUNT, opts.signal);
-    images = parseImageXml(raw);
-  } else if (src.id === "pixabay") {
-    // Запрос бесплатный, поэтому повтор при сетевой осечке тут не стоит денег.
-    const data = await fetchJson(pixabayUrl(q, settings, IMAGE_COUNT), {
-      signal: opts.signal,
-      label: "Поиск картинок (Pixabay)",
-      tries: 2,
-      // Причину Pixabay пишет в теле простым текстом: «[ERROR 400] Invalid or
-      // missing API key». Без этого в панели осталось бы «HTTP 400», и чужой
-      // ключ выглядел бы как поломка расширения.
-      errorBody: true
-    });
-    raw = JSON.stringify(data);
-    images = parsePixabayImages(data);
-  } else {
-    const data = await fetchJson(openverseUrl(q, IMAGE_COUNT), {
-      signal: opts.signal,
-      label: "Поиск картинок (Openverse)",
-      tries: 2,
-      // У Openverse причина в теле JSON: {"detail":"Invalid token."}.
-      errorBody: true
-    });
-    raw = JSON.stringify(data);
-    images = parseOpenverseImages(data);
-  }
-
-  if (!images.length) {
-    // Молчаливая пустая галерея — худший исход: непонятно, поиск не нашёл или
-    // мы не разобрали ответ. Показываем начало ответа.
-    throw new Error(src.label + " ответил, но картинок в ответе не нашлось. Начало ответа: " + headOf(raw));
-  }
-  // Пустой ответ в кэш не кладём: «не нашлось» — это про сегодняшнюю выдачу,
-  // и запирать его на сутки незачем.
-  await writeImageCache(cacheKey, images);
-  return { images: images, query: q, source: src.label, notice: IMG_NOTICE[src.id] || "", cached: false };
-}
-
-// Фразы для поиска картинок по смыслу статьи. Заголовок даёт тему, но не
-// смысл, поэтому если AI-рерайт настроен — просим у модели короткие запросы.
-// Без модели работаем заголовком: обещать «по смыслу» без неё нечестно.
-const IMAGE_QUERY_PROMPT =
-  "Ты подбираешь иллюстрации к статье для Яндекс.Дзена. " +
-  "Придумай 3 коротких запроса для поиска картинок по смыслу этой статьи. " +
-  "Каждый запрос — 2–4 слова, без кавычек, без нумерации, по одному в строке. " +
-  "Верни только запросы, ничего больше.";
-
-function parseQueries(text) {
-  return String(text || "")
-    .split(/\r?\n/)
-    .map((s) => s.replace(/^\s*(?:[-–—*•]|\d+[.)])\s*/, "").replace(/^["«']|["»']$/g, "").trim())
-    .filter((s) => s.length >= 3 && s.length <= 100)
-    .slice(0, IMAGE_QUERIES_MAX);
-}
-
-async function aiImageQueries(text, settings, opts = {}) {
-  const base = (settings.aiBaseUrl || DEFAULTS.aiBaseUrl).replace(/\/+$/, "");
-  // Фразы для картинок — та же модель и тот же медленный путь: у своей машины
-  // свой потолок, иначе панель молча осталась бы с одним заголовком статьи.
-  const local = isLocalAiBase(base);
-  const data = await fetchJson(base + "/chat/completions", {
-    signal: opts.signal,
-    label: "AI",
-    tries: local ? 1 : 2,
-    timeout: aiTimeoutMs(text, local),
-    method: "POST",
-    headers: aiHeaders(settings),
-    body: JSON.stringify({
-      model: settings.aiModel || DEFAULTS.aiModel,
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: IMAGE_QUERY_PROMPT },
-        { role: "user", content: String(text || "").slice(0, 4000) }
-      ]
-    })
-  });
-  const out = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  return parseQueries(out);
 }
 
 // ------------------------------------------------------- проверка ключей ---
@@ -2027,7 +1544,7 @@ function aiAnswered(data) {
 //
 // Ключи берём из полей попапа (msg.overrides), а не из хранилища: проверять
 // надо то, что человек только что вписал, — иначе кнопка проверяла бы прошлую
-// версию настроек. Запросы платные (у Яндекса — один поисковый), поэтому
+// версию настроек. Запросы платные, поэтому
 // проверка идёт только по нажатию и без повторов.
 
 async function checkAiKey(settings) {
@@ -2100,47 +1617,6 @@ async function checkAiKey(settings) {
   return local
     ? "Модель «" + answered + "» ответила. Ключ не нужен — это свой сервер."
     : "Ключ рабочий. Модель «" + answered + "» ответила.";
-}
-
-async function checkImageKey(settings) {
-  const src = imgSourceInfo(settings);
-
-  if (src.id === "yandex") {
-    if (!settings.imgKey) throw new Error("Не указан ключ Yandex Search API — впишите его в поле выше");
-    if (!settings.imgFolder) throw new Error("Не указан folder ID Яндекс Облака — впишите его в поле выше");
-
-    // Одна картинка вместо двенадцати: проверяем ключ и folder ID, а не подбираем
-    // иллюстрации. Запрос платный, поэтому ровно один.
-    const xml = await imageSearch("проверка ключа", settings, 1);
-    const found = parseImageXml(xml).length;
-    return found
-      ? "Ключ рабочий: поиск ответил, картинок в ответе — " + found + "."
-      : "Ключ рабочий: поиск ответил, но картинок в ответе не нашлось.";
-  }
-
-  if (src.id === "pixabay") {
-    if (!settings.pixabayKey) throw new Error("Не указан ключ Pixabay — впишите его в поле выше");
-    const data = await fetchJson(pixabayUrl("проверка ключа", settings, 3), {
-      label: "Проверка ключа",
-      tries: 1,
-      errorBody: true // чужой ключ объясняется телом ответа, а не кодом
-    });
-    const found = parsePixabayImages(data).length;
-    return found
-      ? "Ключ рабочий: Pixabay ответил, картинок в ответе — " + found + ". Запрос бесплатный."
-      : "Ключ рабочий: Pixabay ответил, но картинок в ответе не нашлось.";
-  }
-
-  // Openverse проверяем без ключа — проверять тут нечего, кроме самого сервиса.
-  const data = await fetchJson(openverseUrl("проверка ключа", 3), {
-    label: "Проверка ключа",
-    tries: 1,
-    errorBody: true
-  });
-  const found = parseOpenverseImages(data).length;
-  return found
-    ? "Ключ не нужен: Openverse отвечает без него, картинок в ответе — " + found + "."
-    : "Openverse ответил, но картинок в ответе не нашлось.";
 }
 
 // ------------------------------------------------------------ сообщения ---
@@ -2259,40 +1735,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // требует настоящего жеста пользователя, и надёжнее не гонять его через
       // service worker, а держать один путь вместо двух.
 
-      if (msg.type === "imageQueries") {
-        const settings = { ...(await getSettings()), ...(msg.overrides || {}) };
-        // Без настроенного AI остаётся заголовок статьи — это не ошибка, а
-        // ожидаемое поведение, поэтому отвечаем пустым списком, а не падаем.
-        if (!settings.aiEnabled || !aiHasAccess(settings)) {
-          sendResponse({ ok: true, queries: [] });
-          return;
-        }
-        sendResponse({ ok: true, queries: await aiImageQueries(msg.text, settings) });
-        return;
-      }
-
-      if (msg.type === "findImages") {
-        const settings = { ...(await getSettings()), ...(msg.overrides || {}) };
-        const out = await findImages(msg.query, settings);
-        // Источник и предупреждение о лицензии едут вместе с картинками: панель
-        // не должна сама угадывать, откуда они пришли. Признак «ответ из кэша»
-        // тоже: без него панель не может объяснить, почему набор не изменился.
-        sendResponse({
-          ok: true,
-          images: out.images,
-          query: out.query,
-          source: out.source,
-          notice: out.notice,
-          cached: !!out.cached
-        });
-        return;
-      }
-
       if (msg.type === "checkKey") {
         const settings = { ...(await getSettings()), ...(msg.overrides || {}) };
-        const text =
-          msg.kind === "images" ? await checkImageKey(settings) : await checkAiKey(settings);
-        sendResponse({ ok: true, text: text });
+        sendResponse({ ok: true, text: await checkAiKey(settings) });
         return;
       }
 
@@ -2316,6 +1761,12 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   // или перезагрузке расширения настройки уже есть, а запись по умолчанию
   // успевала затереть только что сохранённое значение (гонка с попапом).
   if (details && details.reason === "install") await seedDefaults();
+  // Подбор картинок убран в 2.0.0: вычищаем его настройки и кэш, чтобы ключи
+  // не оставались в хранилище мёртвым грузом.
+  try {
+    await chrome.storage.sync.remove(["imgSource"]);
+    await chrome.storage.local.remove(["imgKey", "imgFolder", "pixabayKey", "dzrImages"]);
+  } catch (e) {}
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
       id: "dzr-run",

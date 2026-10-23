@@ -610,10 +610,9 @@ async function main() {
       fs.writeFileSync(path.join(TMP, "shot-settings.png"), Buffer.from(shot.data, "base64"));
     }
 
-    // кладём в оба кэша по записи и проверяем, что счётчик и очистка работают
+    // кладём в кэш запись и проверяем, что счётчик и очистка работают
     await evalJs(`chrome.storage.local.set({
-      dzrCache: { 'google|auto|ru|abc-3': { t: 'тест', at: Date.now() } },
-      dzrImages: { 'pixabay|subaru|12': { at: Date.now(), images: [{ url: 'https://example.com/a.jpg' }] } }
+      dzrCache: { 'google|auto|ru|abc-3': { t: 'тест', at: Date.now() } }
     })`);
     await evalJs(`location.reload()`);
     await sleep(900);
@@ -626,22 +625,17 @@ async function main() {
     const info = await evalJs(`document.getElementById('cache-info').textContent`);
     console.log("cache-info: %j", info);
     check("счётчик кэша видит запись", /1/.test(info), info);
-    // Наборы картинок — второй кэш, и кнопка одна на оба. Счётчик обязан их
-    // называть: иначе человек чистит кэш и не понимает, почему та же фраза
-    // по-прежнему отдаёт прежний набор.
-    check("счётчик называет наборы картинок", /наборов картинок: 1/.test(info), info);
+    check("счётчик называет переводы", /переводов: 1/.test(info), info);
 
     await evalJs(`document.getElementById('clear-cache').click()`);
     await sleep(700);
     const cleared = await evalJs(`(async () => ({
       info: document.getElementById('cache-info').textContent,
       status: document.getElementById('settings-status').textContent,
-      stored: Object.keys((await chrome.storage.local.get({ dzrCache: {} })).dzrCache || {}).length,
-      images: Object.keys((await chrome.storage.local.get({ dzrImages: {} })).dzrImages || {}).length
+      stored: Object.keys((await chrome.storage.local.get({ dzrCache: {} })).dzrCache || {}).length
     }))()`);
     console.log("после очистки: %j", cleared);
     check("кэш очищен в хранилище", cleared.stored === 0, "записей: " + cleared.stored);
-    check("наборы картинок очищены вместе с переводами", cleared.images === 0, "наборов: " + cleared.images);
     check("счётчик обновился", /пуст/i.test(cleared.info), cleared.info);
     check("показан статус очистки", /очищен/i.test(cleared.status), cleared.status);
 
@@ -652,25 +646,18 @@ async function main() {
     await evalJs(`document.getElementById('tab-settings').click()`);
     await sleep(200);
     const keyUI = await evalJs(`(() => {
-      const a = document.getElementById('ai-check'), i = document.getElementById('img-check');
+      const a = document.getElementById('ai-check');
       return {
-        ai: !!a, img: !!i,
+        ai: !!a,
         aiLabel: a ? a.textContent.trim() : '',
-        imgLabel: i ? i.textContent.trim() : '',
         aiInAiFields: !!(a && a.closest('#ai-fields')),
-        aiStatus: !!document.getElementById('ai-check-status'),
-        imgStatus: !!document.getElementById('img-check-status')
+        aiStatus: !!document.getElementById('ai-check-status')
       };
     })()`);
     check("кнопка проверки ключа AI есть", keyUI.ai === true);
-    check("кнопка проверки ключа Яндекса есть", keyUI.img === true);
-    check(
-      "кнопки подписаны одинаково",
-      /Проверить ключ/.test(keyUI.aiLabel) && /Проверить ключ/.test(keyUI.imgLabel),
-      keyUI.aiLabel + " / " + keyUI.imgLabel
-    );
+    check("кнопка подписана «Проверить ключ»", /Проверить ключ/.test(keyUI.aiLabel), keyUI.aiLabel);
     check("проверка ключа AI живёт в блоке AI-настроек", keyUI.aiInAiFields === true);
-    check("у обеих проверок есть строка результата", keyUI.aiStatus && keyUI.imgStatus);
+    check("у проверки есть строка результата", keyUI.aiStatus === true);
 
     const waitStatus = async (id) => {
       for (let i = 0; i < 25; i++) {
@@ -684,47 +671,11 @@ async function main() {
     // Пустые поля — честная ошибка, а не молчание.
     await evalJs(`(() => {
       document.getElementById('aiKey').value = '';
-      document.getElementById('imgKey').value = '';
-      document.getElementById('imgFolder').value = '';
       return true;
     })()`);
     await evalJs(`document.getElementById('ai-check').click()`);
     const aiEmpty = await waitStatus("ai-check-status");
     check("пустой ключ AI объяснён", /API-ключ/.test(aiEmpty), aiEmpty);
-
-    await evalJs(`document.getElementById('img-check').click()`);
-    const imgEmpty = await waitStatus("img-check-status");
-    check("пустой ключ Яндекса объяснён", /Yandex Search API/.test(imgEmpty), imgEmpty);
-
-    // Источник картинок — один список и одна кнопка проверки на три сервиса,
-    // поэтому поля и подсказка обязаны меняться вместе с выбором: иначе человек
-    // впишет ключ Pixabay в поле Яндекса и будет искать, почему «не указан folder ID».
-    const imgSrcUI = (value) => evalJs(`(() => {
-      const s = document.getElementById('imgSource');
-      s.value = ${JSON.stringify(value)};
-      s.dispatchEvent(new Event('change'));
-      return {
-        yandex: !document.getElementById('img-yandex').hidden,
-        pixabay: !document.getElementById('img-pixabay').hidden,
-        hint: document.getElementById('img-check-hint').textContent
-      };
-    })()`);
-    const yandexPick = await imgSrcUI("yandex");
-    check("при Яндексе видны поля Яндекса", yandexPick.yandex && !yandexPick.pixabay, JSON.stringify(yandexPick));
-    check("подсказка предупреждает, что запрос платный", /платн/i.test(yandexPick.hint), yandexPick.hint);
-
-    const pixabayPick = await imgSrcUI("pixabay");
-    check("при Pixabay видны поля Pixabay", !pixabayPick.yandex && pixabayPick.pixabay, JSON.stringify(pixabayPick));
-    check("подсказка говорит, что запрос бесплатный", /бесплатн/i.test(pixabayPick.hint), pixabayPick.hint);
-
-    const openversePick = await imgSrcUI("openverse");
-    check(
-      "при Openverse полей с ключами нет",
-      !openversePick.yandex && !openversePick.pixabay,
-      JSON.stringify(openversePick)
-    );
-    check("подсказка говорит, что ключ не нужен", /не нужен/i.test(openversePick.hint), openversePick.hint);
-    await imgSrcUI("yandex");
 
     // Проверяем вписанное, а не сохранённое: иначе кнопка проверяла бы прошлую
     // версию настроек, и человек чинил бы не то. Фон подставной — в сеть не идём.
