@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Дзен — мок, где редактор появляется позже (SPA)</title>
+<style>
+  body { font: 16px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #fff; color: #1a1a1a; }
+  .page { max-width: 760px; margin: 0 auto; padding: 32px 24px 160px; }
+  .body { outline: none; min-height: 420px; }
+  .body h2 { font-size: 20px; margin: 24px 0 8px; }
+  .body p { margin: 12px 0; }
+  .spinner { color: #888; font-size: 14px; }
+</style>
+</head>
+<body>
+  <div class="page">
+    <p class="spinner" id="loading">Загружаем редактор…</p>
+    <div id="host"></div>
+  </div>
+
+  <script>
+    // Дзен — SPA: редактор монтируется заметно позже загрузки страницы.
+    // Панель к этому моменту уже построена и должна быть свёрнута в пузырёк,
+    // а затем развернуться сама.
+    setTimeout(function () {
+      var loading = document.getElementById("loading");
+      if (loading) loading.remove();
+      var ed = document.createElement("div");
+      ed.className = "body";
+      ed.setAttribute("contenteditable", "true");
+      ed.innerHTML =
+        '<h2>2026 Subaru Outback Wilderness Summary Points</h2>' +
+        '<p>The Wilderness trim is the most rugged and off-road capable version of the 2026 Outback.</p>' +
+        '<p>Standard features include electronic dampers, chunky all-terrain tires, 9.5 inches of ground clearance.</p>' +
+        '<p>The 2026 Subaru Outback Wilderness has a potent yet familiar turbocharged 2.4-liter Boxer engine.</p>';
+      document.getElementById("host").appendChild(ed);
+    }, 1500);
+  </script>
+</body>
+</html>

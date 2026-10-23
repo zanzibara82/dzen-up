@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "Дзен Рерайтер — перевод и рерайт статей",
+  "version": "1.1.1",
+  "description": "Выделите текст в редакторе Яндекс Дзен и нажмите иконку внизу окна — текст будет переведён и отрерайчен.",
+  "minimum_chrome_version": "102",
+  "permissions": ["storage", "contextMenus", "activeTab", "scripting"],
+  "optional_host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
+  "host_permissions": [
+    "https://dzen.ru/*",
+    "https://zen.yandex.ru/*",
+    "https://translate.googleapis.com/*",
+    "https://api.mymemory.translated.net/*",
+    "https://api.openai.com/*",
+    "https://openrouter.ai/*",
+    "https://searchapi.api.cloud.yandex.net/*",
+    "https://pixabay.com/*",
+    "https://api.openverse.org/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://dzen.ru/*", "https://zen.yandex.ru/*"],
+      "js": ["presets.js", "rewriter.js", "content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "Дзен Рерайтер",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_ui": {
+    "page": "popup.html",
+    "open_in_tab": true
+  },
+  "commands": {
+    "translate-rewrite": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "Command+Shift+Y" },
+      "description": "Перевести и отрерайтить выделенный текст"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
