@@ -628,7 +628,7 @@
 
   /**
    * Значение для атрибута. От escapeHtml отличается кавычкой: без неё адрес
-   * картинки, пришедший из поиска, закрыл бы атрибут и добавил свои.
+   * с кавычкой закрыл бы атрибут и добавил свои теги.
    */
   function escapeAttr(s) {
     return escapeHtml(s).replace(/"/g, "&quot;");
@@ -1504,10 +1504,6 @@
     if (barLeft != null) placeAt(barLeft, barTop, barSide);
   }
 
-  function isCollapsed() {
-    return collapsed;
-  }
-
   function startEditorWatch() {
     if (editorWatch) return;
     editorWatch = setInterval(function () {
@@ -1721,10 +1717,6 @@
         if (t) o.textContent = t;
       });
     });
-  }
-
-  function isVertical() {
-    return !!(bar && bar.classList.contains("dzr-vertical"));
   }
 
   /**
@@ -2273,7 +2265,7 @@
       parts[i] =
         parts[i].slice(0, at) +
         '<a href="' +
-        escapeHtml(url) +
+        escapeAttr(url) +
         '"' +
         (rel || "") +
         ">" +
