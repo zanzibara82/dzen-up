@@ -414,6 +414,63 @@ async function main() {
     check("промпты заведомо влезают в лимит sync (8 КБ на ключ)", fat.length === 0, fat.map((p) => p.id).join(","));
   }
 
+  console.log("\n=== 16. запись кэша не ждёт таймера ===");
+  {
+    // Воркер MV3 убивается в простое: не записанное — пропало. Кэш переводов
+    // сохранялся паузой в 1,5 с после последнего фрагмента, и воркер,
+    // дописавший статью и заснувший, терял готовые переводы. Проверка
+    // требует: как только translate вернул ответ, запись уже в хранилище,
+    // без ожидания дебаунса.
+    // Фрагмент обязан быть НЕ на русском: русский при targetLang=ru считается
+    // уже переведённым (job.same) и в кэш не пишется — проверка бы висела
+    // вхолостую, без единого обращения к переводчику.
+    await clearCache();
+    routes = { google: ({ q }) => ({ body: googleBody(q.toUpperCase()) }) };
+    await translateText("A fragment that must reach the storage.", SETTINGS);
+    let landed = false;
+    for (let i = 0; i < 24 && !landed; i++) {
+      landed = Object.keys(localStore.dzrCache || {}).length > 0;
+      if (!landed) await sleep(25);
+    }
+    check("кэш переводов пишется сразу, а не через паузу", landed, "не дождались записи за ~600 мс");
+  }
+
+  console.log("\n=== 17. висячий сайт: карта читается с таймаутом ===");
+  {
+    // fetchText — единственный сетевой путь без таймаута: сайт, принявший
+    // запрос и замолчавший, вешает чтение карты навсегда, и сообщение
+    // перелинковки остаётся без ответа. Чтобы не ждать реального потолка,
+    // грузим background.js ещё раз с таймером, ускоренным в сто раз, и
+    // ставим «сервер», который молчит вечно.
+    const realST = setTimeout;
+    const scaleST = (cb, ms) => realST(cb, Math.max(1, Math.round((ms || 0) / 100)));
+    const api2 = new Function("chrome", "setTimeout", "clearTimeout", src + "\nreturn { sitemapFor };")(
+      chrome,
+      scaleST,
+      clearTimeout
+    );
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (url, opts = {}) =>
+      new Promise((res, rej) => {
+        // «сервер» принял соединение и замолчал: ни ответа, ни обрыва.
+        // Ожить обещает только когда его оборвут по таймауту.
+        const s = opts.signal;
+        if (s) {
+          if (s.aborted) { rej(new Error("abort")); return; }
+          s.addEventListener("abort", () => rej(new Error("висячий ответ оборван")));
+        }
+      });
+    const outcome = await Promise.race([
+      api2.sitemapFor("https://hang.example/sitemap.xml", null, true).then(
+        () => "done",
+        () => "error"
+      ),
+      new Promise((r) => realST(() => r("hang"), 4000))
+    ]);
+    globalThis.fetch = prevFetch;
+    check("висячий сайт не вешает чтение карты", outcome === "done", "исход: " + outcome);
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);
