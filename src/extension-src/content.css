@@ -341,26 +341,17 @@
   color: #fcd34d;
 }
 
-.dzr-hl {
-  outline: 2px dashed rgba(217, 70, 239, 0.8) !important;
-  outline-offset: 4px;
-  border-radius: 6px;
-}
-
 /* ----------------------------------------------- предпросмотр перевода --- */
 /* Карточка показывает, как переведённый текст встанет в статью. Пока она
    открыта, статья не меняется: вставка происходит только по «Применить». */
 
 #dzr-preview,
-#dzr-preview *,
-#dzr-images,
-#dzr-images * {
+#dzr-preview * {
   box-sizing: border-box;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "YS Text", Roboto, Arial, sans-serif;
 }
 
-#dzr-preview,
-#dzr-images {
+#dzr-preview {
   position: fixed;
   z-index: 2147483601;
   width: 560px;
@@ -379,8 +370,7 @@
   user-select: none;
 }
 
-#dzr-preview .dzr-pv-head,
-#dzr-images .dzr-pv-head {
+#dzr-preview .dzr-pv-head {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -389,8 +379,7 @@
   font-size: 13px;
 }
 
-#dzr-preview .dzr-pv-sub,
-#dzr-images .dzr-pv-sub {
+#dzr-preview .dzr-pv-sub {
   font-size: 11px;
   color: rgba(255, 255, 255, 0.55);
 }
@@ -442,8 +431,7 @@
   max-width: 100%;
 }
 
-#dzr-preview .dzr-pv-foot,
-#dzr-images .dzr-pv-foot {
+#dzr-preview .dzr-pv-foot {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -452,8 +440,7 @@
 }
 
 #dzr-preview .dzr-pv-apply,
-#dzr-preview .dzr-pv-cancel,
-#dzr-images .dzr-pv-cancel {
+#dzr-preview .dzr-pv-cancel {
   padding: 8px 16px;
   border-radius: 999px;
   border: 1px solid transparent;
@@ -471,14 +458,12 @@
   filter: brightness(1.1);
 }
 
-#dzr-preview .dzr-pv-cancel,
-#dzr-images .dzr-pv-cancel {
+#dzr-preview .dzr-pv-cancel {
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.16);
   color: rgba(255, 255, 255, 0.85);
 }
-#dzr-preview .dzr-pv-cancel:hover,
-#dzr-images .dzr-pv-cancel:hover {
+#dzr-preview .dzr-pv-cancel:hover {
   background: rgba(255, 255, 255, 0.14);
 }
 
