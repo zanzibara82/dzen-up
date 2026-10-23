@@ -163,8 +163,8 @@ async function main() {
   const server = await startServer();
   const chrome = spawn(CHROME, [
     "--remote-debugging-pipe", "--enable-unsafe-extension-debugging",
-    "--user-data-dir=" + USER_DATA, "--no-first-run", "--no-default-browser-check",
-    "--disable-gpu", "--window-size=1280,900", "about:blank",
+    "--user-data-dir=" + USER_DATA,
+    ...PATHS.chromeFlags(), "--window-size=1280,900", "about:blank",
   ], { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
 
   const c = pipeCdp(chrome);

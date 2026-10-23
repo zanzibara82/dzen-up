@@ -124,6 +124,12 @@ const docs = {
 /** Фраза есть в README (переносы строк не мешают). */
 const inReadme = (frag) => docs["README.md"].includes(norm(frag));
 
+// README репозитория — отдельный текст: `read()` читает из папки расширения,
+// а про тесты и сборку написано в корне. Факт из `test/` нельзя искать в
+// пользовательской инструкции, иначе сторож проверяет не то, где правду пишут.
+const repoReadme = norm(fs.readFileSync(path.join(paths.REPO, "README.md"), "utf8"));
+const inRepo = (frag) => repoReadme.includes(norm(frag));
+
 console.log("\n=== README против кода ===\n");
 
 // ------------------------------------------------- 1. числа обязаны совпадать ---
@@ -450,6 +456,39 @@ for (const f of listed) {
   const exists = fs.existsSync(path.join(EXT, f));
   check("состав пакета: " + f + " есть в папке и назван в README", exists && inReadme(f));
 }
+
+// ------------------------------------ 6. профили тестов не должны обрастать ---
+// Chrome в тестовом профиле качает «дополнения»: одно из них приносит 1,1 ГБ в
+// Default/Extensions, и профиль раздувается с каждым прогоном. Удалить их потом
+// нельзя — ОС отдаёт «Отказано в доступе» и rm, и PowerShell, и уборщику; убирать
+// остаётся руками. Поэтому единственная верная защита — не скачивать: на старте
+// Chrome обязан получать флаги из одного места (PATHS.chromeFlags), а не свой
+// список «как в прошлый раз». Проверка статическая: она смотрит, что каждый
+// браузерный харнесс эти флаги передаёт.
+const TEST_DIR = path.join(__dirname);
+const browserHarnesses = fs
+  .readdirSync(TEST_DIR)
+  .filter((f) => /^test-.*\.cjs$/.test(f) && f !== path.basename(__filename))
+  .filter((f) => {
+    const src = fs.readFileSync(path.join(TEST_DIR, f), "utf8");
+    // "--user-data-dir=" — верный признак: он есть только там, где реально
+    // поднимают Chrome. Проверка по «spawn(CHROME» её бы не поймала: у восьми
+    // харнессов аргументы начинаются с переноса строки.
+    return src.includes("spawn(") && src.includes("--user-data-dir=");
+  });
+check("найдены браузерные харнессы", browserHarnesses.length >= 10, browserHarnesses.join(", "));
+for (const f of browserHarnesses) {
+  const src = fs.readFileSync(path.join(TEST_DIR, f), "utf8");
+  check("харнесс " + f + " стартует через PATHS.chromeFlags()", /chromeFlags\s*\(/.test(src));
+}
+// Сами флаги имеют смысл только если они запрещают фоновые загрузки и обновления
+// дополнений; без них helper — пустая обёртка, и профиль снова вырастет до гигабайта.
+const pathsSrc = fs.readFileSync(path.join(TEST_DIR, "paths.cjs"), "utf8");
+check(
+  "флаги запрещают фоновые загрузки и обновления дополнений",
+  /--disable-background-networking/.test(pathsSrc) && /--disable-component-update/.test(pathsSrc)
+);
+check("README репозитория: сказано, как тесты берегут диск", inRepo("chromeFlags"));
 
 console.log("\n=== ИТОГ ===");
 console.log("всего проверок: " + checks + ", провалов: " + fails);

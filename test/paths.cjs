@@ -68,6 +68,31 @@ function testProfile(tag) {
 }
 
 /**
+ * Флаги запуска Chrome для тестов — ОБЩИЕ для всех наборов.
+ *
+ * Два флага важны для диска. Тестовый профиль стартует чистый, и Chrome
+ * успевает докачать в него «дополнения» и компоненты: одно из них приносит
+ * 1,1 ГБ в Default/Extensions. Обратно эти файлы не отдаются — удаление
+ * блокирует ОС (и rm, и PowerShell, и attrib -r), так что убирать гигабайты
+ * приходится руками. Легче не пускать: --disable-background-networking
+ * запрещает фоновые загрузки, --disable-component-update — обновления
+ * компонентов. Профиль перестаёт расти от прогона к прогону.
+ *
+ * Остальные флаги были выписаны в каждом харнессе заново; одиннадцать наборов
+ * уже не совпадали со «списком соседа», поэтому они здесь.
+ */
+function chromeFlags() {
+  return [
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--no-default-browser-check",
+    "--no-first-run",
+    "--disable-gpu"
+  ];
+}
+
+/**
  * Убирает настройки расширения, оставшиеся от прошлого прогона.
  *
  * Зачем: профиль переиспользуется, а состояние из него файлами не убрать (см.
@@ -164,6 +189,7 @@ module.exports = {
   CHROME: findChrome(),
   normalize,
   testProfile,
+  chromeFlags,
   clearStorage,
   scratchExt
 };
