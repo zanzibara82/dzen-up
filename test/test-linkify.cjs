@@ -50,6 +50,16 @@ const SITEMAP_NO_MATCH = `<?xml version="1.0" encoding="UTF-8"?>
 <url><loc>${SITE}/remont-dvigatelya-svoimi-rukami/</loc></url>
 </urlset>`;
 
+// Карта, где под модели есть только страницы рубрик: ссылка должна встать на
+// рубрику, а не на корень сайта и не на статью про масло.
+const SITEMAP_TAGS = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>${SITE}/kak-vybrat-maslo/</loc></url>
+<url><loc>${SITE}/tag/volvo-xc40/</loc></url>
+<url><loc>${SITE}/category/camry/</loc></url>
+<url><loc>${SITE}/tag/camry/page/2/</loc></url>
+</urlset>`;
+
 // Лента канала: у Дзена карты статей нет, она собирается обходом открытого API.
 // Мок-сервер отдаёт её вместо платформы, чтобы проверка была без сети.
 // Чужую карточку (другой publisher_id) добавляем нарочно: она обязана отсеяться.
@@ -127,6 +137,11 @@ function startServer() {
     if (url === "/empty-sitemap.xml") {
       res.writeHead(200, { "Content-Type": "application/xml; charset=utf-8" });
       res.end(SITEMAP_NO_MATCH);
+      return;
+    }
+    if (url === "/tag-sitemap.xml") {
+      res.writeHead(200, { "Content-Type": "application/xml; charset=utf-8" });
+      res.end(SITEMAP_TAGS);
       return;
     }
     if (url === "/channel-api") {
@@ -636,6 +651,44 @@ async function main() {
       after.links.some((link) => link.text === 'Тойота Камри' && link.href === ARTICLES.toyota));
     check("синонимы: разные написания одной модели не дают повторных ссылок", after.links.length === 1);
     check("синонимы: выбор другого написания не меняет текст", after.text === variantsBefore.text);
+
+    console.log("\n=== рубрики: ссылка на подборку вместо ненайденной статьи ===");
+    await setSettings({ preview: false, linkSites: SITE + "/tag-sitemap.xml", linkChannels: "", linkCount: 2, linkSynonyms: "" });
+    await openPage();
+    // Абзацы с моделями разнесены: в соседнем абзаце ссылка по правилу не
+    // ставится, и на двух подряд моделях мы бы проверяли не рубрики.
+    await evalJs(`(() => {
+      document.querySelector('.body').innerHTML =
+        '<h2>Рубрики вместо статей</h2>' +
+        '<p>Вводный абзац про рынок подержанных машин — здесь ссылок быть не должно.</p>' +
+        '<p>Volvo XC40 подешевел за месяц.</p>' +
+        '<p>Дорога была длинной, покрытие менялось от гладкого асфальта до неровной грунтовки.</p>' +
+        '<p>Toyota Camry получила обновлённый салон и новый мотор.</p>' +
+        '<p>Подведём итоги после нескольких месяцев эксплуатации и сравним расходы.</p>';
+      return true;
+    })()`);
+    const tagsBefore = await snapshot();
+    toast = await runLinkify();
+    after = await snapshot();
+    console.log("  уведомление: %j", toast.replace(/\n/g, " | "));
+    console.log("  ссылки: %j", after.links.map((l) => l.text + " → " + l.href));
+    check(
+      "рубрики: модель без статьи ведёт на её рубрику",
+      after.links.some((l) => l.href === SITE + "/tag/volvo-xc40/"),
+      JSON.stringify(after.links.map((l) => l.href))
+    );
+    check(
+      "рубрики: рубрика по специфичному слову выбрана, а не по марке",
+      after.links.some((l) => l.href === SITE + "/category/camry/"),
+      JSON.stringify(after.links.map((l) => l.href))
+    );
+    check("рубрики: страница с фильтром не стала целью", !/page\/2/.test(JSON.stringify(after.links)));
+    check("рубрики: текст статьи не изменён", after.text === tagsBefore.text);
+    check(
+      "рубрики: в отчёте видно, что ссылки ведут на рубрики",
+      /2 ведут на рубрику/.test(toast),
+      toast.replace(/\n/g, " | ")
+    );
 
     const errs = c.events.filter((e) => e.method === "Runtime.exceptionThrown");
     if (errs.length) {

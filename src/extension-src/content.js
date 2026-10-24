@@ -2431,6 +2431,12 @@
       }
       notes.push(where.join(" · "));
     }
+    // Рубрика — не статья: человек должен видеть, что ссылка ведёт на подборку
+    // материалов по теме, а не на конкретный текст.
+    var toTag = placed.filter(function (p) {
+      return p.kind === "tag";
+    }).length;
+    if (toTag) notes.push(toTag + " " + leadsWord(toTag) + " на рубрику сайта — своей статьи не нашлось");
 
     clearSaved();
     setStatus("Готово: " + placed.length + " ссыл.", "ok");
