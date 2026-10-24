@@ -321,6 +321,40 @@ async function main() {
     check("попап подхватил большой глоссарий из хранилища", afterReload.same === true, "длина " + afterReload.len);
     check("промпт остался сокращённым", afterReload.prompt === "короткий промпт", JSON.stringify(afterReload.prompt));
 
+    const synonymStorage = await evalJs(`(async () => {
+      const send = (m) => new Promise((r) => chrome.runtime.sendMessage(m, r));
+      await chrome.storage.local.remove('linkSynonyms');
+      await chrome.storage.sync.set({ linkSynonyms: 'polo = народный седан' });
+      const migrated = await send({ type: 'getSettings' });
+      const local = await chrome.storage.local.get('linkSynonyms');
+      const sync = await chrome.storage.sync.get('linkSynonyms');
+      const large = ('cayenne = кайенна\\n').repeat(1000);
+      const saved = await send({ type: 'saveSettings', settings: { linkSynonyms: large } });
+      const round = await send({ type: 'getSettings' });
+      await chrome.storage.sync.set({ linkSynonyms: 'устаревшее = старое' });
+      const preferred = await send({ type: 'getSettings' });
+      const after = await chrome.storage.sync.get('linkSynonyms');
+      await send({ type: 'saveSettings', settings: { linkSynonyms: '' } });
+      const cleared = await send({ type: 'getSettings' });
+      await chrome.storage.sync.set({ linkSynonyms: 'polo = старый вариант' });
+      const clearedAfterSync = await send({ type: 'getSettings' });
+      return {
+        clearedAfterSync: clearedAfterSync.settings?.linkSynonyms === '',
+        migrated: migrated.settings?.linkSynonyms,
+        local: local.linkSynonyms,
+        syncAbsent: sync.linkSynonyms === undefined,
+        largeSaved: saved.ok && round.settings?.linkSynonyms === large,
+        localWins: preferred.settings?.linkSynonyms === large && after.linkSynonyms === undefined,
+        cleared: cleared.settings?.linkSynonyms === ''
+      };
+    })()`);
+    check("синонимы: старое значение перенесено из sync в local",
+      synonymStorage.migrated === 'polo = народный седан' && synonymStorage.local === 'polo = народный седан' && synonymStorage.syncAbsent);
+    check("синонимы: словарь больше 8 КБ сохраняется целиком", synonymStorage.largeSaved);
+    check("синонимы: local приоритетнее старой копии sync", synonymStorage.localWins);
+    check("синонимы: очистка не возвращает старое значение", synonymStorage.cleared);
+    check("синонимы: поздняя копия sync не отменяет очистку", synonymStorage.clearedAfterSync);
+
     const errs = c.events.filter((e) => e.method === "Runtime.exceptionThrown");
     if (errs.length) {
       console.log("\nисключения:");
@@ -336,6 +370,7 @@ async function main() {
     const bad = results.filter((r) => !r.ok);
     console.log("всего проверок: %d, провалов: %d", results.length, bad.length);
     bad.forEach((b) => console.log("  FAIL: %s (%s)", b.name, b.detail));
+    process.exitCode = bad.length ? 1 : 0;
   } finally {
     try { execSync("taskkill /F /T /PID " + chrome.pid, { stdio: "ignore" }); } catch {}
   }

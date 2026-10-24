@@ -345,6 +345,16 @@
         них места нет, а по адресу вида <b>/a/…</b> не понять, о чём статья.
       </p>
 
+      <label for="linkSynonyms" style="margin-top: 14px">Синонимы для перелинковки</label>
+      <textarea id="linkSynonyms" rows="4" aria-describedby="link-synonyms-hint" placeholder="cayenne = Каен&#10;Land Cruiser = Крузак"></textarea>
+      <p id="link-synonyms-hint" class="hint" style="margin: 6px 0 0">
+        По строке на правило: <b>Термин = вариант</b>. Слева — название для поиска,
+        справа — его вариант в тексте. Ваши правила приоритетнее встроенных; регистр
+        не важен, строки с <b>#</b> игнорируются. Текст статьи не меняется.
+        Словарь хранится локально, не ограничен 8 КБ и не синхронизируется.
+        Пустое поле оставляет только встроенные синонимы.
+      </p>
+
       <label for="linkCount" style="margin-top: 12px">Сколько ссылок на статью</label>
       <input id="linkCount" type="number" min="1" max="10" step="1" placeholder="2" />
       <p class="hint" style="margin: 6px 0 0">

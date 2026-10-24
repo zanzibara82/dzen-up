@@ -22,6 +22,7 @@ const DEFAULTS = {
   glossary: "", // термины, которые нельзя переводить: «Оригинал = Замена» построчно
   linkSites: "", // сайты для перелинковки: по строке на сайт (хранится в local)
   linkChannels: "", // каналы Дзена для перелинковки: по строке на канал (хранится в local)
+  linkSynonyms: "",
   linkCount: 2, // сколько ссылок ставить в статью
   aiEnabled: false,
   aiBaseUrl: "https://api.openai.com/v1",
@@ -51,7 +52,7 @@ const DEFAULTS = {
 // При превышении set() падает с ошибкой, и длинный глоссарий молча терялся бы
 // при сохранении. В local лимит около 5 МБ на всё расширение.
 
-const LOCAL_KEYS = ["glossary", "aiKey", "linkSites", "linkChannels"];
+const LOCAL_KEYS = ["glossary", "aiKey", "linkSites", "linkChannels", "linkSynonyms"];
 
 function isLocalKey(key) {
   return LOCAL_KEYS.indexOf(key) !== -1;
@@ -69,7 +70,7 @@ async function getSettings() {
   // лежащий в sync от прошлой версии расширения.
   for (const k of LOCAL_KEYS) {
     const lv = localStored[k];
-    if (lv !== undefined && lv !== "") out[k] = lv;
+    if (lv !== undefined && (lv !== "" || k === "linkSynonyms")) out[k] = lv;
   }
   return out;
 }
@@ -95,7 +96,8 @@ async function migrateLegacySettings() {
     // его, иначе перенос молча выбросил бы глоссарий из sync (потеря данных).
     for (const k of present) {
       const lv = local[k];
-      if (lv === undefined || lv === "") move[k] = legacy[k];
+      // Синонимы появились после отказа от пустых дефолтов: пусто здесь означает явную очистку.
+      if (lv === undefined || (lv === "" && k !== "linkSynonyms")) move[k] = legacy[k];
     }
     if (Object.keys(move).length) await chrome.storage.local.set(move);
     await chrome.storage.sync.remove(LOCAL_KEYS);
@@ -626,13 +628,199 @@ const MODEL_STOP = new Set([
   "into", "plus", "series", "model", "models", "class", "truck", "trucks", "van", "vans"
 ]);
 
-const BRAND_INDEX = (() => {
-  const idx = Object.create(null);
-  CAR_BRANDS.forEach((b) => {
-    idx[b.toLowerCase()] = b;
-  });
-  return idx;
+// Добавляем только проверенные варианты названий, на которых терялась ссылка; не угадываем окончания.
+const MODEL_ALIASES = {
+  cayenne: ["кайенн", "кайен", "кайенна", "кайена", "кайенну", "кайенном"],
+  macan: ["макан", "макана", "макане"],
+  panamera: ["панамера", "панамеры", "панамеру"],
+  granta: ["гранта", "гранты", "гранте", "гранту", "грантой", "грантов"],
+  vesta: ["веста", "весты", "весте", "весту", "вестой"],
+  kalina: ["калина", "калины", "калине", "калину"],
+  priora: ["приора", "приоры", "приоре", "приору"],
+  niva: ["нива", "нивы", "ниве", "ниву"],
+  largus: ["ларгус", "ларгуса", "ларгусе"],
+  xray: ["иксрей", "иксрея"],
+  polo: ["поло"],
+  golf: ["гольф", "гольфа", "гольфе"],
+  passat: ["пассат", "пассата", "пассате"],
+  tiguan: ["тигуан", "тигуана", "тигуане"],
+  touareg: ["туарег", "туарега", "туареге"],
+  jetta: ["джетта", "джетты", "джетту"],
+  solaris: ["солярис", "соляриса", "солярисе"],
+  creta: ["крета", "креты", "крету"],
+  tucson: ["туссан", "туссана", "туксон", "туксона"],
+  "santa fe": ["санта фе", "санта-фе"],
+  elantra: ["элантра", "элантры", "элантру"],
+  sonata: ["соната", "сонаты", "сонату"],
+  octavia: ["октавия", "октавии", "октавию"],
+  rapid: ["рапид", "рапида", "рапиде"],
+  kodiaq: ["кодиак", "кодиака", "кодиаке"],
+  karoq: ["карок", "карока", "кароке"],
+  superb: ["суперб", "суперба", "супербе"],
+  fabia: ["фабия", "фабии", "фабию"],
+  camry: ["камри"],
+  corolla: ["королла", "короллы", "короллу"],
+  rav4: ["рав4", "рав 4"],
+  "land cruiser": ["ленд крузер", "ленд крузера", "ланд крузер", "ланд крузера"],
+  prado: ["прадо"],
+  highlander: ["хайлендер", "хайлендера"],
+  fortuner: ["фортунер", "фортунера"],
+  yaris: ["ярис", "яриса"],
+  logan: ["логан", "логана", "логане"],
+  sandero: ["сандеро"],
+  duster: ["дастер", "дастера", "дастере"],
+  arkana: ["аркана", "арканы", "аркану"],
+  kaptur: ["каптюр", "каптюра", "каптюре"],
+  megane: ["меган", "мегана", "мегане"],
+  clio: ["клио"],
+  rio: ["рио"],
+  sportage: ["спортейдж", "спортейджа", "спортидж", "спортиджа"],
+  sorento: ["соренто"],
+  ceed: ["сид", "сида", "сиде"],
+  seltos: ["селтос", "селтоса"],
+  cerato: ["церато", "серато"],
+  optima: ["оптима", "оптимы", "оптиму"],
+  k5: ["к5"],
+  qashqai: ["кашкай", "кашкаи", "кашкае", "кашкая"],
+  "x trail": ["xtrail", "икстрейл", "икстрейла"],
+  juke: ["джук", "джука"],
+  teana: ["теана", "теаны", "теану"],
+  almera: ["альмера", "альмеры", "альмеру"],
+  murano: ["мурано"],
+  patrol: ["патрол", "патрола"],
+  outlander: ["аутлендер", "аутлендера"],
+  lancer: ["лансер", "лансера"],
+  pajero: ["паджеро"],
+  asx: ["асх"],
+  focus: ["фокус", "фокуса", "фокусе"],
+  mondeo: ["мондео"],
+  kuga: ["куга", "куги", "кугу"],
+  explorer: ["эксплорер", "эксплорера"],
+  civic: ["сивик", "сивика"],
+  accord: ["аккорд", "аккорда"],
+  cx5: ["сх5"],
+  cx9: ["сх9"],
+  "mazda 3": ["mazda3", "мазда3", "мазда 3"],
+  a4: ["а4"]
+};
+
+const BRAND_ALIASES = {
+  audi: ["ауди"],
+  bmw: ["бмв"],
+  volvo: ["вольво"],
+  gaz: ["газ"],
+  geely: ["джили"],
+  kamaz: ["камаз", "камаза"],
+  lada: ["лада", "лады", "ладе", "ладу", "ладой"],
+  moskvich: ["москвич", "москвича", "москвиче"],
+  nissan: ["ниссан", "ниссана", "ниссане"],
+  renault: ["рено"],
+  toyota: ["тойота", "тойоты", "тойоте", "тойоту", "тойотой"],
+  uaz: ["уаз", "уаза"],
+  haval: ["хавал", "хавейл", "хавала", "хавейла"],
+  hyundai: ["хендай", "хёндай", "хёндэ", "хендэ", "хундаи", "хендая"],
+  chery: ["чери"],
+  skoda: ["шкода", "шкоды", "шкоде", "шкоду"],
+  porsche: ["порше"],
+  volkswagen: ["фольксваген", "фольксвагена", "фольксвагене"],
+  kia: ["киа", "кия"],
+  ford: ["форд", "форда", "форде"],
+  mazda: ["мазда", "мазды", "мазду"],
+  mitsubishi: ["мицубиси", "митсубиси", "митсубиши"],
+  honda: ["хонда", "хонды", "хонду"],
+  chevrolet: ["шевроле"],
+  lexus: ["лексус", "лексуса"],
+  mercedes: ["мерседес", "мерседеса"],
+  "mercedes benz": ["мерседес бенц", "мерседес-бенц"],
+  "land rover": ["ленд ровер", "ленд ровера", "ланд ровер", "ланд ровера"],
+  "range rover": ["рендж ровер", "рейндж ровер", "рейндж ровера"],
+  subaru: ["субару"],
+  suzuki: ["сузуки"],
+  peugeot: ["пежо"],
+  citroen: ["ситроен", "ситроена"],
+  opel: ["опель", "опеля"],
+  changan: ["чанган", "чангана"],
+  exeed: ["эксид", "эксида"],
+  omoda: ["омода", "омоды"],
+  tesla: ["тесла", "теслы", "теслу"]
+};
+
+function addAlias(index, variant, tokens, brand) {
+  const words = slugTokens(variant, true);
+  if (!words.length || !tokens.length) return;
+  // Исходный канон нужен, чтобы повторное правило не потеряло его прежние варианты.
+  index.terms.set(words.join(" "), { tokens, source: tokens, brand });
+  index.canonicals.add(tokens.join(" "));
+  index.maxWords = Math.max(index.maxWords, words.length * 2);
+}
+
+const BUILTIN_ALIASES = (() => {
+  const index = { terms: new Map(), canonicals: new Set(), maxWords: 1 };
+  for (const brand of CAR_BRANDS) addAlias(index, brand, slugTokens(brand), true);
+  for (const [dict, brand] of [[BRAND_ALIASES, true], [MODEL_ALIASES, false]]) {
+    for (const [canonical, variants] of Object.entries(dict)) {
+      const tokens = slugTokens(canonical, true);
+      for (const variant of [canonical, ...variants]) addAlias(index, variant, tokens, brand);
+    }
+  }
+  return index;
 })();
+
+function linkAliases(raw) {
+  if (!String(raw || "").trim()) return BUILTIN_ALIASES;
+  const index = {
+    terms: new Map(BUILTIN_ALIASES.terms),
+    canonicals: new Set(BUILTIN_ALIASES.canonicals),
+    maxWords: BUILTIN_ALIASES.maxWords
+  };
+  for (const line of String(raw).split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const parts = line.split("=").map((part) => part.trim());
+    if (parts.length !== 2 || !parts[0] || !parts[1]) continue;
+    const canonical = slugTokens(parts[0], true);
+    const tokens = canonTokens(canonical);
+    const brand = !!BUILTIN_ALIASES.terms.get(canonical.join(" "))?.brand;
+    const variantKey = slugTokens(parts[1], true).join(" ");
+    if (!tokens.length || !variantKey) continue;
+    if (index.canonicals.has(variantKey)) {
+      const override = { terms: new Map([[variantKey, { tokens, brand }]]), maxWords: index.maxWords };
+      for (const [key, value] of index.terms) {
+        const matchesSource = value.source.some((_, i) => matchAliasAt(value.source, i, override, true));
+        const next = canonTokens(matchesSource ? value.source : value.tokens, override);
+        index.terms.set(key, { ...value, tokens: next });
+      }
+    }
+    addAlias(index, parts[0], tokens, brand);
+    addAlias(index, parts[1], tokens, brand);
+  }
+  return index;
+}
+
+function matchAliasAt(words, i, index, normalized = false) {
+  let limit = Math.min(index.maxWords, words.length - i);
+  for (let k = 0; k < limit; k++) {
+    if (!words[i + k]) { limit = k; break; }
+  }
+  for (let len = limit; len >= 1; len--) {
+    const part = words.slice(i, i + len).join(" ");
+    const key = normalized ? part : slugTokens(part, true).join(" ");
+    const hit = index.terms.get(key);
+    if (hit) return { ...hit, len };
+  }
+  return null;
+}
+
+function canonTokens(tokens, index = BUILTIN_ALIASES) {
+  const out = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const hit = matchAliasAt(tokens, i, index, true);
+    if (hit) {
+      out.push(...hit.tokens);
+      i += hit.len - 1;
+    } else out.push(tokens[i]);
+  }
+  return out;
+}
 
 /** Слова, из которых может состоять название модели: XC40, Cayenne, T143, CLE. */
 function isModelWord(word) {
@@ -643,68 +831,74 @@ function isModelWord(word) {
   return /^[A-ZА-ЯЁ]/.test(s) || /\d/.test(s);
 }
 
-/** Марка в позиции i — самая длинная из подходящих («Land Rover» бьёт «Land»). */
-function matchBrandAt(words, i) {
-  for (let len = 3; len >= 1; len--) {
-    if (i + len > words.length) continue;
-    const parts = [];
-    for (let k = 0; k < len; k++) parts.push(words[i + k].toLowerCase().replace(/\.$/, ""));
-    const brand = BRAND_INDEX[parts.join(" ")];
-    if (brand) return { len, brand };
-  }
-  return null;
-}
-
-/**
- * Названия моделей в тексте: марка плюс до двух слов модели.
- * Возвращает [{anchor, tokens, core}]:
- *   • tokens — все слова для поиска статьи по слагу;
- *   • core — марка плюс первое слово модели: запасной вариант поиска, когда в
- *     слаге модель названа иначе («CLE 646» в тексте, а в адресе — только «cle»).
- */
-function findModels(text) {
+function findModels(text, synonyms = "") {
   const src = String(text || "");
+  const index = linkAliases(synonyms);
   const re = /[A-Za-z\u00C0-\u024F\u0400-\u04FF0-9][A-Za-z\u00C0-\u024F\u0400-\u04FF0-9.\-]*/g;
-  const words = [];
+  const words = [], starts = [], ends = [];
   let m;
-  while ((m = re.exec(src)) !== null) words.push(m[0].replace(/[.\-]+$/, "")); // точка от конца предложения — не часть названия
+  while ((m = re.exec(src)) !== null) {
+    if (ends.length && !/^\s*$/.test(src.slice(ends[ends.length - 1], m.index))) {
+      words.push(""); starts.push(m.index); ends.push(m.index);
+    }
+    const word = m[0].replace(/[.\-]+$/, "");
+    words.push(word); starts.push(m.index); ends.push(m.index + word.length);
+  }
 
   const out = [];
-  const seen = Object.create(null);
+  const seen = new Map();
   for (let i = 0; i < words.length; i++) {
-    const hit = matchBrandAt(words, i);
+    const hit = matchAliasAt(words, i, index);
     if (!hit) continue;
     let j = i + hit.len;
-    const tail = [];
-    // Следующая марка — уже другое название, а не продолжение этого: без
-    // проверки «Volvo Toyota Camry» склеилось бы в одну несуществующую модель.
-    while (j < words.length && tail.length < 2 && isModelWord(words[j]) && !matchBrandAt(words, j)) {
-      tail.push(words[j]);
-      j++;
+    let coreEnd = j;
+    if (hit.brand) {
+      const model = matchAliasAt(words, j, index);
+      if (model && !model.brand) {
+        j += model.len;
+        coreEnd = j;
+      }
+      const tailStart = i + hit.len;
+      while (j < words.length && j - tailStart < 2 && isModelWord(words[j])) {
+        if (matchAliasAt(words, j, index)) break;
+        j++;
+        if (coreEnd === tailStart) coreEnd = j;
+      }
     }
-    const brandWords = words.slice(i, i + hit.len);
-    const anchor = brandWords.join(" ") + (tail.length ? " " + tail.join(" ") : "");
-    // Разобранные слова дальше не пересканируем: иначе «Land Rover Discovery»
-    // дало бы ещё и «Rover Discovery» — вторую, ложную модель, и она съела бы
-    // ссылку, которая должна была достаться другой машине.
+    const anchor = src.slice(starts[i], ends[j - 1]);
+    const tokens = canonTokens(slugTokens(anchor, true), index);
+    const core = canonTokens(slugTokens(src.slice(starts[i], ends[coreEnd - 1]), true), index);
     i = j - 1;
-    const tokens = slugTokens(anchor);
     const key = tokens.join(" ");
-    if (!tokens.length || seen[key]) continue;
-    seen[key] = true;
-    const core = slugTokens(brandWords.join(" "));
-    if (tail.length) core.push(slugTokens(tail[0])[0]);
-    out.push({ anchor, tokens, core });
+    if (!tokens.length) continue;
+    const prior = seen.get(key);
+    if (prior) {
+      const variants = [prior.anchor, ...(prior.alternatives || [])];
+      if (!variants.some((variant) => variant.toLowerCase() === anchor.toLowerCase())) {
+        (prior.alternatives || (prior.alternatives = [])).push(anchor);
+      }
+      continue;
+    }
+    const model = { anchor, tokens, core };
+    seen.set(key, model);
+    out.push(model);
   }
   return out;
 }
 
-/** Слова строки в виде, в котором они встречаются в слагах URL. */
-function slugTokens(s) {
-  return String(s || "")
-    .toLowerCase()
-    .split(/[^a-z0-9\u00C0-\u024F\u0400-\u04FF]+/)
-    .filter((t) => t.length > 1);
+function slugTokens(s, keepShort = false) {
+  const parts = String(s || "").toLowerCase().split(/[^a-z0-9\u00C0-\u024F\u0400-\u04FF]+/).filter(Boolean);
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    let token = parts[i];
+    // Rio 3 — модель и поколение, CLE 646 — модель и комплектация, не буквенные коды.
+    if (/^(?:[a-zа-яё]|cx|xc|сх|хс|rav|рав)$/.test(token) && /^\d{1,2}$/.test(parts[i + 1] || "") &&
+        !CAR_BRANDS.some((brand) => brand.toLowerCase() === token)) {
+      token += parts[++i];
+    }
+    if (keepShort || token.length > 1 || /^\d$/.test(token)) out.push(token);
+  }
+  return out;
 }
 
 /** Список сайтов из настроек: по строке на сайт, # — комментарий. */
@@ -885,21 +1079,28 @@ async function sitemapFor(site, signal, refresh) {
  * (статья канала Дзена). Во втором случае искать приходится по заголовку:
  * адрес статьи на Дзене — это /a/<случайный id>, в нём модели нет.
  */
-function pickArticle(entries, tokens, core, rand) {
+function pickArticle(entries, tokens, core, rand, synonyms = "", cache = new Map()) {
   const list = entries || [];
   if (!list.length) return null;
+  const index = linkAliases(synonyms);
   const r = typeof rand === "function" ? rand() : Math.random();
   const urlOf = (e) => (typeof e === "string" ? e : e.url);
-  const hayOf = (e) =>
-    typeof e === "string"
-      ? e.replace(/^https?:\/\/[^/]+/, "").replace(/[?#].*$/, "")
-      : String(e.title || "") + " " + String(e.url || "").replace(/^https?:\/\/[^/]+/, "");
+  const hayOf = (e) => {
+    let path = String(urlOf(e) || "").replace(/^https?:\/\/[^/]+/, "").replace(/[?#].*$/, "");
+    try { path = decodeURIComponent(path); } catch (e) {}
+    return typeof e === "string" ? path : String(e.title || "") + " " + path;
+  };
+  const indexed = list.map((entry) => {
+    if (!cache.has(entry)) {
+      cache.set(entry, { url: urlOf(entry), tokens: new Set(canonTokens(slugTokens(hayOf(entry), true), index)) });
+    }
+    return cache.get(entry);
+  });
   const tryFind = (need) => {
     if (!need || !need.length) return null;
     const hits = [];
-    for (const e of list) {
-      const set = new Set(slugTokens(hayOf(e)));
-      if (need.every((t) => set.has(t))) hits.push(urlOf(e));
+    for (const entry of indexed) {
+      if (need.every((t) => entry.tokens.has(t))) hits.push(entry.url);
     }
     if (!hits.length) return null;
     return hits[Math.min(hits.length - 1, Math.floor(r * hits.length))];
@@ -1155,7 +1356,7 @@ async function exportChannelMaps(settings) {
 async function buildLinks(text, settings, opts = {}) {
   const sites = parseSiteList(settings.linkSites);
   const channels = parseChannelList(settings.linkChannels);
-  const models = findModels(text);
+  const models = findModels(text, settings.linkSynonyms);
   const stats = {
     models: models.length,
     sites: sites.length,
@@ -1214,24 +1415,27 @@ async function buildLinks(text, settings, opts = {}) {
 
   const sources = Array.from(pools.keys());
   const links = [];
+  const articleCache = new Map();
   models.forEach((model, i) => {
     // Источники перебираем по кругу: первая модель идёт на первый, вторая —
     // на второй. Иначе все ссылки соберутся на первом сайте списка.
     for (let k = 0; k < sources.length; k++) {
       const src = sources[(i + k) % sources.length];
       const entries = pools.get(src) || [];
-      const url = entries.length ? pickArticle(entries, model.tokens, model.core, opts.rand) : null;
+      const url = entries.length
+        ? pickArticle(entries, model.tokens, model.core, opts.rand, settings.linkSynonyms, articleCache)
+        : null;
       if (url) {
         // Заголовок тащим в результат: адрес статьи на Дзене нечитаемый, и в
         // отчёте человеку нужно название, а не /a/<случайный id>.
         const hit = entries.find((e) => (typeof e === "string" ? e : e.url) === url);
         const title = hit && typeof hit === "object" ? hit.title : "";
-        links.push({ anchor: model.anchor, url, site: src, kind: "article", title });
+        links.push({ anchor: model.anchor, alternatives: model.alternatives || [], url, site: src, kind: "article", title });
         return;
       }
       // Статья не нашлась, но источник указан явно — ведём на него самого.
       if (!entries.length) {
-        links.push({ anchor: model.anchor, url: src, site: src, kind: "site" });
+        links.push({ anchor: model.anchor, alternatives: model.alternatives || [], url: src, site: src, kind: "site" });
         stats.siteOnly++;
         return;
       }

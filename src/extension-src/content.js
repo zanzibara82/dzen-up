@@ -2314,14 +2314,21 @@
           var link = queue[k];
           var key = String(link.anchor).toLowerCase();
           if (used[key]) continue;
-          var html = wrapAnchorInHtml(inner, link.anchor, link.url, relForUrl(link.url));
+          var variants = [link.anchor].concat(link.alternatives || []);
+          var html = null;
+          var anchor = link.anchor;
+          for (var a = 0; a < variants.length; a++) {
+            anchor = variants[a];
+            html = wrapAnchorInHtml(inner, anchor, link.url, relForUrl(link.url));
+            if (html != null) break;
+          }
           if (html == null) continue;
           used[key] = true;
           queue.splice(k, 1);
           lastAt = i;
           placed.push({
             block: i,
-            anchor: link.anchor,
+            anchor: anchor,
             url: link.url,
             kind: link.kind,
             // Заголовок нужен отчёту: у статьи канала адрес /a/<id> нечитаем.
