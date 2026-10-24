@@ -150,6 +150,8 @@ const NUMERIC = [
   ["background.js", bg, "CHANNEL_TTL", (v) => v / 3600000 + " часов", "кэш карты канала", ["README.md", "popup.html"]],
   ["background.js", bg, "CHANNEL_MAX_PAGES", (v) => "до " + v + " страниц", "лимит обхода ленты"],
   ["background.js", bg, "SITEMAP_MAX_URLS", (v) => "до " + v + " адресов", "лимит адресов карты"],
+  ["background.js", bg, "SITEMAP_MAX_TAGS", (v) => "до " + v + " рубрик", "лимит рубрик карты"],
+  ["background.js", bg, "SPEC_TOKEN_MIN", (v) => "длиннее " + v + " букв", "порог специфичного слова рубрики"],
   ["content.js", content, "EDITOR_MIN_CHARS", (v) => "от " + v + " символов", "порог «это редактор»"],
   ["content.js", content, "EDGE_ZONE", (v) => "ближе " + v + " px", "зона бокового режима"]
 ];
@@ -175,6 +177,31 @@ try {
   check("порог «это редактор»: в README есть «от " + w + "×" + h + "»", docs["README.md"].includes("от " + w + "×" + h));
 } catch (e) {
   check("порог «это редактор»: константы найдены", false, e.message);
+}
+
+// Сегменты-рубрики: человек смотрит на адрес своего сайта и должен понять,
+// почему тот «/category/…» стал целью ссылки, а «/about/…» — нет. Поэтому
+// каждый сегмент из кода обязан быть назван в README — в коде их правят
+// молча, и документация отстаёт первой.
+try {
+  const segments = constArray(bg, "TAG_SEGMENTS");
+  const missing = segments.filter((s) => !docs["README.md"].includes("`" + s + "`"));
+  check("рубрики: все сегменты названы в README", missing.length === 0, missing.join(", "));
+  check("рубрики: список сегментов непустой", segments.length > 0, segments.length + " шт.");
+} catch (e) {
+  check("рубрики: TAG_SEGMENTS найдена в коде", false, e.message);
+}
+
+// Длина слага рубрики — «одно-два слова»: при двух это живая русская фраза, при
+// большем числе — уже перечисление. Сторож выбирает фразу по значению константы,
+// чтобы правка лимита не осталась без текста для человека.
+try {
+  const n = constValue(bg, "TAG_MAX_SLUG_PARTS");
+  const phrase = n === 2 ? "одно-два слова" : "не больше " + n + " слов";
+  check("рубрики: длина слага названа в README («" + phrase + "»)", docs["README.md"].includes(phrase),
+    "TAG_MAX_SLUG_PARTS = " + n);
+} catch (e) {
+  check("рубрики: TAG_MAX_SLUG_PARTS найдена в коде", false, e.message);
 }
 
 // Таймаут AI-рерайта: у облака и у своей машины он разный, поэтому берём обе

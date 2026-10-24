@@ -951,6 +951,68 @@ const SITEMAP_MAX_URLS = 5000; // больше в статьях не нужно
 const SITEMAP_MAX_FILES = 6; // вложенные карты читаем не бесконечно
 const SITE_TIMEOUT_MS = 30000; // один файл карты: повторять нечего, но и висеть нельзя
 
+/**
+ * Служебные сегменты адреса: страница с ними — не статья, а подборка материалов
+ * по метке, категории или рубрике. Такие адреса лежат в той же карте сайта, что
+ * и статьи, и до разделения попадали в пул статей: ссылка на «всё про Cayenne»
+ * вставала там, где читателю ждалась конкретная статья.
+ */
+const TAG_SEGMENTS = ["tag", "tags", "category", "categories", "rubric", "topic", "метка", "тег", "рубрика"];
+const SITEMAP_MAX_TAGS = 500; // меток на сайте бывают тысячами; в подборе нужно несколько
+const TAG_MAX_SLUG_PARTS = 2; // «/tag/kia-sportage/» — рубрика, «/tag/…/page/2/» — фильтр
+const SPEC_TOKEN_MIN = 4; // «sw» и «fe» — приписка к названию, а не слово для подборки
+
+/** Служебный сегмент мог быть записан процентами: «%D1%82%D0%B5%D0%B3» — это «тег». */
+function decodeSegment(part) {
+  try {
+    return decodeURIComponent(part);
+  } catch (e) {
+    return part;
+  }
+}
+
+/**
+ * Что это за адрес под рубричным сегментом: "tag" — годная рубрика (после
+ * сегмента одно-два слова названия), "list" — страница под рубрикой, но не
+ * цель ссылки (общий указатель рубрик, фильтр сортировки или пагинация),
+ * null — обычный адрес. Сегмент сравнивается целиком: «about-my-tag-collection»
+ * рубрикой не считается, хотя слово «tag» в нём есть. Пути режем по сырым
+ * слэшам и только потом раскодируем: «%2F» — часть слага, а не граница пути.
+ */
+function tagKindOf(url) {
+  const raw = String(url || "")
+    .replace(/^https?:\/\/[^/]+/i, "")
+    .replace(/[?#].*$/, "")
+    .split("/")
+    .filter(Boolean);
+  let at = -1;
+  for (let i = 0; i < raw.length; i++) {
+    if (TAG_SEGMENTS.indexOf(decodeSegment(raw[i]).trim().toLowerCase()) !== -1) {
+      at = i;
+      break;
+    }
+  }
+  if (at < 0) return null;
+  const slug = slugTokens(raw.slice(at + 1).map(decodeSegment).join("/"), true);
+  return slug.length >= 1 && slug.length <= TAG_MAX_SLUG_PARTS ? "tag" : "list";
+}
+
+/**
+ * Деление карты на пул статей и пул рубрик. Адрес под рубричным сегментом не
+ * становится статьёй ни при каких условиях — ни когда не прошёл по лимиту, ни
+ * когда у него длинный хвост: ссылка на подборку вместо статьи и есть тот
+ * дефект, из-за которого пулы разделили, и в отчёте он был бы незаметен.
+ */
+function splitSitemapUrls(urls) {
+  const out = { urls: [], tags: [] };
+  for (const url of urls || []) {
+    const kind = tagKindOf(url);
+    if (kind === "tag" && out.tags.length < SITEMAP_MAX_TAGS) out.tags.push(url);
+    else if (!kind) out.urls.push(url);
+  }
+  return out;
+}
+
 /** Кэш в local под произвольным ключом: карты сайтов и карты каналов. */
 async function readLocalCache(key) {
   try {
@@ -1030,6 +1092,7 @@ async function loadSitemap(site, signal) {
   const queue = sitemapCandidates(site);
   const urls = [];
   let files = 0;
+  let read = false;
   const tried = [];
   while (queue.length && files < SITEMAP_MAX_FILES) {
     const url = queue.shift();
@@ -1042,11 +1105,16 @@ async function loadSitemap(site, signal) {
       continue;
     }
     const locs = parseSitemap(xml);
-    if (isSitemapIndex(xml)) queue.push.apply(queue, locs.slice(0, SITEMAP_MAX_FILES - files));
+    const index = isSitemapIndex(xml);
+    // «Карта есть» — это когда из файла хоть что-то достали. Пустой ответ,
+    // заглушка антибота или html вместо xml читаются как «карты нет»: у такого
+    // источника нет материалов, и врать про них в отчёте не нужно.
+    if (locs.length || index) read = true;
+    if (index) queue.push.apply(queue, locs.slice(0, SITEMAP_MAX_FILES - files));
     else urls.push.apply(urls, locs);
     if (urls.length >= SITEMAP_MAX_URLS) break;
   }
-  return { urls: urls.slice(0, SITEMAP_MAX_URLS), tried };
+  return { urls: urls.slice(0, SITEMAP_MAX_URLS), tried, read };
 }
 
 async function sitemapFor(site, signal, refresh) {
@@ -1061,51 +1129,145 @@ async function sitemapFor(site, signal, refresh) {
   const key = hostOf(site) + path;
   const cache = await readLocalCache(SITEMAP_CACHE_KEY);
   const hit = cache[key];
-  if (!refresh && hit && Date.now() - hit.at < SITEMAP_TTL) return hit.urls;
+  if (!refresh && hit && Date.now() - hit.at < SITEMAP_TTL) {
+    // Запись прошлой версии — плоский список, где статьи лежат вперемешку с
+    // рубриками. Перечитываем её через то же деление: сети не просим, профиль
+    // не чистим, но подборка не встаёт под якорь как статья.
+    if (!Array.isArray(hit.tags)) return Object.assign(splitSitemapUrls(hit.urls || []), { read: true });
+    return { urls: hit.urls || [], tags: hit.tags, read: true };
+  }
 
   const res = await loadSitemap(site, signal);
+  const map = splitSitemapUrls(res.urls);
   if (res.urls.length) {
-    await mergeLocalCache(SITEMAP_CACHE_KEY, key, { at: Date.now(), urls: res.urls });
+    await mergeLocalCache(SITEMAP_CACHE_KEY, key, { at: Date.now(), urls: map.urls, tags: map.tags });
   }
-  return res.urls;
+  return Object.assign(map, { read: res.read });
+}
+
+/** Адрес элемента пула: строка (карта сайта) или {url, title} (статья канала). */
+function entryUrl(e) {
+  return typeof e === "string" ? e : e.url;
 }
 
 /**
- * Статья сайта под модель: в слаге должны найтись ВСЕ слова модели, а если
- * такой нет — хотя бы марка с первым словом модели.
- * Из подходящих берём случайную: иначе все ссылки в статье ведут в одно место.
- *
- * Элемент списка — либо строка-адрес (sitemap сайта), либо {url, title}
- * (статья канала Дзена). Во втором случае искать приходится по заголовку:
- * адрес статьи на Дзене — это /a/<случайный id>, в нём модели нет.
+ * По чему ищем: у сайта — слаг адреса, у канала — заголовок плюс адрес.
+ * Адрес статьи на Дзене это /a/<случайный id>, в нём модели нет, поэтому
+ * без заголовка искать было бы нечего.
  */
-function pickArticle(entries, tokens, core, rand, synonyms = "", cache = new Map()) {
+function entryHay(e) {
+  let path = String(entryUrl(e) || "").replace(/^https?:\/\/[^/]+/i, "").replace(/[?#].*$/, "");
+  try {
+    path = decodeURIComponent(path);
+  } catch (e) {
+    /* проценты не раскодируются — ищем по тому, что написано */
+  }
+  return typeof e === "string" ? path : String(e.title || "") + " " + path;
+}
+
+/**
+ * Пул → множество канонических токенов на адрес. Разбор один на весь проход:
+ * карта из пяти тысяч адресов иначе перечитывалась бы по разу на каждую
+ * модель и на каждый источник.
+ */
+function poolIndex(entries, index, cache) {
+  return (entries || []).map((entry) => {
+    let hit = cache.get(entry);
+    if (!hit) {
+      hit = { url: entryUrl(entry), tokens: new Set(canonTokens(slugTokens(entryHay(entry), true), index)) };
+      cache.set(entry, hit);
+    }
+    return hit;
+  });
+}
+
+/**
+ * Ключ адреса для правила «один адрес — одна ссылка»: в одной карте страница
+ * бывает записана со слэшем и без него, с якорем, живым кириллическим словом и
+ * его процентной записью — для человека это одно и то же место. Параметр
+ * («?page=2») и протокол трогать нельзя: за ними стоят разные страницы.
+ */
+function urlKey(url) {
+  const raw = decodeSegment(String(url || "")).replace(/#.*$/, "");
+  const head = (raw.match(/^https?:\/\/[^/]+/i) || [""])[0].toLowerCase();
+  return (head + raw.slice(head.length))
+    .replace(/\/index\.html?$/i, "")
+    .replace(/\/+$/, "");
+}
+
+/**
+ * Первый уровень строгости, давний адрес, тот и берём: списки идут от строгого
+ * к мягкому. Из подходящих — случайный, иначе все ссылки в статье вели бы в
+ * одно место. Уже отданные адреса пропускаем: повтор в одной статье читается
+ * как накрутка.
+ */
+function findInPool(indexed, levels, rand, skip) {
+  const r = typeof rand === "function" ? rand() : Math.random();
+  for (const need of levels) {
+    if (!need || !need.length) continue;
+    const hits = [];
+    for (const entry of indexed) {
+      if (skip && skip.has(urlKey(entry.url))) continue;
+      if (need.every((t) => entry.tokens.has(t))) hits.push(entry.url);
+    }
+    if (hits.length) return hits[Math.min(hits.length - 1, Math.floor(r * hits.length))];
+  }
+  return null;
+}
+
+/**
+ * Статья сайта под модель: в слаге должны найтись ВСЕ канонические слова
+ * модели, а если такой нет — хотя бы марка с первым словом модели.
+ */
+function pickArticle(entries, tokens, core, rand, synonyms = "", cache = new Map(), skip = null) {
+  const list = entries || [];
+  if (!list.length) return null;
+  return findInPool(poolIndex(list, linkAliases(synonyms), cache), [tokens, core], rand, skip);
+}
+
+/**
+ * Слово принадлежит марке? Смотрим не по словарю марок целиком, а по слогам:
+ * у «Land Rover» в названии два слова, и каждое по отдельности — обрывок марки,
+ * а не название модели. Рубрика «/tag/land/» собирает всё, где встретилось
+ * слово «land», и ссылка на неё врёт про содержимое.
+ */
+function isBrandToken(token, index) {
+  for (const entry of index.terms.values()) {
+    if (entry.brand && entry.tokens.indexOf(token) !== -1) return true;
+  }
+  return false;
+}
+
+/**
+ * Самое специфичное слово названия: последнее, что не марка, не номер и не
+ * приписка. «Toyota Camry» → camry. Марка сама по себе слишком общая: рубрика
+ * «все Тойоты» не заменяет статью про Камри, а ссылка на неё врёт про
+ * содержимое. Год и комплектация («2024», «646») в адресах рубрик не
+ * встречаются, и «SW» или «FE» из конца названия — тоже приписка, а не слово:
+ * подборка всего, где встретилось «sw», про Весту ничего не рассказывает.
+ */
+function specificToken(tokens, index) {
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const t = tokens[i];
+    if (/^\d+$/.test(t)) continue;
+    if (t.length < SPEC_TOKEN_MIN) continue;
+    if (isBrandToken(t, index)) continue;
+    return t;
+  }
+  return "";
+}
+
+/**
+ * Рубрика того же сайта: сначала по всему названию модели, если такой
+ * подборки нет — по самому специфичному слову. Рубрики это то, что у сайта
+ * есть почти всегда, поэтому они и стоят после статей, но до ссылки на корень.
+ */
+function pickTag(entries, tokens, rand, synonyms = "", cache = new Map(), skip = null) {
   const list = entries || [];
   if (!list.length) return null;
   const index = linkAliases(synonyms);
-  const r = typeof rand === "function" ? rand() : Math.random();
-  const urlOf = (e) => (typeof e === "string" ? e : e.url);
-  const hayOf = (e) => {
-    let path = String(urlOf(e) || "").replace(/^https?:\/\/[^/]+/, "").replace(/[?#].*$/, "");
-    try { path = decodeURIComponent(path); } catch (e) {}
-    return typeof e === "string" ? path : String(e.title || "") + " " + path;
-  };
-  const indexed = list.map((entry) => {
-    if (!cache.has(entry)) {
-      cache.set(entry, { url: urlOf(entry), tokens: new Set(canonTokens(slugTokens(hayOf(entry), true), index)) });
-    }
-    return cache.get(entry);
-  });
-  const tryFind = (need) => {
-    if (!need || !need.length) return null;
-    const hits = [];
-    for (const entry of indexed) {
-      if (need.every((t) => entry.tokens.has(t))) hits.push(entry.url);
-    }
-    if (!hits.length) return null;
-    return hits[Math.min(hits.length - 1, Math.floor(r * hits.length))];
-  };
-  return tryFind(tokens) || tryFind(core);
+  const spec = specificToken(tokens, index);
+  return findInPool(poolIndex(list, index, cache), [tokens, spec ? [spec] : null], rand, skip);
 }
 
 // --------------------------------------------------------- каналы Дзена ---
@@ -1365,6 +1527,7 @@ async function buildLinks(text, settings, opts = {}) {
     noSitemap: [],
     noChannel: [],
     siteOnly: 0,
+    tagLinks: 0,
     unmapped: []
   };
   if ((!sites.length && !channels.length) || !models.length) return { links: [], stats };
@@ -1390,17 +1553,18 @@ async function buildLinks(text, settings, opts = {}) {
   }
 
   // Источники ссылок: сайты (по sitemap) и каналы (по обходу выдачи). Ключ —
-  // адрес, на который ведём, если статьи не нашлись: сам сайт или сам канал.
+  // адрес, на который ведём, если ни статей, ни рубрик не нашлось: сам сайт
+  // или сам канал. У канала рубрик нет — лента отдаёт только статьи.
   const pools = new Map();
   for (const site of sites) {
-    let urls = [];
+    let map = { urls: [], tags: [], read: false };
     try {
-      urls = await sitemapFor(site, opts.signal, opts.refresh);
+      map = await sitemapFor(site, opts.signal, opts.refresh);
     } catch (e) {
-      urls = [];
+      map = { urls: [], tags: [], read: false };
     }
-    if (!urls.length) stats.noSitemap.push(hostOf(site) || site);
-    pools.set(site, urls);
+    if (!map.read) stats.noSitemap.push(hostOf(site) || site);
+    pools.set(site, map);
   }
   for (const name of channels) {
     let list = [];
@@ -1410,33 +1574,48 @@ async function buildLinks(text, settings, opts = {}) {
       list = [];
     }
     if (!list.length) stats.noChannel.push(name);
-    pools.set(channelUrl(name), list);
+    pools.set(channelUrl(name), { urls: list, tags: [], read: !!list.length });
   }
 
   const sources = Array.from(pools.keys());
   const links = [];
   const articleCache = new Map();
+  // Один адрес — одна ссылка на статью: две на одно место читаются как
+  // накрутка, поэтому взятый адрес подбор пропускает и ищет дальше.
+  const used = new Set();
   models.forEach((model, i) => {
     // Источники перебираем по кругу: первая модель идёт на первый, вторая —
     // на второй. Иначе все ссылки соберутся на первом сайте списка.
     for (let k = 0; k < sources.length; k++) {
       const src = sources[(i + k) % sources.length];
-      const entries = pools.get(src) || [];
-      const url = entries.length
-        ? pickArticle(entries, model.tokens, model.core, opts.rand, settings.linkSynonyms, articleCache)
-        : null;
+      const pool = pools.get(src) || { urls: [], tags: [], read: false };
+      const url = pickArticle(pool.urls, model.tokens, model.core, opts.rand, settings.linkSynonyms, articleCache, used);
       if (url) {
         // Заголовок тащим в результат: адрес статьи на Дзене нечитаемый, и в
         // отчёте человеку нужно название, а не /a/<случайный id>.
-        const hit = entries.find((e) => (typeof e === "string" ? e : e.url) === url);
+        const hit = pool.urls.find((e) => entryUrl(e) === url);
         const title = hit && typeof hit === "object" ? hit.title : "";
+        used.add(urlKey(url));
         links.push({ anchor: model.anchor, alternatives: model.alternatives || [], url, site: src, kind: "article", title });
         return;
       }
-      // Статья не нашлась, но источник указан явно — ведём на него самого.
-      if (!entries.length) {
-        links.push({ anchor: model.anchor, alternatives: model.alternatives || [], url: src, site: src, kind: "site" });
+      // Своей статьи нет — подборка той же темы на том же сайте всё равно
+      // лучше ссылки на корень.
+      const tag = pickTag(pool.tags, model.tokens, opts.rand, settings.linkSynonyms, articleCache, used);
+      if (tag) {
+        used.add(urlKey(tag));
+        stats.tagLinks++;
+        links.push({ anchor: model.anchor, alternatives: model.alternatives || [], url: tag, site: src, kind: "tag", title: "" });
+        return;
+      }
+      // Карты источника нет вовсе — ведём на него самого. Здесь правило
+      // «один адрес — одна ссылка» не действует: это не адрес материала, а
+      // откат «лучшее, что есть», и без него модель осталась бы без ссылки
+      // вовсе. Если же карту прочитали, но подходящего адреса в ней нет, корень
+      // не отдаём: у следующего источника материал вполне может быть.
+      if (!pool.read) {
         stats.siteOnly++;
+        links.push({ anchor: model.anchor, alternatives: model.alternatives || [], url: src, site: src, kind: "site" });
         return;
       }
     }

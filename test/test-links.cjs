@@ -52,7 +52,7 @@ const SRC_TEXT = fs.readFileSync(SRC, "utf8");
 const api = new Function(
   "chrome",
   SRC_TEXT +
-    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap };"
+    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap, sitemapFor };"
 )(chrome);
 
 const {
@@ -64,6 +64,7 @@ const {
   isSitemapIndex,
   sitemapCandidates,
   pickArticle,
+  sitemapFor,
   buildLinks
 } = api;
 
@@ -476,6 +477,263 @@ async function main() {
     [["Кайенна", "https://a.ru/porsche-cayenne-test/"]]);
   res = await buildLinks("тест-драйв Кайенна", { linkSites: "a.ru", linkSynonyms: "polo = Кайенна" }, { rand: () => 0 });
   eq("сборка: пользовательское правило передаётся из настроек", res.links.map((l) => l.url), ["https://a.ru/polo-obzor/"]);
+
+  // ---- 12. карта делится на статьи и рубрики ------------------------------
+  // Ссылка на страницу рубрики — легальная цель, но смешивать её со статьями
+  // нельзя: иначе подбор «статья → рубрика» теряет смысл.
+  routes = {
+    "https://t.ru/sitemap.xml": {
+      body: sm([
+        "https://t.ru/porsche-cayenne-test/",
+        "https://t.ru/tag/cayenne/",
+        "https://t.ru/tags/camry/",
+        "https://t.ru/category/off-road/",
+        "https://t.ru/categories/trucks/",
+        "https://t.ru/rubric/volvo/",
+        "https://t.ru/topic/scania/",
+        "https://t.ru/метка/lada/",
+        "https://t.ru/тег/gaz/",
+        "https://t.ru/рубрика/uaaz/",
+        "https://t.ru/blog/tag/toyota-camry/page/2/",
+        "https://t.ru/tag/"
+      ])
+    }
+  };
+  let map = await sitemapFor("https://t.ru", null, true);
+  eq("карта: в пул статей рубрики не попадают", map.urls, ["https://t.ru/porsche-cayenne-test/"]);
+  eq("карта: каждый сегмент рубрики опознан", map.tags, [
+    "https://t.ru/tag/cayenne/",
+    "https://t.ru/tags/camry/",
+    "https://t.ru/category/off-road/",
+    "https://t.ru/categories/trucks/",
+    "https://t.ru/rubric/volvo/",
+    "https://t.ru/topic/scania/",
+    "https://t.ru/метка/lada/",
+    "https://t.ru/тег/gaz/",
+    "https://t.ru/рубрика/uaaz/"
+  ]);
+
+  // Страница с длинным хвостом после сегмента рубрики — фильтр сортировки или
+  // пагинация, пустой хвост — общий указатель рубрик. Ни то ни другое не статья
+  // и не годится целью: адрес под рубрикой остаётся за её пределами и не
+  // возвращается ни в одном пуле.
+  check(
+    "карта: страница с фильтром не стала статьёй",
+    map.urls.indexOf("https://t.ru/blog/tag/toyota-camry/page/2/") === -1 &&
+      map.tags.indexOf("https://t.ru/blog/tag/toyota-camry/page/2/") === -1
+  );
+  check(
+    "карта: указатель рубрик без слага не стал статьёй",
+    map.urls.indexOf("https://t.ru/tag/") === -1 && map.tags.indexOf("https://t.ru/tag/") === -1
+  );
+
+  // %2F — это часть одного слага, а не граница пути: после раскодировки сегмент
+  // «tag%2Fkia» остаётся одним сегментом и рубрикой не считается.
+  routes = { "https://enc.ru/sitemap.xml": { body: sm(["https://enc.ru/blog/tag%2Fkia/", "https://enc.ru/%D1%82%D0%B5%D0%B3/camry/"]) } };
+  map = await sitemapFor("https://enc.ru", null, true);
+  eq("карта: косая черта из %2F путь не режет", map.urls, ["https://enc.ru/blog/tag%2Fkia/"]);
+  eq("карта: раскодированный кириллический сегмент опознан", map.tags, ["https://enc.ru/%D1%82%D0%B5%D0%B3/camry/"]);
+
+  // Лимит: карта крупного сайта содержит тысячи меток, в подборе нужно несколько.
+  const manyTags = [];
+  for (let i = 0; i < 600; i++) manyTags.push("https://n.ru/tag/t" + i + "/");
+  routes = { "https://n.ru/sitemap.xml": { body: sm(manyTags.concat(["https://n.ru/article/"])) } };
+  map = await sitemapFor("https://n.ru", null, true);
+  eq("карта: рубриков не больше лимита", map.tags.length, 500);
+  eq("карта: метки сверх лимита в статьи не попадают", map.urls, ["https://n.ru/article/"]);
+
+  // Старый кэш (прошлая версия расширения) не содержит рубрик — профиль
+  // пользователя не чистится, карта должна читаться и так. Но плоский список
+  // прошлой версии — это статьи И рубрики вперемешку: запись перечитывается
+  // через то же деление, иначе подборка встанет под якорь как статья.
+  localStore.dzrSitemaps["old.ru"] = { at: Date.now(), urls: ["https://old.ru/kia-sportage-i-ceny/", "https://old.ru/tag/cayenne/"] };
+  fetched.length = 0;
+  const legacy = await sitemapFor("https://old.ru", null, false);
+  eq("старый кэш: статьи прочитаны", legacy.urls, ["https://old.ru/kia-sportage-i-ceny/"]);
+  eq("старый кэш: рубрика из плоской записи не стала статьёй", legacy.tags, ["https://old.ru/tag/cayenne/"]);
+  eq("старый кэш: в сеть не идём", fetched.length, 0);
+  res = await buildLinks("тест-драйв Кайенна", { linkSites: "old.ru" }, { rand: () => 0 });
+  eq("старый кэш: рубрика помечена рубрикой, а не статьёй", res.links.map((l) => [l.url, l.kind]), [
+    ["https://old.ru/tag/cayenne/", "tag"]
+  ]);
+  eq("старый кэш: в сеть по-прежнему не идём", fetched.length, 0);
+  check("кэш: свежая карта сохранена с рубриками", Array.isArray(localStore.dzrSitemaps["t.ru"].tags));
+
+  // ---- 13. порядок подбора: статья → рубрика → сайт -----------------------
+  routes = {
+    "https://s.ru/sitemap.xml": { body: sm(["https://s.ru/porsche-cayenne-test/", "https://s.ru/tag/cayenne/"]) }
+  };
+  res = await buildLinks("тест-драйв Кайенна", { linkSites: "s.ru" }, { refresh: true, rand: () => 0 });
+  eq("подбор: статья сайта важнее рубрики", res.links.map((l) => [l.url, l.kind]), [
+    ["https://s.ru/porsche-cayenne-test/", "article"]
+  ]);
+  eq("подбор: рубрика не посчитана, когда взята статья", res.stats.tagLinks, 0);
+
+  routes = {
+    "https://u.ru/sitemap.xml": { body: sm(["https://u.ru/kia-sportage-i-ceny/", "https://u.ru/tag/cayenne/"]) }
+  };
+  res = await buildLinks("тест-драйв Кайенна", { linkSites: "u.ru" }, { refresh: true, rand: () => 0 });
+  eq("подбор: вместо ненайденной статьи берётся рубрика", res.links.map((l) => [l.url, l.kind]), [
+    ["https://u.ru/tag/cayenne/", "tag"]
+  ]);
+  eq("статистика: ссылка на рубрику посчитана", res.stats.tagLinks, 1);
+  eq("статистика: рубрика не считается ссылкой на сайт", res.stats.siteOnly, 0);
+
+  // Полного совпадения нет — остаётся одно самое специфичное слово названия.
+  routes = { "https://v.ru/sitemap.xml": { body: sm(["https://v.ru/tag/camry/", "https://v.ru/tag/toyota/"]) } };
+  res = await buildLinks("Обзор Toyota Camry", { linkSites: "v.ru" }, { refresh: true, rand: () => 0 });
+  eq("подбор: рубрика по самому специфичному слову", res.links.map((l) => l.url), ["https://v.ru/tag/camry/"]);
+
+  // Рубрика марки — не замена статье о модели: «Toyota Camry» не должна
+  // вести на общий указатель всех Тойот, иначе ссылка врёт про содержимое.
+  routes = { "https://w.ru/sitemap.xml": { body: sm(["https://w.ru/tag/toyota/"]) } };
+  res = await buildLinks("Обзор Toyota Camry", { linkSites: "w.ru" }, { refresh: true, rand: () => 0 });
+  eq("подбор: рубрика марки модель не заменяет", res.links, []);
+  res = await buildLinks("Toyota дорожает", { linkSites: "w.ru" }, { refresh: true, rand: () => 0 });
+  eq("подбор: марка сама по себе ведёт на свою рубрику", res.links.map((l) => [l.url, l.kind]), [
+    ["https://w.ru/tag/toyota/", "tag"]
+  ]);
+
+  // Чужая рубрика не подходит: ни одна модель в неё не ложится.
+  routes = { "https://x.ru/sitemap.xml": { body: sm(["https://x.ru/tag/cayenne/"]) } };
+  res = await buildLinks("Volvo XC40 поехал", { linkSites: "x.ru" }, { refresh: true, rand: () => 0 });
+  eq("подбор: чужая рубрика не берётся", res.links, []);
+  eq("подбор: промах назван в статистике", res.stats.unmapped, ["Volvo XC40"]);
+
+  // ---- 14. один адрес — одна ссылка ---------------------------------------
+  // Две модели, одна статья: вторая не должна вести туда же, ей достаётся
+  // рубрика. Иначе в статье стоят две одинаковые ссылки, и читается это как
+  // накрутка.
+  routes = {
+    "https://y.ru/sitemap.xml": { body: sm(["https://y.ru/porsche-cayenne-test/", "https://y.ru/tag/cayenne/"]) }
+  };
+  res = await buildLinks("Порше Кайенна и просто Кайенна", { linkSites: "y.ru" }, { refresh: true, rand: () => 0 });
+  eq("дубль: вторая модель получает рубрику", res.links.map((l) => [l.anchor, l.kind]), [
+    ["Порше Кайенна", "article"],
+    ["Кайенна", "tag"]
+  ]);
+
+  // Если есть другая подходящая статья — идёт она, а не рубрика.
+  routes = {
+    "https://z.ru/sitemap.xml": {
+      body: sm(["https://z.ru/toyota-camry-2024/", "https://z.ru/camry-test/", "https://z.ru/tag/camry/"])
+    }
+  };
+  res = await buildLinks("Toyota Camry и обновлённая Камри", { linkSites: "z.ru" }, { refresh: true, rand: () => 0 });
+  eq("дубль: адрес не отдаётся дважды", res.links.map((l) => l.url), [
+    "https://z.ru/toyota-camry-2024/",
+    "https://z.ru/camry-test/"
+  ]);
+
+  // Сайт без карты — откат, а не материал: он отдаётся каждой модели, иначе
+  // вторая осталась бы без ссылки вовсе.
+  routes = {};
+  res = await buildLinks("Volvo XC40 и Toyota Camry", { linkSites: "q.ru" }, { refresh: true, rand: () => 0 });
+  eq("откат: сайт без карты отдаётся обеим моделям", res.links.map((l) => [l.anchor, l.kind]), [
+    ["Volvo XC40", "site"],
+    ["Toyota Camry", "site"]
+  ]);
+  eq("откат: промахов при откате нет", res.stats.unmapped, []);
+
+  // Одна и та же страница, записанная в карте дважды — со слэшем и без: для
+  // человека это один адрес, и вторую ссылку на него отдавать нельзя.
+  routes = {
+    "https://d.ru/sitemap.xml": { body: sm(["https://d.ru/toyota-camry-obzor/", "https://d.ru/toyota-camry-obzor"]) }
+  };
+  res = await buildLinks("Toyota Camry и обновлённая Камри", { linkSites: "d.ru" }, { refresh: true, rand: () => 0 });
+  eq("дубль: один и тот же адрес без слэша не отдаётся дважды", res.links.map((l) => l.url), ["https://d.ru/toyota-camry-obzor/"]);
+
+  // ---- 15. рубрика не притворяется статьёй ---------------------------------
+  // Адрес под сегментом рубрики — это подборка, а не материал: ни когда он не
+  // прошёл по лимиту, ни когда у него длинный хвост. Если бы он возвращался в
+  // пуле статей, ссылка встала бы на подборку молча, без пометки в отчёте.
+  const filled = [];
+  for (let i = 0; i < 500; i++) filled.push("https://cap.ru/tag/t" + i + "/");
+  routes = { "https://cap.ru/sitemap.xml": { body: sm(filled.concat(["https://cap.ru/tag/kia-sportage/"])) } };
+  res = await buildLinks("Kia Sportage подорожала", { linkSites: "cap.ru" }, { refresh: true, rand: () => 0 });
+  eq("рубрика сверх лимита не стала ссылкой", res.links, []);
+  eq("рубрика сверх лимита названа в промахах", res.stats.unmapped, ["Kia Sportage"]);
+
+  routes = {
+    "https://tail.ru/sitemap.xml": { body: sm(["https://tail.ru/tag/volvo-xc40-poleznye-sovety/", "https://tail.ru/o-ghosting-dvizhatelya/"]) }
+  };
+  res = await buildLinks("Volvo XC40 поехал", { linkSites: "tail.ru" }, { refresh: true, rand: () => 0 });
+  eq("страница с фильтром не стала ссылкой", res.links, []);
+
+  // Самое специфичное слово не может быть обрубком марки: «Land Rover» не
+  // должен получать ссылку на рубрику «/tag/land/», где собрано вообще всё,
+  // где встречается слово «land».
+  routes = { "https://frag.ru/sitemap.xml": { body: sm(["https://frag.ru/tag/land/", "https://frag.ru/tag/rover/"]) } };
+  res = await buildLinks("Land Rover подорожал", { linkSites: "frag.ru" }, { refresh: true, rand: () => 0 });
+  eq("рубрика из обрывка марки не берётся", res.links, []);
+
+  // А целое название модели в рубрике — берётся.
+  routes = { "https://whole.ru/sitemap.xml": { body: sm(["https://whole.ru/tag/land-rover/"]) } };
+  res = await buildLinks("Land Rover подорожал", { linkSites: "whole.ru" }, { refresh: true, rand: () => 0 });
+  eq("рубрика целого названия работает", res.links.map((l) => [l.url, l.kind]), [["https://whole.ru/tag/land-rover/", "tag"]]);
+
+  // ---- 16. деление карты не должно врать про источник ----------------------
+  // Адрес под рубрикой с длинным хвостом не попадает ни в один пул. Если из
+  // карты больше ничего не осталось, источник нельзя объявлять «без sitemap.xml»
+  // и вести на него ссылкой: карту прочитали, просто материала в ней нет.
+  routes = { "https://only.ru/sitemap.xml": { body: sm(["https://only.ru/category/avto/obzor-kia-sportage-2024/"]) } };
+  res = await buildLinks("Kia Sportage подорожала", { linkSites: "only.ru" }, { refresh: true, rand: () => 0 });
+  eq("карта без годных адресов не даёт ссылку на корень", res.links, []);
+  eq("карта без годных адресов не называется отсутствующей", res.stats.noSitemap, []);
+  eq("карта без годных адресов: модель в промахах", res.stats.unmapped, ["Kia Sportage"]);
+
+  // И источник, где карта прочитана и статьи лежат рядом, должен быть
+  // досмотрен: ссылка на корень бесполезного сайта затмивает настоящую статью.
+  routes = {
+    "https://emptyish.ru/sitemap.xml": { body: sm(["https://emptyish.ru/category/avto/obzor-kia-sportage-2024/"]) },
+    "https://good.ru/sitemap.xml": { body: sm(["https://good.ru/kia-sportage-obzor/"]) }
+  };
+  res = await buildLinks("Kia Sportage подорожала", { linkSites: "emptyish.ru\ngood.ru" }, { refresh: true, rand: () => 0 });
+  eq("модель доходит до источника со статьёй", res.links.map((l) => [l.url, l.kind]), [
+    ["https://good.ru/kia-sportage-obzor/", "article"]
+  ]);
+
+  // Карта есть, но она пустая — это действительно «читать нечего»: откат на
+  // сам сайт остаётся, иначе модель осталась бы без ссылки вовсе.
+  routes = { "https://bare.ru/sitemap.xml": { body: sm([]) } };
+  res = await buildLinks("Kia Sportage подорожала", { linkSites: "bare.ru" }, { refresh: true, rand: () => 0 });
+  eq("пустая карта: откат на сам сайт", res.links.map((l) => [l.url, l.kind]), [["https://bare.ru", "site"]]);
+
+  // ---- 17. самое специфичное слово — слово, а не приписка -----------------
+  // «Lada Vesta SW» ищет рубрику по слову vesta, а не по «sw»: подборка всего,
+  // где встретилось sw, про Весту ничего не рассказывает.
+  routes = {
+    "https://trim.ru/sitemap.xml": { body: sm(["https://trim.ru/tag/sw/", "https://trim.ru/tag/vesta/"]) }
+  };
+  res = await buildLinks("Lada Vesta SW поехала", { linkSites: "trim.ru" }, { refresh: true, rand: () => 0 });
+  eq("рубрика берётся по слову названия, а не по приписке", res.links.map((l) => l.url), ["https://trim.ru/tag/vesta/"]);
+
+  routes = { "https://tiny.ru/sitemap.xml": { body: sm(["https://tiny.ru/tag/sw/"]) } };
+  res = await buildLinks("Lada Vesta SW поехала", { linkSites: "tiny.ru" }, { refresh: true, rand: () => 0 });
+  eq("короткая приписка рубрикой не становится", res.links, []);
+
+  // ---- 18. тот же адрес, записанный по-разному -----------------------------
+  // Якорь — та же страница, что и без якоря; процентная запись — то же слово,
+  // что и живое. Ссылка на одно место дважды читается как накрутка.
+  routes = {
+    "https://q2.ru/sitemap.xml": { body: sm(["https://q2.ru/toyota-camry-obzor/", "https://q2.ru/toyota-camry-obzor/#otzyvy"]) }
+  };
+  res = await buildLinks("Toyota Camry и обновлённая Камри", { linkSites: "q2.ru" }, { refresh: true, rand: () => 0 });
+  eq("дубль: адрес с якорем — тот же адрес", res.links.map((l) => l.url), ["https://q2.ru/toyota-camry-obzor/"]);
+
+  routes = {
+    "https://pct.ru/sitemap.xml": { body: sm(["https://pct.ru/tag/%D0%BA%D0%B0%D0%B9%D0%B5%D0%BD%D0%BD%D0%B0/", "https://pct.ru/tag/кайенна/"]) }
+  };
+  res = await buildLinks("Порше Кайенна и просто Кайенна", { linkSites: "pct.ru" }, { refresh: true, rand: () => 0 });
+  eq("дубль: процентная запись кириллицы — то же слово", res.links.length, 1);
+
+  // А адрес с другим параметром — другая страница (пагинация «?page=2»), и
+  // занятостью он не считается: ссылки на первую и вторую страницы — разные.
+  routes = {
+    "https://pr.ru/sitemap.xml": { body: sm(["https://pr.ru/toyota-camry-obzor/", "https://pr.ru/toyota-camry-obzor?page=2"]) }
+  };
+  res = await buildLinks("Toyota Camry и обновлённая Камри", { linkSites: "pr.ru" }, { refresh: true, rand: () => 0 });
+  eq("параметр адреса — не тот же адрес", res.links.map((l) => l.url), ["https://pr.ru/toyota-camry-obzor/", "https://pr.ru/toyota-camry-obzor?page=2"]);
 
   // ---- итог ---------------------------------------------------------------
   const failed = results.filter((r) => !r.ok).length;
