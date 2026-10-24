@@ -190,6 +190,75 @@ async function main() {
   eq("модели: tokens по всем словам", v.tokens, ["mercedes", "amg", "cle", "646"]);
   eq("модели: core — марка плюс первое слово модели", v.core, ["mercedes", "amg", "cle"]);
 
+  const aliases = [
+    ["тест-драйв Кайенна", "Кайенна", ["cayenne"]],
+    ["расход Гранты", "Гранты", ["granta"]],
+    ["обзор Соляриса", "Соляриса", ["solaris"]],
+    ["покупка Октавии", "Октавии", ["octavia"]],
+    ["цены на Поло", "Поло", ["polo"]],
+    ["Тойоты Камри", "Тойоты Камри", ["toyota", "camry"]],
+    ["Порше Кайенна", "Порше Кайенна", ["porsche", "cayenne"]],
+    ["обзор Хёндэ Солярис", "Хёндэ Солярис", ["hyundai", "solaris"]],
+    ["новая Лада веста", "Лада веста", ["lada", "vesta"]],
+    ["Toyota RAV4", "Toyota RAV4", ["toyota", "rav4"]],
+    ["Toyota RAV 4", "Toyota RAV 4", ["toyota", "rav4"]],
+    ["Toyota rav-4", "Toyota rav-4", ["toyota", "rav4"]],
+    ["RAV 4", "RAV 4", ["rav4"]],
+    ["Land Cruiser", "Land Cruiser", ["land", "cruiser"]],
+    ["Toyota\tLand  Cruiser", "Toyota\tLand  Cruiser", ["toyota", "land", "cruiser"]]
+  ];
+  for (const [text, anchor, tokens] of aliases) {
+    eq("синонимы: " + text, findModels(text), [{ anchor, tokens, core: tokens }]);
+  }
+  eq("синонимы: варианты одной модели не дублируются",
+    findModels("Кайенн и Cayenne, затем Кайенна").map((m) => m.anchor), ["Кайенн"]);
+  eq("синонимы: часть слова не совпадает", findModels("Грантовый конкурс и полотно"), []);
+  eq("синонимы: граница предложения не склеивается",
+    findModels("Toyota. Camry подорожала").map((m) => m.anchor), ["Toyota", "Camry"]);
+  eq("синонимы: пользователь переопределяет встроенный вариант",
+    findModels("Кайенна", "polo = Кайенна"), [{ anchor: "Кайенна", tokens: ["polo"], core: ["polo"] }]);
+  eq("синонимы: пользователь добавляет фразу",
+    findModels("Обзор народного седана", "polo = народного седана"),
+    [{ anchor: "народного седана", tokens: ["polo"], core: ["polo"] }]);
+  eq("синонимы: канон из нескольких слов",
+    findModels("Наш Крузак", "Land Cruiser = Крузак"),
+    [{ anchor: "Крузак", tokens: ["land", "cruiser"], core: ["land", "cruiser"] }]);
+  eq("синонимы: комментарии, пустые и некорректные строки не добавляют терминов",
+    findModels("Жук и Слон", "# beetle = Жук\n\n = Слон\nСлон =\nbeetle = Жук = Слон"), []);
+  eq("синонимы: переопределение не меняет встроенный словарь",
+    findModels("Кайенна")[0]?.tokens, ["cayenne"]);
+  eq("синонимы: добавление варианта марки не отбрасывает модель",
+    findModels("Toyota Hilux", "Toyota = Тойотка").map((m) => m.anchor), ["Toyota Hilux"]);
+  eq("синонимы: вариант марки также захватывает модель",
+    findModels("Тойотка Hilux", "Toyota = Тойотка")[0]?.tokens, ["toyota", "hilux"]);
+  eq("синонимы: короткая часть названия не теряется",
+    findModels("C-HR", "Toyota C-HR = C-HR")[0]?.tokens, ["toyota", "c", "hr"]);
+  eq("синонимы: укороченный вариант не появляется сам",
+    findModels("HR", "Toyota C-HR = C-HR"), []);
+  eq("синонимы: союз внутри пользовательской фразы сохраняется",
+    findModels("народный и автомобиль", "polo = народный и автомобиль")[0]?.anchor, "народный и автомобиль");
+  eq("синонимы: топливо не становится маркой", findModels("расход газа"), []);
+  eq("синонимы: обычное написание X-Trail распознаётся",
+    findModels("X-Trail")[0]?.tokens, ["x", "trail"]);
+  eq("синонимы: переопределение канона действует на его варианты",
+    findModels("Кайенна", "polo = cayenne")[0]?.tokens, ["polo"]);
+  eq("синонимы: последнее правило выигрывает",
+    findModels("Кайенна", "polo = Кайенна\ngranta = Кайенна")[0]?.tokens, ["granta"]);
+  eq("синонимы: канон из знаков препинания не удаляет модель",
+    findModels("Поло", "??? = polo")[0]?.tokens, ["polo"]);
+  eq("синонимы: альтернативное написание остаётся для выбора места ссылки",
+    findModels("Toyota Camry подорожала. Тойота Камри стала удобнее.")[0]?.alternatives, ["Тойота Камри"]);
+  eq("синонимы: повторное переопределение канона действует на все варианты",
+    findModels("Кайенна", "polo = cayenne\ngranta = cayenne")[0]?.tokens, ["granta"]);
+  eq("синонимы: пользовательские варианты следуют повторному переопределению",
+    findModels("Каен", "cayenne = Каен\npolo = cayenne\ngranta = cayenne")[0]?.tokens, ["granta"]);
+  eq("синонимы: собственный канон можно переопределить повторно",
+    findModels("Родстер", "roadster = Родстер\npolo = roadster\ngranta = roadster")[0]?.tokens, ["granta"]);
+  eq("синонимы: правило на себя восстанавливает исходный канон",
+    findModels("Кайенна", "polo = cayenne\ncayenne = cayenne")[0]?.tokens, ["cayenne"]);
+  eq("синонимы: встречные правила не зацикливаются",
+    findModels("Кайенна", "polo = cayenne\ncayenne = polo")[0]?.tokens, ["cayenne"]);
+
   // ---- 3. sitemap ---------------------------------------------------------
   eq(
     "sitemap: loc вытаскиваются",
@@ -255,6 +324,51 @@ async function main() {
 
   eq("слова слага: знаки препинания не мешают", slugTokens("Volvo XC40!"), ["volvo", "xc40"]);
   eq("слова слага: однобуквенные выбрасываются", slugTokens("a b c"), []);
+  for (const spelling of ["RAV4", "RAV 4", "rav-4"]) {
+    eq("нормализация: " + spelling, slugTokens(spelling), ["rav4"]);
+  }
+  eq("нормализация: год не приклеивается к модели", slugTokens("Camry 2024"), ["camry", "2024"]);
+  eq("подбор: кириллический вариант в слаге",
+    pickArticle(["https://a.ru/test-kajenna/", "https://a.ru/обзор-кайенна/"], ["cayenne"], [], () => 0),
+    "https://a.ru/обзор-кайенна/");
+  eq("подбор: закодированный кириллический слаг",
+    pickArticle(["https://a.ru/" + encodeURIComponent("обзор-кайенна")], ["cayenne"], [], () => 0),
+    "https://a.ru/" + encodeURIComponent("обзор-кайенна"));
+  eq("подбор: заголовок канала использует тот же словарь",
+    pickArticle([{ url: "https://dzen.ru/a/123", title: "Цена Порше Кайенна" }], ["porsche", "cayenne"], [], () => 0),
+    "https://dzen.ru/a/123");
+  eq("подбор: пользовательские варианты действуют и на цель",
+    pickArticle(["https://a.ru/test-народного-седана/"], ["polo"], [], () => 0, "polo = народного седана"),
+    "https://a.ru/test-народного-седана/");
+  eq("подбор: полное совпадение приоритетнее ядра",
+    pickArticle(["https://a.ru/kia-sportage/", "https://a.ru/kia-sportage-hybrid/"],
+      ["kia", "sportage", "hybrid"], ["kia", "sportage"], () => 0), "https://a.ru/kia-sportage-hybrid/");
+
+  for (const [text, url, synonyms] of [
+    ["Kia Rio 3", "https://a.ru/kia-rio-3-obzor/", ""],
+    ["Hyundai Santa Fe", "https://a.ru/hyundai-santa-fe-2-obzor/", ""],
+    ["Мазда3", "https://a.ru/mazda-3-obzor/", ""],
+    ["Кайенна", "https://a.ru/cayenne-obzor/", "polo = cayenne\ngranta = cayenne"],
+    ["Икстрейл", "https://a.ru/nissan-x-trail-obzor/", ""],
+    ["Кайенна", "https://a.ru/porsche-cayenne/", "polo = cayenne"],
+    ["C-HR", "https://a.ru/toyota-c-hr-obzor/", "Toyota C-HR = C-HR"],
+    ["народный и автомобиль", "https://a.ru/народный-и-автомобиль/", "polo = народный и автомобиль"]
+  ]) {
+    const model = findModels(text, synonyms)[0];
+    eq("подбор: согласованная нормализация «" + text + "»",
+      model ? pickArticle([url], model.tokens, model.core, () => 0, synonyms) : null, url);
+  }
+
+  let titleReads = 0;
+  const indexedEntry = { url: "https://dzen.ru/a/indexed", get title() { titleReads++; return "Kia Sportage"; } };
+  eq("подбор: запасной поиск использует ту же статью",
+    pickArticle([indexedEntry], ["kia", "sportage", "hybrid"], ["kia", "sportage"], () => 0), indexedEntry.url);
+  eq("подбор: заголовок разбирается один раз, даже при поиске по ядру", titleReads, 1);
+  titleReads = 0;
+  const articleCache = new Map();
+  pickArticle([indexedEntry], ["volvo"], [], () => 0, "", articleCache);
+  pickArticle([indexedEntry], ["kia", "sportage"], [], () => 0, "", articleCache);
+  eq("подбор: карта разбирается один раз для нескольких моделей", titleReads, 1);
 
   // ---- 5. buildLinks: полный проход ---------------------------------------
   permAllowed = true;
@@ -355,6 +469,13 @@ async function main() {
   // если кто-то поменяет дефолт, это должно упасть здесь, а не всплыть у него.
   eq("дефолт: ссылок на статью — 2", DEFAULTS.linkCount, 2);
   eq("дефолт: сайтов для перелинковки нет", DEFAULTS.linkSites, "");
+
+  routes = { "https://a.ru/sitemap.xml": { body: sm(["https://a.ru/polo-obzor/", "https://a.ru/porsche-cayenne-test/"]) } };
+  res = await buildLinks("тест-драйв Кайенна", { linkSites: "a.ru" }, { refresh: true, rand: () => 0 });
+  eq("сборка: модель без марки ведёт на статью", res.links.map((l) => [l.anchor, l.url]),
+    [["Кайенна", "https://a.ru/porsche-cayenne-test/"]]);
+  res = await buildLinks("тест-драйв Кайенна", { linkSites: "a.ru", linkSynonyms: "polo = Кайенна" }, { rand: () => 0 });
+  eq("сборка: пользовательское правило передаётся из настроек", res.links.map((l) => l.url), ["https://a.ru/polo-obzor/"]);
 
   // ---- итог ---------------------------------------------------------------
   const failed = results.filter((r) => !r.ok).length;

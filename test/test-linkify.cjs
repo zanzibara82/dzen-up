@@ -597,6 +597,46 @@ async function main() {
       toast.replace(/\n/g, " | ")
     );
 
+    console.log("\n=== синонимы: текст редактора → карта → готовые ссылки ===");
+    await setSettings({ preview: false, linkSites: SITE, linkChannels: "", linkCount: 2, linkSynonyms: "Scania T143 = ветеран" });
+    await openPage();
+    await evalJs(`(() => {
+      document.querySelector('.body').innerHTML =
+        '<h2>Новости автопарка</h2><p>Вводный абзац: рассказываем о легковых и грузовых машинах.</p>' +
+        '<p>В новой Камри стало заметно тише, а расход топлива по сравнению с прошлой поездкой снизился.</p>' +
+        '<p>Дорога была длинной, покрытие менялось от гладкого асфальта до неровной грунтовки.</p>' +
+        '<p>Этот ветеран снова вышел на линию после ремонта и уверенно перевозит грузы между городами.</p>' +
+        '<p>Подведём итоги после нескольких месяцев эксплуатации и сравним расходы на обслуживание.</p>';
+      return true;
+    })()`);
+    const synonymsBefore = await snapshot();
+    toast = await runLinkify();
+    after = await snapshot();
+    check("синонимы: модель без марки получает ссылку на нужную статью",
+      after.links.some((link) => link.text === 'Камри' && link.href === ARTICLES.toyota), JSON.stringify(after.links));
+    check("синонимы: пользовательское правило работает из настроек до редактора",
+      after.links.some((link) => link.text === 'ветеран' && link.href === ARTICLES.scania), JSON.stringify(after.links));
+    check("синонимы: исходный текст не переписан", after.text === synonymsBefore.text);
+    check("синонимы: в отчёте реальное число ссылок", after.links.length === 2 && /Перелинковка: 2/.test(toast));
+
+    await setSettings({ linkSynonyms: "", linkCount: 3 });
+    await openPage();
+    await evalJs(`(() => {
+      document.querySelector('.body').innerHTML =
+        '<h2>Toyota Camry подорожала</h2><p>Вводный абзац о рынке новых автомобилей.</p>' +
+        '<p>Тойота Камри стала удобнее, но расходы на покупку выросли по сравнению с прошлым годом.</p>' +
+        '<p>Дилеры пока не готовы давать прогноз на следующий квартал и ждут новых поставок.</p>' +
+        '<p>Toyota Camry остаётся популярной среди покупателей, которые много ездят по трассе.</p>';
+      return true;
+    })()`);
+    const variantsBefore = await snapshot();
+    await runLinkify();
+    after = await snapshot();
+    check("синонимы: вариант из заголовка не отнимает ссылку у абзаца",
+      after.links.some((link) => link.text === 'Тойота Камри' && link.href === ARTICLES.toyota));
+    check("синонимы: разные написания одной модели не дают повторных ссылок", after.links.length === 1);
+    check("синонимы: выбор другого написания не меняет текст", after.text === variantsBefore.text);
+
     const errs = c.events.filter((e) => e.method === "Runtime.exceptionThrown");
     if (errs.length) {
       console.log("\nисключения:");

@@ -306,6 +306,12 @@ try {
   check("ссылки на статью: в README назван дефолт " + d, d > 0 && inReadme("По умолчанию " + d), "DEFAULTS.linkCount");
 }
 
+{
+  const match = /const MODEL_ALIASES = (\{[\s\S]*?\n\});/.exec(bg);
+  const count = match ? Object.keys(new Function("return (" + match[1] + ")")()).length : 0;
+  check("словарь моделей: размер назван в README", count > 0 && inReadme(count + " моделей"), "моделей: " + count);
+}
+
 // ---------------------------------------- 2. каждая настройка названа в README ---
 // Соответствие «ключ настройки → фраза в README». Ключ, которого тут нет,
 // считается недокументированным — это и есть сигнал «добавил настройку, забыл
@@ -324,6 +330,7 @@ const SETTING_DOC = {
   glossary: "Глоссарий — что не переводить",
   linkSites: "Сайты для перелинковки",
   linkChannels: "Каналы Дзена для перелинковки",
+  linkSynonyms: "Синонимы для перелинковки",
   linkCount: "Сколько ссылок на статью",
   aiEnabled: "Использовать AI-рерайт (OpenAI-совместимый API)",
   aiBaseUrl: "Base URL",
@@ -401,7 +408,7 @@ for (const [frag, what] of KEY_SOURCES) {
 
 // --------------------------------------------- 3. хранилища разложены как в README ---
 const localKeys = constArray(bg, "LOCAL_KEYS");
-const LOCAL_DOC = { glossary: "Глоссарий", aiKey: "API-ключ", linkSites: "список сайтов", linkChannels: "список каналов" };
+const LOCAL_DOC = { glossary: "Глоссарий", aiKey: "API-ключ", linkSites: "список сайтов", linkChannels: "список каналов", linkSynonyms: "словарь синонимов" };
 for (const k of localKeys) {
   const frag = LOCAL_DOC[k];
   check("локальный ключ " + k + " назван в README", !!frag && inReadme(frag), frag ? "«" + frag + "»" : "нет описания в тесте");

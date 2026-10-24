@@ -22,6 +22,7 @@
     "aiPreset",
     "linkSites",
     "linkChannels",
+    "linkSynonyms",
     "linkCount"
   ];
 

@@ -495,6 +495,52 @@ async function main() {
       typeof savedLinks.chLocal === 'string' && savedLinks.chSync === undefined,
       JSON.stringify({ local: typeof savedLinks.chLocal, sync: savedLinks.chSync }));
 
+    const synonymValue = "polo = народный седан\nLand Cruiser = Крузак";
+    const synonymSave = await evalJs(`(async () => {
+      const field = document.getElementById('linkSynonyms');
+      if (!field) return { exists: false };
+      field.value = ${JSON.stringify(synonymValue)};
+      document.getElementById('save').click();
+      for (let i = 0; i < 30; i++) {
+        const stored = await chrome.storage.local.get('linkSynonyms');
+        if (stored.linkSynonyms === field.value) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const local = await chrome.storage.local.get('linkSynonyms');
+      const sync = await chrome.storage.sync.get('linkSynonyms');
+      return { exists: true, tag: field.tagName, local: local.linkSynonyms, inSync: sync.linkSynonyms !== undefined };
+    })()`);
+    check("синонимы: редактируемое поле сохраняет строки в local",
+      synonymSave.exists && synonymSave.tag === 'TEXTAREA' && synonymSave.local === synonymValue && !synonymSave.inSync,
+      JSON.stringify(synonymSave));
+    await evalJs(`document.documentElement.removeAttribute('data-dzr-popup')`);
+    await c.send('Page.reload', {}, sessionId);
+    for (let i = 0; i < 40; i++) {
+      if (await evalJs(`document.documentElement.getAttribute('data-dzr-popup') === 'ready'`)) break;
+      await sleep(150);
+    }
+    const synonymLoaded = await evalJs(`document.getElementById('linkSynonyms')?.value`);
+    check("синонимы: после открытия попапа текст восстановлен", synonymLoaded === synonymValue);
+    await evalJs(`document.getElementById('tab-settings').click()`);
+    if (synonymSave.exists) {
+      await evalJs(`document.getElementById('linkSynonyms').scrollIntoView({ block: 'center' })`);
+      const shotSynonyms = await c.send('Page.captureScreenshot', { format: 'png' }, sessionId);
+      fs.writeFileSync(path.join(TMP, 'shot-synonyms.png'), Buffer.from(shotSynonyms.data, 'base64'));
+    }
+    const synonymCleared = await evalJs(`(async () => {
+      const field = document.getElementById('linkSynonyms');
+      if (!field) return false;
+      field.value = '';
+      document.getElementById('save').click();
+      for (let i = 0; i < 30; i++) {
+        const local = await chrome.storage.local.get('linkSynonyms');
+        if (local.linkSynonyms === '') return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    })()`);
+    check("синонимы: пустое поле удаляет пользовательские правила", synonymCleared);
+
     // границы: опечатка в поле не должна уехать в настройки как есть
     const bounds = await evalJs(`(async () => {
       const field = document.getElementById('linkCount');
@@ -902,6 +948,7 @@ async function main() {
     const bad = results.filter((r) => !r.ok);
     console.log("всего проверок: %d, провалов: %d", results.length, bad.length);
     bad.forEach((b) => console.log("  FAIL: %s (%s)", b.name, b.detail));
+    process.exitCode = bad.length ? 1 : 0;
   } finally {
     try { execSync("taskkill /F /T /PID " + chrome.pid, { stdio: "ignore" }); } catch {}
   }
