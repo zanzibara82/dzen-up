@@ -367,6 +367,34 @@
     return picked;
   }
 
+  // Домен из поля «Адрес статьи, откуда взять текст». Это не цель перелинковки,
+  // а страница, которую расширение читает по кнопке «Взять текст»; вписывать её
+  // в список сайтов нельзя — она стала бы целью ссылок. Право на неё просим
+  // здесь же: chrome.permissions.request работает только из попапа по жесту.
+  function sourceOrigin() {
+    var raw = String(settings.sourceUrl || "").trim();
+    if (!raw) return "";
+    if (!/^https?:\/\//i.test(raw)) raw = "https://" + raw;
+    try {
+      var u = new URL(raw);
+      if (u.protocol === "https:") return "https://" + u.host + "/*";
+      // http разрешён только своей машине — в необязательных правах его больше негде
+      var local = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+      if (u.protocol === "http:" && local) return "http://" + u.host + "/*";
+      return "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  /** Всё, на что кнопка доступа обязана спросить разрешение. */
+  function accessOrigins() {
+    var picked = linkOrigins();
+    var src = sourceOrigin();
+    if (src && picked.origins.indexOf(src) === -1) picked.origins.push(src);
+    return picked;
+  }
+
   function setPermStatus(text, cls) {
     var el = $("link-perm");
     el.textContent = text;
@@ -374,10 +402,14 @@
   }
 
   async function refreshLinkPerm() {
-    var picked = linkOrigins();
+    // Считаем и домен из поля адреса статьи: он тоже читается расширением, и
+    // строка доступа обязана говорить правду о нём, а не «ничего не указано».
+    var picked = accessOrigins();
     if (!picked.origins.length) {
       setPermStatus(
-        picked.bad.length ? "⚠️ Ни одного адреса сайта в списке." + skippedNote(picked.bad) : "Ни сайты, ни каналы не указаны."
+        picked.bad.length
+          ? "⚠️ Ни одного адреса сайта в списке." + skippedNote(picked.bad)
+          : "Ни сайты, ни каналы, ни адрес статьи не указаны."
       );
       return;
     }
@@ -389,10 +421,10 @@
   }
 
   $("link-allow").addEventListener("click", async function () {
-    var picked = linkOrigins();
+    var picked = accessOrigins();
     var note = skippedNote(picked.bad);
     if (!picked.origins.length) {
-      setPermStatus("Сначала впишите хотя бы один сайт или канал." + note, "err");
+      setPermStatus("Сначала впишите хотя бы один сайт, канал или адрес статьи." + note, "err");
       return;
     }
     // Список мог поменяться после сохранения — сохраняем текущие поля, чтобы

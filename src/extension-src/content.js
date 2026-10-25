@@ -24,16 +24,21 @@
     signature: false,
     signatureText: "",
     linkCount: 2,
-    glossary: ""
+    glossary: "",
+    // адрес, откуда берём текст готовой статьи (поле в панели)
+    sourceUrl: ""
   };
 
   var busy = false;
   var lastOriginal = "";
-  var bar, statusEl, goBtn, undoBtn, langSel, modeSel, presetSel, linkBtn;
+  var bar, statusEl, goBtn, undoBtn, langSel, modeSel, presetSel, linkBtn, srcUrlInput, srcBtn;
 
   // подпись кнопки по умолчанию и подтверждение обработки всей статьи
   var goLabel = "";
   var confirmedAll = false;
+  // подпись кнопки забора текста по адресу — та же история, что у goLabel:
+  // во время работы она становится «Отменить» и обязана вернуться к исходной
+  var srcLabel = "";
   var confirmTimer = null;
   // снимок редактора до вставки — для надёжного отката
   var undoSnapshot = null;
@@ -1114,9 +1119,11 @@
       if (fromRange) return fromRange;
     }
 
-    // 2) поле, в котором стоит курсор
+    // 2) поле, в котором стоит курсор — но НЕ наше собственное: панель с полем
+    //    адреса сама просилась стать «редактором статьи», и забранный текст
+    //    уезжал в это поле вместо статьи.
     var active = document.activeElement;
-    if (isEditable(active)) return editableRoot(active);
+    if (active && !isOurNode(active) && isEditable(active)) return editableRoot(active);
 
     // 3) редактор, который использовали в прошлый раз
     if (savedEditor && document.contains(savedEditor)) return savedEditor;
@@ -1311,7 +1318,8 @@
       grip: '<circle cx="9" cy="6" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="18" r="1.4"/>',
       spin: '<path d="M21 12a9 9 0 1 1-6.2-8.6"/>',
       chevron: '<path d="M6 15l6-6 6 6"/>',
-      link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.5-1.5"/>'
+      link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.5-1.5"/>',
+      download: '<path d="M12 3v11m0 0 4-4m-4 4-4-4"/><path d="M4 19h16"/>'
     };
     return (
       '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" ' +
@@ -1827,6 +1835,30 @@
     collapseBtn.title = "Свернуть в пузырёк, чтобы не мешала";
     collapseBtn.innerHTML = icon("chevron");
 
+    // Забор текста по адресу: поле + кнопка одной строкой. Поле — обычный input,
+    // потому что адрес читают глазами и правят руками, а кнопка отдельная:
+    // сам по себе ввод адреса ничего не должен менять.
+    var srcRow = document.createElement("div");
+    srcRow.className = "dzr-src";
+
+    srcUrlInput = document.createElement("input");
+    srcUrlInput.type = "text";
+    srcUrlInput.className = "dzr-src-url";
+    srcUrlInput.placeholder = "Адрес статьи, откуда взять текст";
+    srcUrlInput.title = "Адрес статьи, откуда взять текст";
+    srcUrlInput.spellcheck = false;
+    srcUrlInput.setAttribute("aria-label", "Адрес статьи, откуда взять текст");
+
+    srcBtn = document.createElement("button");
+    srcBtn.type = "button";
+    srcBtn.className = "dzr-src-btn";
+    srcBtn.title = "Открыть адрес в фоновой вкладке и забрать с него текст";
+    srcLabel = icon("download") + "<span>Взять текст</span>";
+    srcBtn.innerHTML = srcLabel;
+
+    srcRow.appendChild(srcUrlInput);
+    srcRow.appendChild(srcBtn);
+
     var closeBtn = document.createElement("button");
     closeBtn.className = "dzr-icon-btn";
     closeBtn.title = "Скрыть панель до перезагрузки страницы";
@@ -1843,6 +1875,7 @@
     bar.appendChild(controls);
     bar.appendChild(goBtn);
     bar.appendChild(linkBtn);
+    bar.appendChild(srcRow);
     bar.appendChild(statusEl);
     bar.appendChild(undoBtn);
     bar.appendChild(collapseBtn);
@@ -1852,6 +1885,7 @@
     langSel.value = S.targetLang;
     modeSel.value = S.mode;
     presetSel.value = S.aiPreset;
+    srcUrlInput.value = S.sourceUrl || "";
     syncPresetVisibility();
 
     goBtn.addEventListener("click", function (e) {
@@ -1865,6 +1899,21 @@
       e.stopPropagation();
       if (busy) cancelRun();
       else runLinkify();
+    });
+    srcBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      // во время забора кнопка работает как «Отменить»
+      if (busy) cancelRun();
+      else runSourceFetch();
+    });
+    srcUrlInput.addEventListener("change", saveSourceUrl);
+    srcUrlInput.addEventListener("keydown", function (e) {
+      // Enter в поле — тот же клик по кнопке: адрес вводят, чтобы сразу взять текст
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (!busy) runSourceFetch();
     });
     langSel.addEventListener("change", function () {
       S.targetLang = langSel.value;
@@ -1905,7 +1954,12 @@
     // Главное: панель не должна забирать фокус у редактора.
     // Иначе Дзен сбрасывает выделение и мы теряем выделенный фрагмент.
     bar.addEventListener("mousedown", function (e) {
-      if (e.target && e.target.closest && e.target.closest("select")) return; // селекту нужен фокус
+      // выделяем заранее — и селекту, и полю адреса нужен настоящий фокус,
+      // иначе в поле нельзя напечатать
+      if (e.target && e.target.closest && e.target.closest("select, input, textarea")) {
+        captureSelection();
+        return;
+      }
       captureSelection();
       e.preventDefault();
     });
@@ -2535,6 +2589,288 @@
     }
   }
 
+  // ----------------------------------------------- забор текста по адресу ---
+
+  /**
+   * Адрес поля живёт в настройках: поле обязано быть заполненным и во второй
+   * вкладке редактора, и после перезагрузки страницы. Потолок в 500 знаков — не
+   * украшение: у одного ключа в chrome.storage.sync лимит 8 КБ, а вставляют в
+   * поле иногда строку с метками кампании целиком.
+   */
+  function saveSourceUrl() {
+    if (!srcUrlInput) return;
+    var v = String(srcUrlInput.value || "").trim().slice(0, 500);
+    srcUrlInput.value = v;
+    S.sourceUrl = v;
+    send({ type: "saveSettings", settings: { sourceUrl: v } });
+  }
+
+  /** Хост адреса — в отчёте человек должен видеть, ОТКУДА взялся текст. */
+  function hostOfUrl(url) {
+    try {
+      return new URL(url).hostname;
+    } catch (e) {
+      return String(url || "").slice(0, 40);
+    }
+  }
+
+  // Абзацы забранного текста помечаем ДО разбора тегов: переводы строк между
+  // узлами DOM теряет, а вот сущности (&laquo;, &nbsp;) расшифровывает только
+  // он. Разделитель — управляемый знак: в текстах статей его не бывает.
+  var PARA_MARK = "\u0001";
+
+  /** Обычный текст из забранной разметки — для предпросмотра и для полей без HTML. */
+  function htmlToPlain(html) {
+    var box = document.createElement("div");
+    box.innerHTML = String(html || "")
+      .replace(/<br\s*\/?>/gi, PARA_MARK)
+      .replace(/<\/(p|div|li|ul|ol|h[1-6]|blockquote|pre|tr)>/gi, PARA_MARK);
+    var out = [];
+    var parts = String(box.textContent || "").split(PARA_MARK);
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i].replace(/\s+/g, " ").trim();
+      if (t) out.push(t);
+    }
+    return out.join("\n\n");
+  }
+
+  /**
+   * Пара пустых меток вокруг места вставки. Сразу после вставки между ними
+   * оказывается ровно забранный текст, и выделить его можно одним движением.
+   * Искать по тексту нельзя: где кончился вставленный абзац, по DOM надёжно не
+   * определить — узлы редактор пересобирает как хочет.
+   */
+  function placeMarks(range) {
+    try {
+      var doc = range.startContainer.ownerDocument || document;
+      var end = doc.createElement("span");
+      end.setAttribute("data-dzr-mark", "end");
+      var afterRange = range.cloneRange();
+      afterRange.collapse(false);
+      afterRange.insertNode(end);
+
+      var start = doc.createElement("span");
+      start.setAttribute("data-dzr-mark", "start");
+      var beforeRange = range.cloneRange();
+      beforeRange.collapse(true);
+      beforeRange.insertNode(start);
+
+      var inner = doc.createRange();
+      inner.setStartAfter(start);
+      inner.setEndBefore(end);
+      return { start: start, end: end, range: inner };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** Выделить вставленное от метки до метки; метки после этого убираем. */
+  function selectBetweenMarks(marks) {
+    if (!marks) return false;
+    try {
+      if (!document.contains(marks.start) || !document.contains(marks.end)) return false;
+      var r = document.createRange();
+      r.setStartAfter(marks.start);
+      r.setEndBefore(marks.end);
+      var ok = applyRange(r);
+      marks.start.remove();
+      marks.end.remove();
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Вставляет забранный текст. Отдельно от insertAndReport: там отчёт перевода —
+   * уникальность, кэш, фолбэки, — а перевода здесь ещё не было. Человек принёс
+   * в редактор чужой текст и сам решит, что с ним делать дальше.
+   */
+  async function insertSource(job) {
+    busy = true;
+    var marks = null;
+    try {
+      var editor = job.editor;
+      var payload = job.payload;
+      var prevValue = job.isField ? String(editor.value || "") : "";
+
+      undoSnapshot = job.isField
+        ? { editor: editor, value: prevValue, plain: payload.plain, orig: prevValue }
+        : { editor: editor, html: editor.innerHTML, plain: payload.plain, orig: "" };
+      // «оригинала» у забора нет: откат возвращает статью к тому виду, который
+      // был до вставки, и копировать в буфер нечего.
+      lastOriginal = "";
+
+      setStatus("Вставляю…");
+      var inserted;
+      var picked = false;
+      if (job.isField && job.append) {
+        // поле без выделения: добавляем в конец, а не затираем написанное
+        var base = prevValue.replace(/\s+$/, "");
+        setNativeValue(editor, (base ? base + "\n\n" : "") + payload.plain);
+        var caret = base ? base.length + 2 : 0;
+        editor.setSelectionRange(caret, caret + payload.plain.length);
+        inserted = true;
+        picked = true;
+      } else {
+        var target = job.range;
+        if (!job.isField && target) {
+          marks = placeMarks(target);
+          if (marks) target = marks.range;
+        }
+        inserted = await replaceSelection(editor, payload, target, false);
+      }
+      if (!inserted) throw new Error("Не удалось вставить текст в редактор");
+
+      // Выделение нужно, чтобы следующее нажатие «Перевести» работало по
+      // привнесённому тексту, а не по старому фрагменту, которого уже нет.
+      if (selectBetweenMarks(marks)) {
+        picked = true;
+        captureSelection();
+      }
+
+      clearSaved();
+      undoBtn.hidden = false;
+      setStatus("Текст взят", "ok");
+      toast(
+        "⬇️ Текст взят с " +
+          escapeHtml(hostOfUrl(job.url)) +
+          (picked ? " и выделен." : ".") +
+          "<br><span class=\"dzr-dim\">Жмите «Перевести и рерайтить», чтобы переписать его, или оставьте как есть.</span>",
+        false,
+        { text: payload.plain, html: payload.html }
+      );
+    } catch (err) {
+      // Метки ставились в саму статью: при сбое вставки их надо убрать, иначе
+      // в тексте останутся два пустых служебных span.
+      if (marks) {
+        try {
+          marks.start.remove();
+          marks.end.remove();
+        } catch (e) {}
+      }
+      setStatus("Ошибка", "error");
+      toast("❌ " + escapeHtml(String((err && err.message) || err)), true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /**
+   * Забор текста по адресу из поля панели. Отдельный поток, а не часть run():
+   * текст приезжает готовым, а перевод и рерайт человек вызывает сам — той же
+   * кнопкой, что и обычно.
+   */
+  async function runSourceFetch() {
+    if (busy) return;
+    if (isPreviewOpen()) closePreview();
+
+    var raw = String(srcUrlInput.value || "").trim();
+    if (!raw) {
+      toast("❌ Введите в поле адрес статьи, откуда взять текст.", true);
+      return;
+    }
+    var editor = findEditor();
+    if (!editor) {
+      toast("❌ Не нашёл поле редактора на странице. Кликните в текст статьи и попробуйте снова.", true);
+      return;
+    }
+    saveSourceUrl();
+
+    var isField = editor.tagName === "TEXTAREA" || editor.tagName === "INPUT";
+    var range = hasSaved() ? savedRange.cloneRange() : null;
+    if (!range) {
+      var live = liveSelectionRange();
+      if (live) range = live.cloneRange();
+    }
+    // Куда вставлять, решаем СЕЙЧАС, до ответа воркера: пока тот открывает
+    // вкладку и ждёт загрузки, выделение теряется (клик по полю адреса забирает
+    // фокус у редактора). Без выделения добавляем в конец статьи — ничего не
+    // выделять чаще значит «пишу с нуля», а не «затри всё, что было».
+    var append = !range;
+    if (append && !isField) {
+      range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+    }
+
+    busy = true;
+    var runId = "s" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    currentRunId = runId;
+    srcBtn.classList.add("dzr-cancel");
+    srcBtn.innerHTML = icon("close") + "<span>Отменить</span>";
+    setStatus("Беру текст…");
+
+    try {
+      var res = await send({ type: "fetchSource", url: raw, requestId: runId });
+      // Отмена могла прийти, когда страница уже догрузилась: воркер успел отдать
+      // текст, а человек уже нажал «Отменить». Вставлять после отмены нельзя.
+      if (currentRunId !== runId) {
+        var late = new Error("Забор отменён");
+        late.cancelled = true;
+        throw late;
+      }
+      if (!res.ok) {
+        if (res.cancelled) {
+          var ce = new Error("Забор отменён");
+          ce.cancelled = true;
+          throw ce;
+        }
+        throw new Error(res.error || "Не удалось забрать текст со страницы");
+      }
+
+      var found = res.source || {};
+      var payload = { html: found.html, plain: htmlToPlain(found.html) };
+      var st = globalThis.DzenRewriter.stats(payload.plain);
+      var job = {
+        editor: editor,
+        payload: payload,
+        range: range,
+        isField: isField,
+        append: append,
+        url: found.url || raw
+      };
+
+      // Предпросмотр: статью не трогаем, пока пользователь не подтвердит, — тот
+      // же порядок, что у перевода.
+      if (S.preview) {
+        setStatus("Предпросмотр: проверьте результат");
+        showPreview(
+          payload,
+          st.words + " слов · " + st.chars + " симв.",
+          function () {
+            insertSource(job);
+          },
+          function () {
+            setStatus("Отменено — текст не изменён", "warn");
+            toast("⏹ Предпросмотр закрыт. Текст статьи не изменён.");
+          }
+        );
+        return;
+      }
+
+      await insertSource(job);
+    } catch (err) {
+      if (err && err.cancelled) {
+        setStatus("Отменено", "warn");
+        toast("⏹ Забор текста отменён. Текст статьи не изменён.");
+      } else {
+        setStatus("Ошибка", "error");
+        toast("❌ " + escapeHtml(String((err && err.message) || err)), true);
+      }
+    } finally {
+      busy = false;
+      currentRunId = null;
+      srcBtn.disabled = false;
+      srcBtn.classList.remove("dzr-cancel");
+      srcBtn.innerHTML = srcLabel;
+      // cancelRun() блокирует и главную кнопку — возвращаем её в обычный вид
+      goBtn.disabled = false;
+      goBtn.classList.remove("dzr-cancel");
+      goBtn.innerHTML = goLabel;
+    }
+  }
+
   async function run() {
     if (busy) return;
     // новый запуск отменяет неразобранный предпросмотр: пользователь явно
@@ -2861,6 +3197,9 @@
         if (langSel) langSel.value = S.targetLang;
         if (modeSel) modeSel.value = S.mode;
         if (presetSel) presetSel.value = S.aiPreset;
+        // поле адреса заполняем только пустое: человек мог начать вводить его,
+        // пока настройки ещё читались, и затирать его ввод — не наше дело
+        if (srcUrlInput && !srcUrlInput.value) srcUrlInput.value = S.sourceUrl || "";
         syncPresetVisibility();
         // Признак «настройки прочитаны и применены». До этого момента панель
         // живёт на значениях по умолчанию из S, и клик по кнопке отработает по

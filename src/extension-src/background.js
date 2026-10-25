@@ -24,6 +24,9 @@ const DEFAULTS = {
   linkChannels: "", // каналы Дзена для перелинковки: по строке на канал (хранится в local)
   linkSynonyms: "",
   linkCount: 2, // сколько ссылок ставить в статью
+  // адрес, откуда панель берёт текст: храним последний, чтобы не вводить его
+  // заново на каждой странице редактора
+  sourceUrl: "",
   aiEnabled: false,
   aiBaseUrl: "https://api.openai.com/v1",
   aiModel: "gpt-4o-mini",
@@ -1626,6 +1629,228 @@ async function buildLinks(text, settings, opts = {}) {
   return { links, stats };
 }
 
+// --------------------------------------------------- забор текста по адресу ---
+// Человек даёт адрес своей (или чужой) статьи, расширение открывает её в ФОНОВОЙ
+// вкладке, вытаскивает текст и отдаёт панели на предпросмотр. Вкладка — не
+// переход по ссылке: право на хост для `tabs.create` не нужно, но он обязателен
+// для `scripting.executeScript`. Попросить право из воркера нельзя
+// (`permissions.request` работает только из попапа и только по жесту
+// пользователя), поэтому отказ впрыскивания переводится той же формулировкой,
+// что и у карт сайтов.
+
+const SOURCE_TIMEOUT_MS = 20000; // чужая страница грузится долго, но не вечно
+const SOURCE_MIN_CHARS = 400; // тот же порог «это текст, а не обломки», что у панели
+
+/**
+ * Адрес забора: голый хост с путём дотягивается до `https://` (как список
+ * сайтов для перелинковки), всё остальное — не адрес. Проверка до открытия
+ * вкладки нужна ещё и потому, что на мусорном адресе браузер откроет вкладку с
+ * собственной страницей ошибки, и человек будет ждать текст из ниоткуда.
+ */
+function sourceAddress(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  const withScheme = /^https?:\/\//i.test(s) ? s : "https://" + s;
+  if (!looksLikeHost(hostOf(withScheme))) return "";
+  return withScheme.replace(/\/+$/, "");
+}
+
+/**
+ * Ждём конца загрузки вкладки. Слушатель ставится ДО открытия: страница из кэша
+ * успевает догрузиться раньше, чем воркер узнает номер вкладки, поэтому дошедшие
+ * вкладки собираются в набор по событию, а сверяются с номером потом.
+ */
+async function fetchSourceText(url, opts = {}) {
+  const target = sourceAddress(url);
+  if (!target) {
+    throw new Error("Нужен адрес статьи — например, https://auto-dom24.ru/obzor/.");
+  }
+  const timeoutMs = opts.timeoutMs || SOURCE_TIMEOUT_MS;
+
+  const loaded = new Set();
+  let wake = null;
+  const listener = (tabId, info) => {
+    if (info && info.status === "complete") {
+      loaded.add(tabId);
+      if (wake) wake();
+    }
+  };
+  chrome.tabs.onUpdated.addListener(listener);
+
+  let tabId = null;
+  try {
+    const tab = await chrome.tabs.create({ url: target, active: false });
+    tabId = tab.id;
+    await waitLoaded();
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: extractArticle,
+      world: "MAIN"
+    });
+    const found = injected && injected[0] ? injected[0].result : null;
+    if (!found) throw new Error("На странице не нашлось текста.");
+    // Порог ловит и заглушку антибота, и paywall, и страницу-описание: страница
+    // есть, текста нет. Молча отдать 50 знаков — значит дать панель вставить их
+    // вместо статьи.
+    if (found.chars < SOURCE_MIN_CHARS) {
+      throw new Error("Похоже, это не статья: на странице всего " + found.chars + " знаков текста.");
+    }
+    return { html: found.html, title: found.title, url: target, chars: found.chars };
+  } catch (e) {
+    if (e && !e.needPermission && /executeScript|Cannot access|chrome-extension/i.test(String(e.message || e))) {
+      e.message = "Нет доступа к сайту. Откройте настройки расширения и нажмите «Разрешить доступ к сайтам».";
+      e.needPermission = true;
+    }
+    throw e;
+  } finally {
+    chrome.tabs.onUpdated.removeListener(listener);
+    if (tabId != null) {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (e) {
+        /* вкладку уже закрыли — пользователю об этом нечего сообщать */
+      }
+    }
+  }
+
+  /** Промежуток между «вкладку создали» и «страница догрузилась». */
+  function waitLoaded() {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const finish = (err) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
+        wake = null;
+        if (err) reject(err);
+        else resolve();
+      };
+      const timer = setTimeout(
+        () => finish(new Error("Страница не догрузилась за " + Math.round(timeoutMs / 1000) + " с")),
+        timeoutMs
+      );
+      const onAbort = () => {
+        const err = new Error("Забор отменён");
+        // признак отмены, а не ошибки: панель по нему показывает «отменено»,
+        // а не красный текст с просьбой проверить адрес
+        err.cancelled = true;
+        finish(err);
+      };
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          finish(new Error("Забор отменён"));
+          return;
+        }
+        opts.signal.addEventListener("abort", onAbort);
+      }
+      wake = () => {
+        if (loaded.has(tabId)) finish();
+      };
+      wake();
+    });
+  }
+}
+
+/**
+ * Извлечение статьи на чужой странице. Функция передаётся в
+ * `scripting.executeScript` и выполняется В МИРЕ СТРАНИЦЫ, поэтому не имеет
+ * права ни на что из воркера: только аргументы и DOM.
+ *
+ * Порядок способов — от надёжного к грубому: тег `article`, потом
+ * блок со словом content внутри `main`, потом самый крупный по абзацам блок.
+ * Порог длины здесь НЕ проверяется: он один в воркере, и тот же номер видит
+ * человек в сообщении «похоже, это не статья».
+ */
+function extractArticle() {
+  const JUNK = "nav, header, footer, aside, form, script, style, link, meta, noscript, iframe, .comments, .related, [class*='comment'], [class*='related']";
+
+  const len = (el) => (el.textContent || "").replace(/\s+/g, " ").trim().length;
+
+  /** Крупнейший по тексту кандидат; пусто — если на нём читать нечего. */
+  const biggest = (list) => {
+    let win = null;
+    let best = 0;
+    for (const el of list) {
+      const n = len(el);
+      if (n > best) { best = n; win = el; }
+    }
+    return best ? win : null;
+  };
+
+  let block = biggest(Array.from(document.querySelectorAll("article")));
+
+  if (!block) {
+    const main = document.querySelector("main");
+    if (main) block = biggest(Array.from(main.querySelectorAll("[class*='content']")));
+  }
+
+  // Разметки статьи нет: остаётся блок, в котором больше всего текста в абзацах,
+  // лежащих прямо в нём. Сумма по прямым `p` нужна вместо текста всего узла,
+  // иначе всегда побеждает обёртка над статьёй вместе с меню и подвалом.
+  if (!block) {
+    let win = null;
+    let best = 0;
+    for (const el of Array.from(document.querySelectorAll("body *"))) {
+      if (el.closest(JUNK)) continue;
+      let sum = 0;
+      for (const p of Array.from(el.querySelectorAll(":scope > p"))) sum += len(p);
+      if (sum > best) { best = sum; win = el; }
+    }
+    block = best ? win : null;
+  }
+
+  if (!block) return null;
+
+  const clone = block.cloneNode(true);
+  for (const el of Array.from(clone.querySelectorAll(JUNK))) el.remove();
+
+  // С чужой страницы едут не только слова: обработчики событий, чужие классы,
+  // картинки с их домена и теги, которых в редакторе быть не должно. Забранный
+  // код вставляется и в карточку предпросмотра, и в страницу Дзена, поэтому
+  // оставляем только текст и разметку абзацев. Ссылки — единственный тег,
+  // сохраняющий свой атрибут: нужен адрес ссылки, остальное не нужно.
+  const KEEP = new Set(["P", "BR", "DIV", "SPAN", "H1", "H2", "H3", "H4", "H5", "H6", "STRONG", "B", "EM", "I", "U", "S", "A", "UL", "OL", "LI", "BLOCKQUOTE", "CODE", "PRE"]);
+  const DROP = new Set(["IMG", "PICTURE", "SOURCE", "SVG", "VIDEO", "AUDIO", "CANVAS", "OBJECT", "EMBED", "IFRAME", "INPUT", "BUTTON", "SELECT", "TEXTAREA", "MAP", "AREA", "TRACK"]);
+
+  for (const el of Array.from(clone.querySelectorAll("*"))) {
+    if (!el.parentNode) continue; // удалили вместе с родителем
+    if (!KEEP.has(el.tagName)) {
+      if (DROP.has(el.tagName)) {
+        el.remove();
+        continue;
+      }
+      // неизвестный тег разбираем в его содержимое: текст статьи терять нельзя
+      const parent = el.parentNode;
+      while (el.firstChild) parent.insertBefore(el.firstChild, el);
+      el.remove();
+      continue;
+    }
+    const href = el.tagName === "A" ? el.getAttribute("href") : "";
+    for (const attr of Array.from(el.attributes)) el.removeAttribute(attr.name);
+    if (href) el.setAttribute("href", href);
+  }
+
+  for (const a of Array.from(clone.querySelectorAll("a"))) {
+    const href = a.getAttribute("href") || "";
+    // Якорь и «javascript:» после вставки в чужой редактор бессмысленны, а
+    // относительный адрес повёл бы в домен редактора — поэтому полный адрес.
+    if (!href || href.charAt(0) === "#" || /^javascript:/i.test(href)) {
+      a.removeAttribute("href");
+      continue;
+    }
+    try {
+      a.setAttribute("href", new URL(href, document.baseURI).href);
+    } catch (e) {
+      a.removeAttribute("href");
+    }
+  }
+
+  const h1 = clone.querySelector("h1");
+  const title = (h1 ? h1.textContent : document.title) || "";
+  return { html: clone.innerHTML, title: title.replace(/\s+/g, " ").trim(), chars: len(clone) };
+}
+
 // --------------------------------------------------------------- движки ---
 
 async function googleTranslate(text, source, target, signal) {
@@ -2131,6 +2356,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         try {
           sendResponse({ ok: true, text: await aiRewrite(msg.text, settings, { signal: ac.signal }) });
+        } finally {
+          activeRequests.delete(id);
+        }
+        return;
+      }
+
+      // Забор текста по адресу из поля панели. Отмена идёт тем же путём, что и
+      // перевода: `cancelTranslate` по requestId поднимает abort, а вкладку
+      // закрывает `finally` внутри fetchSourceText.
+      if (msg.type === "fetchSource") {
+        const id = msg.requestId || "s" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+        const ac = new AbortController();
+        activeRequests.set(id, ac);
+        try {
+          sendResponse({ ok: true, source: await fetchSourceText(msg.url, { signal: ac.signal }) });
         } finally {
           activeRequests.delete(id);
         }

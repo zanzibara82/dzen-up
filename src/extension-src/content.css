@@ -48,6 +48,7 @@
 #dzr-bar.dzr-collapsed .dzr-status,
 #dzr-bar.dzr-collapsed .dzr-go,
 #dzr-bar.dzr-collapsed .dzr-link-btn,
+#dzr-bar.dzr-collapsed .dzr-src,
 #dzr-bar.dzr-collapsed .dzr-icon-btn:not(.dzr-toggle) {
   display: none;
 }
@@ -135,6 +136,79 @@
   justify-content: center;
 }
 #dzr-bar.dzr-vertical .dzr-link-btn > span:last-child {
+  display: none;
+}
+
+/* ---------- забор текста по адресу: поле + кнопка одной строкой ---------- */
+/* Поле — единственное место панели, где нужен настоящий фокус, поэтому
+   mousedown в content.js для него не отменяет действие браузера. */
+
+.dzr-src {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dzr-src-url {
+  width: 210px;
+  min-width: 90px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  font-size: 12px;
+  outline: none;
+}
+.dzr-src-url::placeholder {
+  color: rgba(255, 255, 255, 0.45);
+}
+.dzr-src-url:focus {
+  border-color: rgba(233, 213, 255, 0.6);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.dzr-src-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.06);
+  color: #e9d5ff;
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.dzr-src-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.dzr-src-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.dzr-src-btn svg {
+  width: 16px;
+  height: 16px;
+}
+.dzr-src-btn.dzr-cancel {
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+}
+
+/* узкая панель у края экрана: адрес там не набрать, остаётся иконка кнопки */
+#dzr-bar.dzr-vertical .dzr-src-url {
+  display: none;
+}
+#dzr-bar.dzr-vertical .dzr-src-btn {
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  justify-content: center;
+}
+#dzr-bar.dzr-vertical .dzr-src-btn > span:last-child {
   display: none;
 }
 

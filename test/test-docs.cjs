@@ -291,6 +291,26 @@ try {
   check("потолок повтора проверки: константы найдены", false, e.message);
 }
 
+// Забор текста по адресу: два числа человек видит в README — сколько ждать загрузку
+// чужой страницы и с какого объёма она считается статьёй. Оба обещания берём из
+// кода: правка лимита иначе оставила бы в тексте старое число.
+try {
+  const timeout = constValue(bg, "SOURCE_TIMEOUT_MS");
+  const min = constValue(bg, "SOURCE_MIN_CHARS");
+  check(
+    "забор по адресу: потолок загрузки назван в README",
+    inReadme(Math.round(timeout / 1000) + " секунд"),
+    "SOURCE_TIMEOUT_MS = " + timeout
+  );
+  check(
+    "забор по адресу: порог «это статья» назван в README",
+    inReadme(min + " знаков"),
+    "SOURCE_MIN_CHARS = " + min
+  );
+} catch (e) {
+  check("забор по адресу: константы найдены", false, e.message);
+}
+
 // Обход ленты: называется не только число страниц, но и вытекающее из него число
 // статей (~20 карточек на страницу). Проверяем именно выкладку, чтобы «~120»
 // не осталось в текстах, когда лимит страниц поменяют. Попап тоже — там эта
@@ -359,6 +379,7 @@ const SETTING_DOC = {
   linkChannels: "Каналы Дзена для перелинковки",
   linkSynonyms: "Синонимы для перелинковки",
   linkCount: "Сколько ссылок на статью",
+  sourceUrl: "Адрес статьи, откуда взять текст",
   aiEnabled: "Использовать AI-рерайт (OpenAI-совместимый API)",
   aiBaseUrl: "Base URL",
   aiModel: "модель",
@@ -441,7 +462,7 @@ for (const k of localKeys) {
   check("локальный ключ " + k + " назван в README", !!frag && inReadme(frag), frag ? "«" + frag + "»" : "нет описания в тесте");
 }
 // Обратная проверка: то, что README кладёт в sync, не должно лежать в LOCAL_KEYS.
-const SYNC_DOC = ["sourceLang", "targetLang", "engine", "strength", "preview", "stripLinks", "signature", "linkCount"];
+const SYNC_DOC = ["sourceLang", "targetLang", "engine", "strength", "preview", "stripLinks", "signature", "linkCount", "sourceUrl"];
 const wrongStore = SYNC_DOC.filter((k) => localKeys.includes(k));
 check("настройки из sync не попали в local", wrongStore.length === 0, wrongStore.length ? "не там: " + wrongStore.join(", ") : "ок");
 
