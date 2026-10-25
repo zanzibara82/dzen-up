@@ -1,7 +1,7 @@
 {
   "name": "dzen-rewriter",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Расширение Chrome: рерайт статьи в редакторе Дзена и перелинковка",
   "type": "module",
   "scripts": {
@@ -20,8 +20,10 @@
     "test:skiplang": "node test/test-skiplang.cjs",
     "test:links": "node test/test-links.cjs",
     "test:channels": "node test/test-channels.cjs",
+    "test:fetch": "node test/test-fetch.cjs",
     "test:linkify": "node test/test-linkify.cjs",
     "test:strip": "node test/test-strip.cjs",
-    "test:signature": "node test/test-signature.cjs"
+    "test:signature": "node test/test-signature.cjs",
+    "test:source": "node test/test-source.cjs"
   }
 }
