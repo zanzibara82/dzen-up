@@ -1651,7 +1651,12 @@ function sourceAddress(raw) {
   const s = String(raw || "").trim();
   if (!s) return "";
   const withScheme = /^https?:\/\//i.test(s) ? s : "https://" + s;
-  if (!looksLikeHost(hostOf(withScheme))) return "";
+  const host = hostOf(withScheme);
+  if (!looksLikeHost(host)) return "";
+  // Необязательное право на http выдано только для localhost и 127.0.0.1.
+  // На прочий http вкладка откроется, а впрыснуть текст будет нечем — человек
+  // получит подсказку «Разрешить доступ», которая ничего не разрешит.
+  if (/^http:\/\//i.test(withScheme) && !/^(localhost|127\.0\.0\.1)(:[0-9]+)?$/i.test(host)) return "";
   return withScheme.replace(/\/+$/, "");
 }
 
@@ -1663,7 +1668,11 @@ function sourceAddress(raw) {
 async function fetchSourceText(url, opts = {}) {
   const target = sourceAddress(url);
   if (!target) {
-    throw new Error("Нужен адрес статьи — например, https://auto-dom24.ru/obzor/.");
+    // Про http отдельная формулировка: человеку важно знать, что дело в схеме,
+    // а не в опечатке адреса.
+    throw /^http:\/\//i.test(String(url || "").trim())
+      ? new Error("Забор работает только по https:// — http допускается лишь для localhost.")
+      : new Error("Нужен адрес статьи — например, https://auto-dom24.ru/obzor/.");
   }
   const timeoutMs = opts.timeoutMs || SOURCE_TIMEOUT_MS;
 
@@ -1738,8 +1747,10 @@ async function fetchSourceText(url, opts = {}) {
         finish(err);
       };
       if (opts.signal) {
+        // Отменённый до старта сигнал — та же отмена, поэтому через onAbort:
+        // панель обязана показать жёлтое «Отменено», а не красную ошибку.
         if (opts.signal.aborted) {
-          finish(new Error("Забор отменён"));
+          onAbort();
           return;
         }
         opts.signal.addEventListener("abort", onAbort);
@@ -1839,11 +1850,18 @@ function extractArticle() {
       a.removeAttribute("href");
       continue;
     }
+    let full = "";
     try {
-      a.setAttribute("href", new URL(href, document.baseURI).href);
+      full = new URL(href, document.baseURI).href;
     } catch (e) {
-      a.removeAttribute("href");
+      full = "";
     }
+    // data:, file: и vbscript: — не ссылки статьи, а мусор чужой страницы.
+    if (!/^(https?|mailto|tel):/i.test(full)) {
+      a.removeAttribute("href");
+      continue;
+    }
+    a.setAttribute("href", full);
   }
 
   const h1 = clone.querySelector("h1");

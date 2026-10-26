@@ -2079,14 +2079,26 @@
     }
   }
 
+  /**
+   * Штатный откат редактора с защитой поля адреса. Нативный undo в Chrome идёт
+   * по истории всего документа: он отменяет и ввод в поле адреса источника, а
+   * пустое поле при следующей потере фокуса сохранилось бы в настройках. Адрес
+   * возвращаем на место сразу после undo.
+   */
+  function undoEditorOnly() {
+    var keep = srcUrlInput ? srcUrlInput.value : "";
+    try {
+      document.execCommand("undo");
+    } catch (e) {}
+    if (srcUrlInput && keep && !srcUrlInput.value) srcUrlInput.value = keep;
+  }
+
   /** Надёжный откат: сначала штатный Ctrl+Z редактора, иначе снимок DOM. */
   function undoLast() {
     var snap = undoSnapshot;
 
     if (!snap || !snap.editor || !document.contains(snap.editor)) {
-      try {
-        document.execCommand("undo");
-      } catch (e) {}
+      undoEditorOnly();
       if (lastOriginal) {
         navigator.clipboard.writeText(lastOriginal).catch(function () {});
         toast("↩️ Отменено. Оригинал скопирован в буфер обмена.");
@@ -2105,7 +2117,11 @@
       undoSnapshot = null;
       undoBtn.hidden = true;
       if (lastOriginal) navigator.clipboard.writeText(lastOriginal).catch(function () {});
-      toast("↩️ Вставка отменена. Оригинал скопирован в буфер обмена.");
+      toast(
+        "↩️ Вставка отменена." +
+          // у забора «оригинала» нет — обещать буфер обмена нечего
+          (lastOriginal ? "<br>Оригинал скопирован в буфер обмена." : "")
+      );
       return;
     }
 
@@ -2124,9 +2140,7 @@
       return;
     }
 
-    try {
-      document.execCommand("undo");
-    } catch (e) {}
+    undoEditorOnly();
 
     setTimeout(function () {
       // сравниваем «сплющенный» текст: innerText содержит переводы строк,
@@ -2159,7 +2173,8 @@
       toast(
         "↩️ Вставка отменена" +
           (restored ? " (восстановил из снимка)" : "") +
-          ".<br>Оригинал скопирован в буфер обмена."
+          "." +
+          (lastOriginal ? "<br>Оригинал скопирован в буфер обмена." : "")
       );
     }, 150);
   }
@@ -2667,16 +2682,26 @@
   /** Выделить вставленное от метки до метки; метки после этого убираем. */
   function selectBetweenMarks(marks) {
     if (!marks) return false;
+    // Метки ставились в саму статью: при любом исходе их надо убрать, иначе в
+    // тексте останутся два пустых служебных span. remove() на отцепленном узле
+    // ничего не делает, поэтому звать можно сколько угодно раз.
+    var drop = function () {
+      try { marks.start.remove(); } catch (e) {}
+      try { marks.end.remove(); } catch (e) {}
+    };
     try {
-      if (!document.contains(marks.start) || !document.contains(marks.end)) return false;
+      if (!document.contains(marks.start) || !document.contains(marks.end)) {
+        drop();
+        return false;
+      }
       var r = document.createRange();
       r.setStartAfter(marks.start);
       r.setEndBefore(marks.end);
       var ok = applyRange(r);
-      marks.start.remove();
-      marks.end.remove();
+      drop();
       return ok;
     } catch (e) {
+      drop();
       return false;
     }
   }

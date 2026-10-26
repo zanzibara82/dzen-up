@@ -174,6 +174,19 @@ async function main() {
   check("чужая схема отклоняется", ftp !== null, "ошибка = " + JSON.stringify(ftp));
   eq("чужая схема: вкладку не открывали", calls.created.length, 0);
 
+  // Право на http в манифесте выдано только localhost и 127.0.0.1. На прочий
+  // http вкладка открылась бы, а впрыснуть текст было бы нечем — человек
+  // получил бы подсказку «Разрешить доступ», которая ничего не разрешит.
+  reset();
+  const plainHttp = await fails(fetchSourceText("http://example.com/a", {}));
+  check("http вне localhost отклоняется", plainHttp !== null && /https/.test(plainHttp), "ошибка = " + JSON.stringify(plainHttp));
+  eq("http вне localhost: вкладку не открывали", calls.created.length, 0);
+
+  reset();
+  const localHttp = await fails(fetchSourceText("http://localhost:8787/a", {}));
+  check("http на localhost проходит", localHttp === null, "ошибка = " + JSON.stringify(localHttp));
+  eq("http на localhost: вкладка открыта по адресу как есть", calls.created.length && calls.created[0].url, "http://localhost:8787/a");
+
   // ---- 2. фоновая вкладка --------------------------------------------------
   reset();
   await fetchSourceText("https://src.ru/a/");
@@ -249,6 +262,21 @@ async function main() {
   const cancelled = await fails(fetchSourceText("https://src.ru/a/", { signal: ac.signal, timeoutMs: 5000 }));
   check("отмена названа отменой", cancelled !== null && /отмен/i.test(cancelled), "ошибка = " + JSON.stringify(cancelled));
   eq("отмена закрыла вкладку", calls.removed.length, 1);
+
+  // Отмена, пришедшая ДО старта, — та же отмена: панель различает их по
+  // признаку `cancelled`, и без него человек увидит красную ошибку.
+  reset();
+  pageLoad = "never";
+  const pre = new AbortController();
+  pre.abort();
+  let preErr = null;
+  try {
+    await fetchSourceText("https://src.ru/a/", { signal: pre.signal, timeoutMs: 5000 });
+  } catch (e) {
+    preErr = e;
+  }
+  check("отмена до старта помечена признаком отмены", !!(preErr && preErr.cancelled), preErr && String(preErr.message));
+  eq("отмена до старта закрыла вкладку", calls.removed.length, 1);
 
   report();
 }
