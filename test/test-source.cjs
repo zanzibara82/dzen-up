@@ -375,6 +375,11 @@ async function main() {
     check("текст абзаца с картинкой сохранён", has(a, "не должны уехать в редактор"));
     check("жирный после зачистки жив", has(a, "<strong>клиренс важнее полного привода</strong>"));
     check("ссылка после зачистки жива", has(a, '<a href="https://auto-dom24.ru/obzor-kladka"'));
+    // Схема ссылки тоже приходит с чужой страницы: data: и vbscript: — не
+    // ссылки статьи, а мусор, который в редакторе Дзена не нужен.
+    check("data-ссылка вырезана", !!a && !/href="data:/i.test(a.html));
+    check("vbscript-ссылка вырезана", !!a && !/href="vbscript:/i.test(a.html));
+    check("текст ссылок-мусора остался", has(a, "data-ссылка") && has(a, "vbscript-ссылка"));
 
     console.log("=== 2: нет article, есть main с блоком content ===");
     const m = await grab("mock-source-main.html");
@@ -464,10 +469,30 @@ async function main() {
     const sel = await page.selectionText();
     check("вставленный текст стал выделением", /клиренс важнее/.test(sel || ""), JSON.stringify(String(sel || "").slice(0, 70)));
 
+    // Откат забора: «оригинала» у забранного текста нет, поэтому обещать
+    // копирование в буфер обмена тост не имеет права.
+    const UNDO = '#dzr-bar .dzr-icon-btn[title*="Отменить вставку"]';
+    check("после вставки появилась кнопка отката", (await page.hasEl(UNDO)) && !(await page.evalJs(`document.querySelector(${JSON.stringify(UNDO)}).hidden`)));
+    await page.click(UNDO);
+    const undoMsg = await page.waitMessage(/Вставка отменена/);
+    check("откат убрал вставленный текст", !/клиренс важнее/.test(await page.bodyText()), JSON.stringify((await page.bodyText()).slice(0, 60)));
+    check("тост отката не обещает буфер обмена", !/Оригинал скопирован/.test(undoMsg || ""), JSON.stringify(String(undoMsg).slice(0, 110)));
+    // нативный undo в Chrome идёт по истории документа и стирает ввод в поле
+    // адреса — после отката адрес обязан остаться на месте
+    check("откат не стёр адрес статьи", /mock-source-article\.html$/.test((await page.value(SRC_INPUT)) || ""), JSON.stringify(await page.value(SRC_INPUT)));
+
     // значение живёт в настройках: и после сворачивания в пузырёк, и после
-    // перезагрузки страницы
+    // перезагрузки страницы. Ждём СМЕНЫ РАСКЛАДКИ после каждого клика: кнопка
+    // в пути анимации уезжает, и второй клик иначе уходит мимо.
+    const fieldLaidOut = () =>
+      page.evalJs(
+        `(() => { var e = document.querySelector('#dzr-bar .dzr-src-url'); if (!e) return false; var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()`
+      );
     await page.click("#dzr-bar .dzr-toggle");
+    for (let i = 0; i < 40 && (await fieldLaidOut()); i++) await sleep(150);
+    check("сворачивание в пузырёк скрыло поле адреса", !(await fieldLaidOut()));
     await page.click("#dzr-bar .dzr-toggle");
+    for (let i = 0; i < 40 && !(await fieldLaidOut()); i++) await sleep(150);
     check("адрес пережил сворачивание в пузырёк", /mock-source-article\.html$/.test((await page.value(SRC_INPUT)) || ""), await page.value(SRC_INPUT));
     await page.reload(EDITOR_URL);
     check("адрес пережил перезагрузку страницы", /mock-source-article\.html$/.test((await page.value(SRC_INPUT)) || ""), await page.value(SRC_INPUT));
@@ -480,6 +505,17 @@ async function main() {
     const errBad = await page.waitMessage(/адрес/i);
     check("мусорный адрес назван мусорным", /адрес/i.test(errBad || ""), JSON.stringify(String(errBad).slice(0, 90)));
     check("мусорный адрес: фоновая вкладка не открыта", (await tabsLike(c, "mock-source")) === 0);
+
+    // Право на http выдано только localhost и 127.0.0.1, поэтому прочий http
+    // обязан отсекаться до открытия вкладки — иначе человек получит подсказку
+    // «Разрешить доступ», которая ничего не разрешит.
+    await page.click(SRC_INPUT);
+    await page.selectAllField();
+    await page.type("http://example.com/mock-source-article.html");
+    await page.click(SRC_BTN);
+    const errHttp = await page.waitMessage(/только по https/i);
+    check("http вне localhost объяснён схемой", /только по https/i.test(errHttp || ""), JSON.stringify(String(errHttp).slice(0, 110)));
+    check("http вне localhost: вкладка не открыта", (await tabsLike(c, "example.com")) === 0);
 
     await page.click(SRC_INPUT);
     await page.selectAllField();
