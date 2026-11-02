@@ -26,7 +26,7 @@ function normalize(p) {
 // Сюда тесты кладут временные копии расширения. Папка внутри проекта, потому
 // что Chrome не даёт грузить расширение с путями, которые ему не нравятся,
 // а ещё её видно при разборе упавших прогонов.
-const SCRATCH = path.join(REPO, ".workbuddy-ai", "tmp");
+const SCRATCH = path.join(REPO, ".agent", "tmp");
 
 const MOCK_DIR = path.join(__dirname, "mocks");
 
@@ -64,7 +64,36 @@ function findChrome() {
  * `clearStorage` — она идёт через сам chrome.storage.
  */
 function testProfile(tag) {
-  return path.join(os.tmpdir(), "dzr-test-profile-" + tag);
+  const dir = path.join(os.tmpdir(), "dzr-test-profile-" + tag);
+  requireProfileFree(dir, tag);
+  return dir;
+}
+
+/**
+ * Проверка до запуска: профиль не должен быть занят.
+ *
+ * Постоянное имя — это переиспользование папки, и иногда её держит Chrome от
+ * прошлого прогона: его убили вместе с родительским прогоном, а окно осталось.
+ * Новый Chrome видит занятый каталог, передаёт ему запуск и выходит сам, а
+ * харнесс остаётся с мёртвым каналом CDP и молча ждёт 40 повторов по 30 секунд.
+ * Разбираемся с этим на входе: у живого Chrome `lockfile` не отдаётся на запись,
+ * а после выхода процесса блокировка снимается вместе с ним.
+ */
+function requireProfileFree(dir, tag) {
+  let fd;
+  try {
+    fd = fs.openSync(path.join(dir, "lockfile"), "r+");
+  } catch (e) {
+    if (e.code === "ENOENT") return; // профиля ещё нет — стартуем свободно
+    throw new Error(
+      "Тестовый профиль «dzr-test-profile-" +
+        tag +
+        "» держит запущенный Chrome (" +
+        dir +
+        "). Закройте его окно — обычно это остаток от прерванного прогона — и повторите набор."
+    );
+  }
+  fs.closeSync(fd);
 }
 
 /**

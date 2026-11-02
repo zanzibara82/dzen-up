@@ -26,10 +26,24 @@
     "linkCount"
   ];
 
+  // Отказ воркера бывает двух видов, и чинят их по-разному. Если фон ответил,
+  // он сам пишет, что сделать (про лимит 8 КБ — «сократите поле»). Если же он
+  // промолчал, значит уснул или расширение только что обновили — и человек с
+  // «Could not establish connection» пойдёт чинить ключ и настройки вместо того,
+  // что действительно сломано. Подсказку даём здесь, в одной точке: тогда её
+  // видят все места, где попап показывает ошибку, а не только сохранение.
+  function deadWorker() {
+    var msg = chrome.runtime.lastError && chrome.runtime.lastError.message;
+    return {
+      ok: false,
+      error: (msg ? msg + ". " : "") + "Фон не ответил: обновите расширение на странице browser://extensions и откройте панель заново."
+    };
+  }
+
   function send(message) {
     return new Promise(function (resolve) {
       chrome.runtime.sendMessage(message, function (res) {
-        resolve(res || { ok: false, error: chrome.runtime.lastError && chrome.runtime.lastError.message });
+        resolve(res || deadWorker());
       });
     });
   }
@@ -171,35 +185,49 @@
     if ($("signature").checked) $("signatureText").focus();
   });
 
+  // Запись в хранилище занимает заметное время, а вёрстка попапа остаётся
+  // кликабельной. Второй клик поверх идущей записи отправляет в фон и старые
+  // значения, и новые: кто из них победит, зависит от того, чей set дошёл
+  // последним, — а человек видел бы в полях одно, а в Дзене работало другое.
+  // Кнопка гаснет на время всего прохода, включая рассылку вкладкам.
   $("save").addEventListener("click", async function () {
-    var next = {
-      aiEnabled: $("aiEnabled").checked,
-      preview: $("preview").checked,
-      skipSameLang: $("skipSameLang").checked,
-      signature: $("signature").checked
-    };
-    FIELDS.forEach(function (f) {
-      if ($(f)) next[f] = $(f).value;
-    });
-    // Число ссылок храним числом: пустое поле — это «по умолчанию», а не NaN.
-    var want = parseInt($("linkCount").value, 10);
-    next.linkCount = Math.max(1, Math.min(10, isNaN(want) ? 2 : want));
-    $("linkCount").value = next.linkCount;
-    var res = await send({ type: "saveSettings", settings: next });
+    var btn = $("save");
+    if (btn.disabled) return;
+    btn.disabled = true;
     var st = $("settings-status");
-    st.className = "status" + (res.ok ? "" : " err");
-    st.textContent = res.ok
-      ? "✅ Сохранено. Настройки применились на всех вкладках Дзена."
-      : "❌ " + res.error;
-    // при ошибке НЕ считаем, что настройки применились: иначе попап начнёт
-    // врать про сохранённое значение до следующего открытия
-    if (res.ok) settings = Object.assign(settings, next);
-    refreshLinkPerm();
+    st.className = "status";
+    st.textContent = "⏳ Сохраняю…";
+    try {
+      var next = {
+        aiEnabled: $("aiEnabled").checked,
+        preview: $("preview").checked,
+        skipSameLang: $("skipSameLang").checked,
+        signature: $("signature").checked
+      };
+      FIELDS.forEach(function (f) {
+        if ($(f)) next[f] = $(f).value;
+      });
+      // Число ссылок храним числом: пустое поле — это «по умолчанию», а не NaN.
+      var want = parseInt($("linkCount").value, 10);
+      next.linkCount = Math.max(1, Math.min(10, isNaN(want) ? 2 : want));
+      $("linkCount").value = next.linkCount;
+      var res = await send({ type: "saveSettings", settings: next });
+      st.className = "status" + (res.ok ? "" : " err");
+      st.textContent = res.ok
+        ? "✅ Сохранено. Настройки применились на всех вкладках Дзена."
+        : "❌ " + res.error;
+      // при ошибке НЕ считаем, что настройки применились: иначе попап начнёт
+      // врать про сохранённое значение до следующего открытия
+      if (res.ok) settings = Object.assign(settings, next);
+      refreshLinkPerm();
 
-    var tabs = await chrome.tabs.query({ url: ["https://dzen.ru/*", "https://zen.yandex.ru/*"] });
-    tabs.forEach(function (t) {
-      chrome.tabs.sendMessage(t.id, { type: "settingsUpdated" }).catch(function () {});
-    });
+      var tabs = await chrome.tabs.query({ url: ["https://dzen.ru/*", "https://zen.yandex.ru/*"] });
+      tabs.forEach(function (t) {
+        chrome.tabs.sendMessage(t.id, { type: "settingsUpdated" }).catch(function () {});
+      });
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   // ---- проверка ключей -----------------------------------------------------

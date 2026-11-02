@@ -52,7 +52,7 @@ const SRC_TEXT = fs.readFileSync(SRC, "utf8");
 const api = new Function(
   "chrome",
   SRC_TEXT +
-    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap, sitemapFor };"
+    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap, sitemapFor, SITE_MAX_BYTES };"
 )(chrome);
 
 const {
@@ -65,7 +65,9 @@ const {
   sitemapCandidates,
   pickArticle,
   sitemapFor,
-  buildLinks
+  buildLinks,
+  loadSitemap,
+  SITE_MAX_BYTES
 } = api;
 
 // ------------------------------------------------------------- подставной fetch
@@ -76,9 +78,32 @@ function installFetch() {
   globalThis.fetch = async (url) => {
     fetched.push(url);
     const r = routes[url];
-    if (!r) return { ok: false, status: 404, text: async () => "" };
+    if (!r) return { ok: false, status: 404, headers: headOf({}), text: async () => "" };
     if (r.throw) throw new Error(r.throw);
-    return { ok: r.status === undefined || r.status === 200, status: r.status || 200, text: async () => r.body };
+    return {
+      ok: r.status === undefined || r.status === 200,
+      status: r.status || 200,
+      headers: headOf(r.headers),
+      // Поток вместо целого тела: на нём виден потолок у ответа без
+      // content-length — такой файл обязан быть оборван самим воркером.
+      body: r.chunks ? { getReader: () => readerOf(r.chunks, r) } : undefined,
+      text: async () => r.body
+    };
+  };
+}
+
+function headOf(map) {
+  const src = map || {};
+  return { get: (k) => src[String(k).toLowerCase()] ?? null };
+}
+
+function readerOf(chunks, box) {
+  let i = 0;
+  return {
+    read: async () => (i < chunks.length ? { done: false, value: chunks[i++] } : { done: true, value: null }),
+    cancel: async () => {
+      box.cancelled = true;
+    }
   };
 }
 
@@ -101,6 +126,23 @@ function sm(urls) {
     "</urlset>"
   );
 }
+/** Кириллица в windows-1251: кодировщика у Node нет, таблицы хватает с запасом. */
+function cp1251Bytes(str) {
+  return Uint8Array.from(
+    [...str].map((ch) => {
+      const c = ch.charCodeAt(0);
+      if (c < 128) return c;
+      if (ch === "ё") return 0xb8;
+      if (ch === "Ё") return 0xa8;
+      if (ch === "й") return 0xe9;
+      if (ch === "Й") return 0xc9;
+      if (c >= 0x410 && c <= 0x42f) return c - 0x410 + 0xc0;
+      if (c >= 0x430 && c <= 0x44f) return c - 0x430 + 0xe0;
+      return 0x3f;
+    })
+  );
+}
+
 function smIndex(locs) {
   return (
     '<?xml version="1.0" encoding="UTF-8"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' +
@@ -734,6 +776,60 @@ async function main() {
   };
   res = await buildLinks("Toyota Camry и обновлённая Камри", { linkSites: "pr.ru" }, { refresh: true, rand: () => 0 });
   eq("параметр адреса — не тот же адрес", res.links.map((l) => l.url), ["https://pr.ru/toyota-camry-obzor/", "https://pr.ru/toyota-camry-obzor?page=2"]);
+
+  // ---- 19. потолок размера ответа -----------------------------------------
+  // Карта сайта — чужой файл, и без потолка целиком в память: обещанный
+  // заголовком гигант и бесконечный поток без content-length укладывают воркер,
+  // а человек вместо внятной ошибки видит молчание перелинковки.
+  {
+    const max = SITE_MAX_BYTES;
+    check(
+      "потолок размера карты задан",
+      typeof max === "number" && max > 1024 * 1024,
+      "SITE_MAX_BYTES = " + JSON.stringify(max)
+    );
+
+    routes = { "https://head.ru/sitemap.xml": { body: sm(["https://head.ru/a/"]), headers: { "content-length": String(max + 1) } } };
+    const head = await loadSitemap("https://head.ru/sitemap.xml", null);
+    eq("гигант по content-length не читается", head.urls, []);
+    check("гигант по content-length не считается картой", head.read === false, "read = " + JSON.stringify(head.read));
+
+    // Тот же размер без заголовка: сервер льёт поток, и оборвать его должен сам
+    // воркер — иначе соединение держится, а байты приходят дальше.
+    const megabyte = new Uint8Array(1024 * 1024);
+    const streamRoute = { chunks: [megabyte, megabyte, megabyte, megabyte, megabyte, megabyte] };
+    routes = { "https://stream.ru/sitemap.xml": streamRoute };
+    const stream = await loadSitemap("https://stream.ru/sitemap.xml", null);
+    eq("поток крупнее потолка отклонён", stream.urls, []);
+    check("поток крупнее потолка оборван", streamRoute.cancelled === true, "cancel не вызван");
+
+    // Обычная карта при этом читается целиком — потолок не должен срезать то,
+    // что заведомо меньше него.
+    routes = { "https://small.ru/sitemap.xml": { body: sm(["https://small.ru/toyota-camry/"]) } };
+    const small = await loadSitemap("https://small.ru/sitemap.xml", null);
+    eq("карта меньше потолка читается", small.urls, ["https://small.ru/toyota-camry/"]);
+
+    // Кириллица на границе двух кусков потока: байты одного знака нельзя
+    // превращать в два вопросительных — адрес перестанет собираться с названием.
+    const bytes = new TextEncoder().encode(sm(["https://split.ru/toyota-camry-обзор/"]));
+    let cut = 0;
+    while (cut < bytes.length && bytes[cut] < 0x80) cut++;
+    routes = { "https://split.ru/sitemap.xml": { chunks: [bytes.slice(0, cut + 1), bytes.slice(cut + 1)] } };
+    const split = await loadSitemap("https://split.ru/sitemap.xml", null);
+    eq("кириллица на границе кусков читается целиком", split.urls, ["https://split.ru/toyota-camry-обзор/"]);
+
+    // Кодировку берём из HTTP-заголовка, как это делал res.text(): карта в
+    // windows-1251 иначе вернулась бы кракозябрами, и подбор потерял бы слова.
+    const cpXml = sm(["https://cp.ru/кайенна/"]).replace('encoding="UTF-8"', 'encoding="windows-1251"');
+    routes = {
+      "https://cp.ru/sitemap.xml": {
+        chunks: [cp1251Bytes(cpXml)],
+        headers: { "content-type": "application/xml; charset=windows-1251" }
+      }
+    };
+    const cp = await loadSitemap("https://cp.ru/sitemap.xml", null);
+    eq("карта в windows-1251 прочитана по заголовку", cp.urls, ["https://cp.ru/кайенна/"]);
+  }
 
   // ---- итог ---------------------------------------------------------------
   const failed = results.filter((r) => !r.ok).length;

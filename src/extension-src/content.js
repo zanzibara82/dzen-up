@@ -32,13 +32,19 @@
   var busy = false;
   var lastOriginal = "";
   var bar, statusEl, goBtn, undoBtn, langSel, modeSel, presetSel, linkBtn, srcUrlInput, srcBtn;
+  // Слушатели на window и document живут вне панели: при перерисовке Дзена
+  // панель пересоздаётся, а они бы копились слой за слоем. Поэтому подписка
+  // ставится один раз, а состояние перетаскивания держится здесь же.
+  var globalsWired = false;
+  var drag = { on: false, x: 0, y: 0, el: null };
 
   // подпись кнопки по умолчанию и подтверждение обработки всей статьи
   var goLabel = "";
   var confirmedAll = false;
-  // подпись кнопки забора текста по адресу — та же история, что у goLabel:
-  // во время работы она становится «Отменить» и обязана вернуться к исходной
+  // подписи кнопок забора текста и перелинковки — та же история, что у goLabel:
+  // во время работы они становятся «Отменить» и обязаны вернуть исходную надпись
   var srcLabel = "";
+  var linkLabel = "";
   var confirmTimer = null;
   // снимок редактора до вставки — для надёжного отката
   var undoSnapshot = null;
@@ -74,7 +80,6 @@
   // Поэтому запоминаем выделение заранее (selectionchange/mouseup) и работаем с ним.
   var savedRange = null;
   var savedText = "";
-  var savedBlocks = [];
   var savedEditor = null;
 
   // ------------------------------------------------------------ утилиты ---
@@ -639,6 +644,56 @@
     return escapeHtml(s).replace(/"/g, "&quot;");
   }
 
+  // ------------------------------------------------- экран чужой разметки ---
+  // Разметка статьи приходит с чужой страницы. Воркер пропускает её через свой
+  // белый список, но одному фильтру доверять нельзя: здесь второй, независимый
+  // проход. Разбор идёт в документе от DOMParser — он инертен, поэтому ни
+  // скрипты, ни «загрузчики» вида <img onerror> до вставки в живой документ не
+  // сработают, и мы успеем всё лишнее снять.
+  var HTML_ALLOWED = [
+    "P", "BR", "DIV", "SPAN", "H1", "H2", "H3", "H4", "H5", "H6",
+    "STRONG", "B", "EM", "I", "U", "S", "A", "UL", "OL", "LI", "BLOCKQUOTE", "CODE", "PRE"
+  ];
+  // Эти вычёркиваем вместе с содержимым: раскладывать их в текст — значит
+  // пустить в статью подпись картинки или содержимое скрипта.
+  var HTML_DEADLY = [
+    "SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "LINK", "META", "BASE", "FORM",
+    "INPUT", "BUTTON", "SELECT", "TEXTAREA", "SVG", "MATH", "TEMPLATE", "NOSCRIPT",
+    "VIDEO", "AUDIO", "PICTURE", "SOURCE", "CANVAS", "MAP", "AREA", "TRACK"
+  ];
+
+  function screenHtml(html) {
+    if (!html) return "";
+    var doc = new DOMParser().parseFromString("<body>" + String(html) + "</body>", "text/html");
+    var nodes = Array.prototype.slice.call(doc.body.querySelectorAll("*"));
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (!el.parentNode) continue; // удалили вместе с родителем
+      var tag = String(el.tagName).toUpperCase();
+      if (HTML_DEADLY.indexOf(tag) !== -1) {
+        el.remove();
+        continue;
+      }
+      if (HTML_ALLOWED.indexOf(tag) === -1) {
+        // незнакомый тег разбираем в содержимое: текст статьи терять нельзя
+        var parent = el.parentNode;
+        while (el.firstChild) parent.insertBefore(el.firstChild, el);
+        el.remove();
+        continue;
+      }
+      var attrs = Array.prototype.slice.call(el.attributes);
+      for (var j = 0; j < attrs.length; j++) {
+        var name = attrs[j].name.toLowerCase();
+        var value = String(attrs[j].value || "").trim();
+        // у ссылки остаётся только адрес по http(s) или почте: обработчики,
+        // стилевые уловки и javascript: вычищаются все до единого
+        if (tag === "A" && name === "href" && /^(https?:|mailto:)/i.test(value)) continue;
+        el.removeAttribute(attrs[j].name);
+      }
+    }
+    return doc.body.innerHTML;
+  }
+
   // ------------------------------------------ разбор маркеров обратно ---
   // [[n]]…[[/n]] — инлайн-обёртка, [[n]] — вставной узел (картинка и пр.).
 
@@ -1017,7 +1072,6 @@
     var text = blocks.length ? blocksToText(blocks) : rangeToText(r);
     if (!text || !text.trim()) return false;
     savedRange = r.cloneRange();
-    savedBlocks = blocks;
     savedText = text;
     savedEditor = root === document.body ? null : root;
     return true;
@@ -1026,7 +1080,6 @@
   function clearSaved() {
     savedRange = null;
     savedText = "";
-    savedBlocks = [];
     savedEditor = null;
   }
 
@@ -1141,25 +1194,6 @@
       return (b.innerText || b.value || "").length - (a.innerText || a.value || "").length;
     });
     return candidates[0] || null;
-  }
-
-  function getSelectedText(editor) {
-    if (!editor) return "";
-    if (editor.tagName === "TEXTAREA" || editor.tagName === "INPUT") {
-      var s = editor.selectionStart,
-        e = editor.selectionEnd;
-      if (s != null && e != null && e > s) return editor.value.slice(s, e);
-      return "";
-    }
-    // живое выделение
-    var r = liveSelectionRange();
-    if (r) {
-      var live = rangeToText(r);
-      if (live.trim()) return live;
-    }
-    // выделение, снятое до клика по панели
-    if (hasSaved()) return savedText;
-    return "";
   }
 
   function makeSelectAllRange(editor) {
@@ -1828,7 +1862,8 @@
     linkBtn = document.createElement("button");
     linkBtn.className = "dzr-link-btn";
     linkBtn.title = "Перелинковка: превратить упоминания моделей в ссылки на свои статьи";
-    linkBtn.innerHTML = icon("link") + "<span>Перелинковка</span>";
+    linkLabel = icon("link") + "<span>Перелинковка</span>";
+    linkBtn.innerHTML = linkLabel;
 
     collapseBtn = document.createElement("button");
     collapseBtn.className = "dzr-icon-btn dzr-toggle";
@@ -1945,6 +1980,9 @@
     closeBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
+      // Крестик во время работы = «отменить и закрыть»: иначе прогон дожил бы
+      // до вставки уже после того, как человек панель убрал.
+      if (busy) cancelRun();
       closed = true;
       stopEditorWatch();
       closePreview(); // карточка без панели бессмысленна
@@ -1966,16 +2004,13 @@
 
     makeDraggable(bar, grip);
     restorePosition();
-    watchSelection();
+    wireGlobals();
   }
 
   function makeDraggable(el, handle) {
-    var sx = 0,
-      sy = 0,
-      dragging = false;
-
     handle.addEventListener("mousedown", function (e) {
-      dragging = true;
+      drag.on = true;
+      drag.el = el;
       // переходим от CSS-центрирования к абсолютным координатам
       var rect = el.getBoundingClientRect();
       el.style.transform = "none";
@@ -1984,31 +2019,10 @@
       barTop = rect.top;
       el.style.left = barLeft + "px";
       el.style.top = barTop + "px";
-      sx = e.clientX;
-      sy = e.clientY;
+      drag.x = e.clientX;
+      drag.y = e.clientY;
       el.classList.add("dzr-dragging");
       e.preventDefault();
-    });
-
-    window.addEventListener("mousemove", function (e) {
-      if (!dragging) return;
-      var dx = e.clientX - sx;
-      var dy = e.clientY - sy;
-      sx = e.clientX;
-      sy = e.clientY;
-      placeAt(
-        (barLeft == null ? 0 : barLeft) + dx,
-        (barTop == null ? 0 : barTop) + dy,
-        sideForPointer(e.clientX)
-      );
-    });
-
-    window.addEventListener("mouseup", function () {
-      if (!dragging) return;
-      dragging = false;
-      el.classList.remove("dzr-dragging");
-      if (barLeft != null) placeAt(barLeft, barTop, barSide);
-      savePosition();
     });
   }
 
@@ -2031,7 +2045,32 @@
     } catch (e) {}
   }
 
-  function watchSelection() {
+  /** Слушатели вне панели: ставятся один раз на весь мир контент-скрипта. */
+  function wireGlobals() {
+    if (globalsWired) return;
+    globalsWired = true;
+
+    window.addEventListener("mousemove", function (e) {
+      if (!drag.on) return;
+      var dx = e.clientX - drag.x;
+      var dy = e.clientY - drag.y;
+      drag.x = e.clientX;
+      drag.y = e.clientY;
+      placeAt(
+        (barLeft == null ? 0 : barLeft) + dx,
+        (barTop == null ? 0 : barTop) + dy,
+        sideForPointer(e.clientX)
+      );
+    });
+
+    window.addEventListener("mouseup", function () {
+      if (!drag.on) return;
+      drag.on = false;
+      if (drag.el) drag.el.classList.remove("dzr-dragging");
+      if (barLeft != null) placeAt(barLeft, barTop, barSide);
+      savePosition();
+    });
+
     document.addEventListener("selectionchange", function () {
       if (busy) return;
       if (captureSelection()) {
@@ -2066,6 +2105,13 @@
     }
   }
 
+  /** Ошибка-признак отмены: по ней run() сворачивается без вставки. */
+  function cancelError() {
+    var e = new Error("Отменено");
+    e.cancelled = true;
+    return e;
+  }
+
   /** Прервать текущий перевод: текст в редакторе при этом не трогается. */
   function cancelRun() {
     if (!busy || !currentRunId) return;
@@ -2086,11 +2132,15 @@
    * возвращаем на место сразу после undo.
    */
   function undoEditorOnly() {
-    var keep = srcUrlInput ? srcUrlInput.value : "";
+    // Снимаем значение ДО undo: поле адреса — не часть статьи, и откатывать его
+    // нельзя. Историю набора Chrome не различает, куда он возвращается.
+    var keep = srcUrlInput ? srcUrlInput.value : null;
     try {
       document.execCommand("undo");
     } catch (e) {}
-    if (srcUrlInput && keep && !srcUrlInput.value) srcUrlInput.value = keep;
+    // Возвращаем ровно то, что было: undo мог и очистить поле, и наполнить его
+    // из истории — проверка «опустело ли» ловила только половину случаев.
+    if (srcUrlInput && keep !== null && srcUrlInput.value !== keep) srcUrlInput.value = keep;
   }
 
   /** Надёжный откат: сначала штатный Ctrl+Z редактора, иначе снимок DOM. */
@@ -2130,10 +2180,20 @@
     // историю набора не попадает, а по тексту «до» и «после» не различить:
     // текст статьи перелинковка не меняет.
     if (snap.restore && snap.html != null) {
+      var restored = true;
       try {
         ed.innerHTML = snap.html;
         ed.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "historyUndo" }));
-      } catch (e) {}
+      } catch (e) {
+        restored = false;
+      }
+      if (!restored) {
+        // Снимок остаётся на месте: человек вправе нажать «Отменить» ещё раз.
+        // Объявить ссылки убранными после неудачной записи — значит оставить их
+        // в тексте и сделать при этом спокойное лицо.
+        toast("⚠️ Редактор не принял возврат: ссылки остались в тексте.", "warn");
+        return;
+      }
       undoSnapshot = null;
       undoBtn.hidden = true;
       toast("↩️ Ссылки убраны — статья вернулась к исходному виду.");
@@ -2247,11 +2307,11 @@
       if (ts && ts.fellBack) {
         warn =
           "⚠️ " +
-          ts.engine +
+          escapeHtml(ts.engine) +
           " не отвечал — " +
           ts.fellBack +
           " фрагм. переведены через " +
-          ts.fallbackName +
+          escapeHtml(ts.fallbackName) +
           ". Качество может отличаться.";
       } else if (ts && ts.failed) {
         warn =
@@ -2265,7 +2325,7 @@
       if (job.aiNote) {
         warn =
           "⚠️ AI недоступен (" +
-          job.aiNote +
+          escapeHtml(job.aiNote) +
           ") — текст переписан встроенным рерайтером.";
       }
 
@@ -2564,11 +2624,18 @@
     }
 
     busy = true;
-    linkBtn.disabled = true;
+    // Кнопка на время шага становится «Отменить»: перелинковка читает чужие
+    // карты сайтов, и ждать её после нажатия незачем. id — тот же механизм,
+    // что у перевода и забора текста.
+    var runId = "l" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    currentRunId = runId;
+    linkBtn.classList.add("dzr-cancel");
+    linkBtn.innerHTML = icon("close") + "<span>Отменить</span>";
     var started = Date.now();
     try {
       setStatus("Подбираю ссылки…");
-      var res = await send({ type: "linkify", text: plain });
+      var res = await send({ type: "linkify", text: plain, requestId: runId });
+      if (res.cancelled || currentRunId !== runId) throw cancelError();
       if (!res.ok) throw new Error(res.error);
 
       var links = res.links || [];
@@ -2585,6 +2652,10 @@
         return;
       }
 
+      // Отмена, нажатая, пока воркер подбирал ссылки, обязана остановить
+      // прогон до вставки — иначе статья перелинкуется вопреки «Отменить».
+      if (currentRunId !== runId) throw cancelError();
+
       await insertAndReport({
         payload: payload,
         editor: editor,
@@ -2596,11 +2667,22 @@
         linkStats: { placed: planner.placed, stats: stats }
       });
     } catch (err) {
-      setStatus("Ошибка", "error");
-      toast("❌ " + escapeHtml(String((err && err.message) || err)), true);
+      if (err && err.cancelled) {
+        setStatus("Отменено", "warn");
+        toast("⏹ Перелинковка отменена. Текст статьи не изменён.");
+      } else {
+        setStatus("Ошибка", "error");
+        toast("❌ " + escapeHtml(String((err && err.message) || err)), true);
+      }
     } finally {
       busy = false;
-      linkBtn.disabled = false;
+      currentRunId = null;
+      linkBtn.classList.remove("dzr-cancel");
+      linkBtn.innerHTML = linkLabel;
+      // cancelRun() блокирует главную кнопку — возвращаем её в обычный вид
+      goBtn.disabled = false;
+      goBtn.classList.remove("dzr-cancel");
+      goBtn.innerHTML = goLabel;
     }
   }
 
@@ -2845,7 +2927,8 @@
       }
 
       var found = res.source || {};
-      var payload = { html: found.html, plain: htmlToPlain(found.html) };
+      var screened = screenHtml(found.html);
+      var payload = { html: screened, plain: htmlToPlain(screened) };
       var st = globalThis.DzenRewriter.stats(payload.plain);
       var job = {
         editor: editor,
@@ -2975,7 +3058,7 @@
     if (!plain.trim()) {
       toast(
         "❌ Не удалось прочитать текст из редактора.<br><span class=\"dzr-dim\">" +
-          describeEditor(editor) +
+          escapeHtml(describeEditor(editor)) +
           "</span>",
         true
       );
@@ -2989,6 +3072,9 @@
     busy = true;
     lastOriginal = plain;
     currentRunId = "r" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    // id этого прогона: отмена обнуляет currentRunId, и по расхождению панель
+    // видит, что её нажали, даже если ответ уже пришёл
+    var runId = currentRunId;
     aiLocal = false; // признак прошлого запуска не должен пережить новый
     // пока идёт работа, кнопка работает как «Отменить»
     goBtn.disabled = false;
@@ -3018,15 +3104,12 @@
           var tr = await send({
             type: "translate",
             text: source,
-            requestId: currentRunId,
+            requestId: runId,
             overrides: { targetLang: S.targetLang, sourceLang: S.sourceLang }
           });
+          if (currentRunId !== runId) throw cancelError();
           if (!tr.ok) {
-            if (tr.cancelled) {
-              var ce = new Error("Отменено");
-              ce.cancelled = true;
-              throw ce;
-            }
+            if (tr.cancelled) throw cancelError();
             throw new Error(tr.error);
           }
           result = tr.text;
@@ -3052,16 +3135,15 @@
           }, 1000);
           var ai;
           try {
-            ai = await send({ type: "aiRewrite", text: result, requestId: currentRunId });
+            ai = await send({ type: "aiRewrite", text: result, requestId: runId });
           } finally {
             clearInterval(aiTick);
           }
+          if (currentRunId !== runId) throw cancelError();
           if (ai.ok) {
             result = ai.text;
           } else if (ai.cancelled) {
-            var ce2 = new Error("Отменено");
-            ce2.cancelled = true;
-            throw ce2;
+            throw cancelError();
           } else {
             aiNote = ai.error;
             result = globalThis.DzenRewriter.rewrite(result, { strength: S.strength });
@@ -3121,6 +3203,10 @@
         started: started
       };
 
+      // Разбор и сборка займов не сетевые, но тоже не мгновенные: отмена,
+      // нажатая во время сборки, обязана остановить прогон до вставки.
+      if (currentRunId !== runId) throw cancelError();
+
       // Предпросмотр: статью не трогаем, пока пользователь не нажмёт «Применить»
       if (S.preview) {
         var st0 = globalThis.DzenRewriter.stats(result);
@@ -3151,7 +3237,7 @@
         toast("⏹ Перевод отменён. Текст статьи не изменён.");
       } else {
         setStatus("Ошибка", "error");
-        toast("❌ " + ((err && err.message) || err), true);
+        toast("❌ " + escapeHtml(String((err && err.message) || err)), true);
       }
     } finally {
       busy = false;
@@ -3216,23 +3302,38 @@
   });
 
   function loadSettings() {
+    // send() никогда не отклоняется: он всегда приносит ответ, пусть и с
+    // ok:false, — поэтому здесь только одна ветка отказа, без второго обработчика
+    // then, который никогда бы не вызвался.
     send({ type: "getSettings" }).then(function (res) {
-      if (res && res.ok) {
-        S = Object.assign(S, res.settings);
-        if (langSel) langSel.value = S.targetLang;
-        if (modeSel) modeSel.value = S.mode;
-        if (presetSel) presetSel.value = S.aiPreset;
-        // поле адреса заполняем только пустое: человек мог начать вводить его,
-        // пока настройки ещё читались, и затирать его ввод — не наше дело
-        if (srcUrlInput && !srcUrlInput.value) srcUrlInput.value = S.sourceUrl || "";
-        syncPresetVisibility();
-        // Признак «настройки прочитаны и применены». До этого момента панель
-        // живёт на значениях по умолчанию из S, и клик по кнопке отработает по
-        // ним, а не по сохранённым настройкам. Тесты ждут этот атрибут, чтобы
-        // не зависеть от того, успел ли ответ прийти; в работе он безвреден.
-        document.documentElement.setAttribute("data-dzr-settings", "ready");
+      if (!res.ok) {
+        // Отказ обязан быть слышен: без него панель молча живёт на значениях по
+        // умолчанию, а человек думает, что работает его настройка.
+        settingsFailed(res.error);
+        return;
       }
+      S = Object.assign(S, res.settings);
+      if (langSel) langSel.value = S.targetLang;
+      if (modeSel) modeSel.value = S.mode;
+      if (presetSel) presetSel.value = S.aiPreset;
+      // поле адреса заполняем только пустое: человек мог начать вводить его,
+      // пока настройки ещё читались, и затирать его ввод — не наше дело
+      if (srcUrlInput && !srcUrlInput.value) srcUrlInput.value = S.sourceUrl || "";
+      syncPresetVisibility();
+      // Признак «настройки прочитаны и применены». До этого момента панель
+      // живёт на значения по умолчанию из S, и клик по кнопке отработает по
+      // ним, а не по сохранённым настройкам. Тесты ждут этот атрибут, чтобы
+      // не зависеть от того, успел ли ответ прийти; в работе он безвреден.
+      document.documentElement.setAttribute("data-dzr-settings", "ready");
     });
+  }
+
+  function settingsFailed(why) {
+    setStatus("Настройки не прочитаны", "warn");
+    toast(
+      "⚠️ Настройки не прочитаны" + (why ? ": " + escapeHtml(String(why)) : "") + ". Панель работает на значениях по умолчанию.",
+      "warn"
+    );
   }
 
   function boot() {

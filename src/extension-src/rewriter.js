@@ -359,15 +359,13 @@
     var words = clean ? clean.split(/\s+/).length : 0;
     return {
       chars: clean.length,
-      words: words,
-      readMinutes: Math.max(1, Math.round(words / 180))
+      words: words
     };
   }
 
   root.DzenRewriter = {
     rewrite: rewrite,
     uniqueness: uniqueness,
-    stats: stats,
-    splitSentences: splitSentences
+    stats: stats
   };
 })(typeof globalThis !== "undefined" ? globalThis : self);

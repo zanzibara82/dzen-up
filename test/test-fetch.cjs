@@ -17,6 +17,12 @@ const SRC = path.join(PATHS.REPO, "src", "extension-src", "background.js");
 
 // ------------------------------------------------------------- подставной chrome
 const localStore = {};
+// Хранилище сеанса: в нём воркер оставляет номера своих вкладок, чтобы уборка
+// нашла хвосты, даже если процесс убили посреди забора.
+const sessionStore = {};
+// Что воркер писал в хранилище сеанса: по этим записям видно, что вкладку
+// поставили на учёт до того, как её закрыли.
+const sessionWrites = [];
 const calls = { created: [], removed: [], injected: [], permissions: [] };
 let updatedListeners = [];
 let injectResult = null; // что вернёт chrome.scripting.executeScript
@@ -26,6 +32,16 @@ let nextTabId = 100;
 // Как ведёт себя страница во вкладке: "complete" — догрузилась сразу,
 // "never" — висит (проверка таймаута), "manual" — дожидается вызова из теста.
 let pageLoad = "complete";
+// Вкладки, живущие в «браузере»: по ним уборка проверяет, не смотрит ли
+// человек в эту вкладку.
+const tabsById = new Map();
+
+/** Номер вкладки, оставленный прошным прогоном: её надо закрыть как сироту. */
+function orphanTab(id, props = {}) {
+  tabsById.set(id, { id, active: false, windowId: 1, ...props });
+  sessionStore.dzrSourceTabs = [id];
+  return id;
+}
 
 function fireUpdated(tabId, changeInfo) {
   for (const fn of updatedListeners) fn(tabId, changeInfo, { id: tabId });
@@ -43,6 +59,14 @@ const chrome = {
       get: async (keys) => (keys == null ? { ...localStore } : Array.isArray(keys) ? { ...localStore } : { [keys]: localStore[keys] }),
       set: async (o) => Object.assign(localStore, o),
       remove: async (k) => { delete localStore[k]; }
+    },
+    session: {
+      get: async (d) => ({ ...d, ...sessionStore }),
+      set: async (o) => {
+        sessionWrites.push({ ...o });
+        Object.assign(sessionStore, o);
+      },
+      remove: async (k) => { delete sessionStore[k]; }
     }
   },
   permissions: {
@@ -61,7 +85,8 @@ const chrome = {
   commands: { onCommand: { addListener() {} } },
   tabs: {
     create: async (props) => {
-      const tab = { id: nextTabId++, windowId: 1 };
+      const tab = { id: nextTabId++, windowId: 1, active: !!props.active, url: props.url };
+      tabsById.set(tab.id, tab);
       calls.created.push(props);
       calls.lastTabId = tab.id;
       // Страница не успевает догрузиться до того, как воркер подписался на
@@ -69,8 +94,14 @@ const chrome = {
       if (pageLoad === "complete") setImmediate(() => completeTab());
       return tab;
     },
+    get: async (id) => {
+      const tab = tabsById.get(id);
+      if (!tab) throw new Error("No tab with id: " + id);
+      return tab;
+    },
     remove: async (ids) => {
       calls.removed.push(ids);
+      for (const id of [].concat(ids)) tabsById.delete(id);
     },
     update: async () => {},
     query: async () => [],
@@ -134,6 +165,9 @@ function reset(article) {
   injectError = null;
   permissionAllowed = true;
   pageLoad = "complete";
+  delete sessionStore.dzrSourceTabs;
+  sessionWrites.length = 0;
+  tabsById.clear();
   injectResult = article
     ? [{ result: article }]
     : [{ result: { html: "<p>Текст статьи.</p>", title: "Как выбирали", chars: 430 } }];
@@ -203,7 +237,10 @@ async function main() {
     "https://src.ru/a",
     430
   ]);
-  eq("впрыскивание в MAIN-мире страницы", calls.injected.length && calls.injected[0].world, "MAIN");
+  // Мир впрыска — не деталь реализации, а граница безопасности: в MAIN-мире
+  // сама страница вправе подменить cloneNode или геттер innerHTML и вернуть
+  // произвольную разметку, которая затем попадает в предпросмотр и в статью.
+  eq("разбор чужой страницы идёт в изолированном мире", calls.injected.length && calls.injected[0].world, "ISOLATED");
 
   // ---- 4. страница не догрузилась ----------------------------------------
   // Вкладку, которая висит, воркер обязан закрыть: иначе у пользователя их
@@ -277,6 +314,51 @@ async function main() {
   }
   check("отмена до старта помечена признаком отмены", !!(preErr && preErr.cancelled), preErr && String(preErr.message));
   eq("отмена до старта закрыла вкладку", calls.removed.length, 1);
+
+  // ---- 8. вкладки-сироты --------------------------------------------------
+  // Воркер MV3 убивается посреди забора, и его `finally` уже не работает:
+  // фоновая вкладка остаётся открытой навсегда. Номер остаётся в хранилище
+  // сеанса, и следующий забор обязан убрать хвост — но не вкладку, которую
+  // человек читает сам, и не вкладку идущего рядом забора.
+  {
+    const tick = async (n) => {
+      for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+    };
+
+    reset();
+    await fetchSourceText("https://src.ru/a/");
+    const marked = sessionWrites.some((w) => Array.isArray(w.dzrSourceTabs) && w.dzrSourceTabs.includes(calls.lastTabId));
+    check("вкладка забора помечена в хранилище сеанса", marked, "записи: " + JSON.stringify(sessionWrites));
+    eq("после успешного забора учёт пуст", sessionStore.dzrSourceTabs, []);
+
+    reset();
+    const orphan = orphanTab(777);
+    await fetchSourceText("https://src.ru/a/");
+    check("сирота с прошлого прогона закрыта", calls.removed.includes(orphan), "закрыто: " + JSON.stringify(calls.removed));
+    check("сирота снята с учёта", !(sessionStore.dzrSourceTabs || []).includes(orphan), JSON.stringify(sessionStore.dzrSourceTabs));
+
+    reset();
+    const read = orphanTab(888, { active: true });
+    await fetchSourceText("https://src.ru/a/");
+    check("вкладку, которую читают, уборка не трогает", !calls.removed.includes(read), "закрыто: " + JSON.stringify(calls.removed));
+
+    // Две вкладки живого воркера: уборка обязана знать о соседнем заборе.
+    reset();
+    pageLoad = "manual";
+    const aP = fetchSourceText("https://a.ru/x");
+    await tick(6);
+    const aTab = calls.lastTabId;
+    check("вкладка идущего забора помечена", (sessionStore.dzrSourceTabs || []).includes(aTab), JSON.stringify(sessionStore.dzrSourceTabs));
+    const bP = fetchSourceText("https://b.ru/x");
+    await tick(6);
+    eq("чужой забор не закрыл вкладку соседнего", calls.removed.length, 0);
+    const bTab = calls.lastTabId;
+    fireUpdated(aTab, { status: "complete" });
+    fireUpdated(bTab, { status: "complete" });
+    await Promise.all([aP, bP]);
+    eq("каждая вкладка закрыта своим забором", calls.removed.slice().sort((x, y) => x - y), [aTab, bTab].sort((x, y) => x - y));
+    eq("после двух заборов учёт пуст", sessionStore.dzrSourceTabs, []);
+  }
 
   report();
 }

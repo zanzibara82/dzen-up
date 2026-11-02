@@ -14,8 +14,9 @@ const ROOT = PATHS.REPO;
 const TMP = PATHS.SCRATCH;
 const MOCK_DIR = PATHS.MOCK_DIR;
 const TEST_EXT = path.join(TMP, "test-ext-fmt");
-// Профиль Chrome — уникальный и в системном temp: чистить его не нужно,
-// поэтому тест не делает массовых удалений (они упираются в защиту песочницы).
+// Профиль Chrome — в системном temp и с постоянным именем (см. `testProfile`):
+// тест не делает массовых удалений, они упираются в защиту песочницы. Если папку
+// держит Chrome от прерванного прогона, это объяснит пред-проверка в `paths.cjs`.
 const USER_DATA = PATHS.testProfile("fmt");
 
 const SRC_EXT = PATHS.normalize(process.argv[2] || PATHS.EXT);

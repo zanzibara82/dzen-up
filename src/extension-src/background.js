@@ -79,6 +79,21 @@ async function getSettings() {
 }
 
 /**
+ * Настройки для ответа отправителю. API-ключ получает только собственная
+ * страница расширения (попап и options): панели на странице он не нужен —
+ * `aiRewrite` отправляется без overrides и воркер берёт ключ сам, а `all_frames`
+ * в манифесте значит, что наш контент-скрипт живёт и в чужих iframe внутри
+ * dzen.ru. Лишняя копия секрета в таких рамках нам ни к чему.
+ */
+function settingsForSender(settings, sender) {
+  const url = (sender && sender.url) || "";
+  if (url.indexOf("chrome-extension://") === 0 || url === "") return settings;
+  const out = { ...settings };
+  delete out.aiKey;
+  return out;
+}
+
+/**
  * Разовый перенос глоссария и API-ключа из sync в local — они лежали там до
  * того, как мы узнали про лимит 8 КБ. Значения не теряются: если в local уже
  * что-то есть, оно остаётся, а копия из sync просто удаляется.
@@ -200,6 +215,22 @@ const CONCURRENCY_MYMEMORY = 2;
 // активные переводы: requestId -> AbortController (для отмены из контент-скрипта)
 const activeRequests = new Map();
 
+// Отмена, пришедшая в паузе между фазами одного прогона, иначе терялась: панель
+// зовёт translate, а следом aiRewrite с тем же requestId, контроллер живёт только
+// время фазы, и cancelTranslate в зазоре никого не находит — «отменять нечего».
+// В результате следующая фаза стартовала уже после нажатия «Отменить». Помним
+// такие id: их добавляется ровно по одному на нажатие, а новый прогон всегда
+// приносит новый id. Потолочок — на случай дня с очень длинным воркером.
+const cancelledRequests = new Set();
+
+/** Регистрирует фазу прогона; отменённый раньше id стартует уже отменённым. */
+function registerRequest(id) {
+  const ac = new AbortController();
+  if (cancelledRequests.has(id)) ac.abort(abortErr());
+  activeRequests.set(id, ac);
+  return ac;
+}
+
 /** Режем абзац на куски по границам предложений, чтобы влезть в лимит сервиса. */
 function splitChunks(text, limit) {
   const sentences = text.match(/[^.!?…]+(?:[.!?…]+|$)/g) || [text];
@@ -314,8 +345,21 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
         break;
       }
 
-      const data = await res.json();
+      // Ответ читаем текстом и разбираем сами. Сервис вправе ответить 200 и
+      // HTML: страница антибота, captive portal, форма логина или aiBaseUrl,
+      // ведущий не на /chat/completions. Сырой SyntaxError («Unexpected token
+      // "<"») не называет имени сервиса, на сетевой регэксп ниже не похож — и
+      // повторялся бы всеми попытками, то есть бился бы по платному API ради
+      // заведомо непригодного ответа.
+      const raw = await res.text();
       cleanup();
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch (e) {
+        lastErr = new Error(label + ": сервис вернул не JSON — " + headOf(raw));
+        break;
+      }
       return data;
     } catch (e) {
       cleanup();
@@ -451,6 +495,16 @@ async function flushCache() {
 }
 
 async function clearCache() {
+  // Ожидаем запись, которая уже в полёте: её `set` лежит на том же хранилище, и
+  // без ожидания она успевала лечь поверх нашего `remove` — только что очищенный
+  // кэш возвращался из мёртвых целиком.
+  if (cacheSaving) {
+    try {
+      await cacheSaving;
+    } catch (e) {
+      /* запись кэша не критична — важнее, что она закончилась */
+    }
+  }
   cacheMap = new Map();
   cacheDirty = false;
   try {
@@ -953,6 +1007,7 @@ const SITEMAP_CACHE_KEY = "dzrSitemaps";
 const SITEMAP_MAX_URLS = 5000; // больше в статьях не нужно, а кэш растёт
 const SITEMAP_MAX_FILES = 6; // вложенные карты читаем не бесконечно
 const SITE_TIMEOUT_MS = 30000; // один файл карты: повторять нечего, но и висеть нельзя
+const SITE_MAX_BYTES = 4 * 1024 * 1024; // 4 МБ: карта крупнее — не карта, а ловушка памяти
 
 /**
  * Служебные сегменты адреса: страница с ними — не статья, а подборка материалов
@@ -1079,7 +1134,7 @@ async function fetchText(url, signal) {
   try {
     const res = await fetch(url, { signal: ac.signal, credentials: "omit", redirect: "follow" });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    return await res.text();
+    return await readBodyCapped(res);
   } catch (e) {
     if (signal && signal.aborted) throw abortErr();
     if (ac.signal.aborted) throw new Error("таймаут " + SITE_TIMEOUT_MS / 1000 + " с");
@@ -1088,6 +1143,62 @@ async function fetchText(url, signal) {
     clearTimeout(timer);
     if (signal) signal.removeEventListener("abort", onOuterAbort);
   }
+}
+
+function decoderFor(contentType) {
+  const m = /charset\s*=\s*["']?([\w-]+)/i.exec(String(contentType || ""));
+  try {
+    // Кодировку берём из HTTP-заголовка, как это делал `res.text()`: карта на
+    // windows-1251 иначе вернулась бы кириллицей в виде кракозябр, и все адреса
+    // в подборе стали бы мусором.
+    return new TextDecoder(m ? m[1] : "utf-8");
+  } catch (e) {
+    return new TextDecoder("utf-8");
+  }
+}
+
+/**
+ * Тело ответа с потолком в байтах. `res.text()` заглатывает всё, что прислал
+ * сайт: гигантская — или намеренно бесконечная — карта укладывает воркер вместе
+ * с памятью, и человек получает молчание вместо ответа. Обрезком xml вопрос не
+ * решаем: недописанный тег читается как «карты нет», а это враньё в отчёте.
+ */
+async function readBodyCapped(res) {
+  const declared = Number(res.headers && res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > SITE_MAX_BYTES) throw tooBigError();
+  if (!res.body || typeof res.body.getReader !== "function") {
+    const text = await res.text();
+    if (text.length > SITE_MAX_BYTES) throw tooBigError();
+    return text;
+  }
+  const reader = res.body.getReader();
+  const decoder = decoderFor(res.headers && res.headers.get("content-type"));
+  const parts = [];
+  let total = 0;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    const value = chunk.value || new Uint8Array(0);
+    total += value.byteLength || value.length || 0;
+    if (total > SITE_MAX_BYTES) {
+      // Пока соединение открыто, сайт вправе лить байты вечно — отрываемся сами.
+      try {
+        await reader.cancel();
+      } catch (e) {
+        /* поток уже закрыт */
+      }
+      throw tooBigError();
+    }
+    parts.push(decoder.decode(value, { stream: true }));
+  }
+  parts.push(decoder.decode());
+  return parts.join("");
+}
+
+function tooBigError() {
+  const err = new Error("файл больше " + Math.round(SITE_MAX_BYTES / (1024 * 1024)) + " МБ — такую карту не читаем");
+  err.tooBig = true;
+  return err;
 }
 
 /** Читает карту сайта: urlset или sitemapindex с вложенными картами. */
@@ -1105,6 +1216,9 @@ async function loadSitemap(site, signal) {
     try {
       xml = await fetchText(url, signal);
     } catch (e) {
+      // Отмена — не «карты нет»: продолжить перебор значило бы дочитывать
+      // чужой сайт после нажатого «Отменить».
+      if (isAbort(e) || (signal && signal.aborted)) throw abortErr();
       continue;
     }
     const locs = parseSitemap(xml);
@@ -1358,6 +1472,7 @@ async function loadChannel(name, signal) {
     try {
       data = await fetchJson(url, { signal, label: "Канал Дзена" });
     } catch (e) {
+      if (isAbort(e) || (signal && signal.aborted)) throw abortErr();
       break; // первая страница не открылась — обход бессмысленен
     }
     if (!owner && data && data.channel && data.channel.source) {
@@ -1564,6 +1679,9 @@ async function buildLinks(text, settings, opts = {}) {
     try {
       map = await sitemapFor(site, opts.signal, opts.refresh);
     } catch (e) {
+      // Отмена — не «сайт не ответил»: молча перейти к следующему значило бы
+      // дочитать чужие карты после нажатого «Отменить».
+      if (isAbort(e) || (opts.signal && opts.signal.aborted)) throw abortErr();
       map = { urls: [], tags: [], read: false };
     }
     if (!map.read) stats.noSitemap.push(hostOf(site) || site);
@@ -1574,6 +1692,7 @@ async function buildLinks(text, settings, opts = {}) {
     try {
       list = await channelArticles(name, opts.signal, opts.refresh);
     } catch (e) {
+      if (isAbort(e) || (opts.signal && opts.signal.aborted)) throw abortErr();
       list = [];
     }
     if (!list.length) stats.noChannel.push(name);
@@ -1640,6 +1759,54 @@ async function buildLinks(text, settings, opts = {}) {
 
 const SOURCE_TIMEOUT_MS = 20000; // чужая страница грузится долго, но не вечно
 const SOURCE_MIN_CHARS = 400; // тот же порог «это текст, а не обломки», что у панели
+const SOURCE_TABS_KEY = "dzrSourceTabs"; // вкладки забора, пережившие убийство воркера
+
+// Номера вкладок, которые этот воркер открыл и ещё не закрыл. Нужны, чтобы
+// уборка хвостов не закрыла живую вкладку идущего рядом забора.
+const liveSourceTabs = new Set();
+
+/** Список вкладок забора в хранилище сеанса: оно выживает между перезапусками воркера. */
+async function readSourceTabs() {
+  const session = chrome.storage && chrome.storage.session;
+  if (!session) return [];
+  try {
+    const st = await session.get({ [SOURCE_TABS_KEY]: [] });
+    return Array.isArray(st[SOURCE_TABS_KEY]) ? st[SOURCE_TABS_KEY] : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function writeSourceTabs(list) {
+  const session = chrome.storage && chrome.storage.session;
+  if (!session) return;
+  try {
+    await session.set({ [SOURCE_TABS_KEY]: list });
+  } catch (e) {
+    /* хранилище сеанса — только подмога уборке, терять из-за него забор нельзя */
+  }
+}
+
+/**
+ * Убираем вкладки, оставшиеся после прошлых прогонов: воркер MV3 убивается посреди
+ * забора, и его `finally` уже не сработает — у человека копятся фоновые вкладки.
+ * Активную вкладку не трогаем никогда: номер вкладки в том же сеансе мог
+ * оказаться у чужой страницы, а закрывать то, что человек читает, — не наша работа.
+ */
+async function reapOrphanSourceTabs() {
+  const list = await readSourceTabs();
+  const orphans = list.filter((id) => !liveSourceTabs.has(id));
+  if (!orphans.length) return;
+  await writeSourceTabs(list.filter((id) => liveSourceTabs.has(id)));
+  for (const id of orphans) {
+    try {
+      const tab = await chrome.tabs.get(id);
+      if (tab && !tab.active) await chrome.tabs.remove(id);
+    } catch (e) {
+      /* вкладки уже нет — это и есть нужный итог */
+    }
+  }
+}
 
 /**
  * Адрес забора: голый хост с путём дотягивается до `https://` (как список
@@ -1675,6 +1842,9 @@ async function fetchSourceText(url, opts = {}) {
       : new Error("Нужен адрес статьи — например, https://auto-dom24.ru/obzor/.");
   }
   const timeoutMs = opts.timeoutMs || SOURCE_TIMEOUT_MS;
+  // Прежде чем открывать свою вкладку, убираем чужие хвосты: их `finally` мог не
+  // случиться, если воркера убили посреди прошлого забора.
+  await reapOrphanSourceTabs();
 
   const loaded = new Set();
   let wake = null;
@@ -1690,11 +1860,17 @@ async function fetchSourceText(url, opts = {}) {
   try {
     const tab = await chrome.tabs.create({ url: target, active: false });
     tabId = tab.id;
+    liveSourceTabs.add(tabId);
+    await writeSourceTabs([...liveSourceTabs]);
     await waitLoaded();
     const injected = await chrome.scripting.executeScript({
       target: { tabId },
       func: extractArticle,
-      world: "MAIN"
+      // ISOLATED, а не MAIN: разбор читает DOM, ему не нужны переменные
+      // страницы. В мире страницы сайт подменил бы cloneNode или геттер
+      // innerHTML — и вернул бы нам произвольную разметку, которая затем
+      // попадает в предпросмотр и в статью.
+      world: "ISOLATED"
     });
     const found = injected && injected[0] ? injected[0].result : null;
     if (!found) throw new Error("На странице не нашлось текста.");
@@ -1713,6 +1889,8 @@ async function fetchSourceText(url, opts = {}) {
     throw e;
   } finally {
     chrome.tabs.onUpdated.removeListener(listener);
+    liveSourceTabs.delete(tabId);
+    await writeSourceTabs([...liveSourceTabs]);
     if (tabId != null) {
       try {
         await chrome.tabs.remove(tabId);
@@ -1826,8 +2004,12 @@ function extractArticle() {
 
   for (const el of Array.from(clone.querySelectorAll("*"))) {
     if (!el.parentNode) continue; // удалили вместе с родителем
-    if (!KEEP.has(el.tagName)) {
-      if (DROP.has(el.tagName)) {
+    // теги из SVG- и MathML-поддерева приходят в нижнем регистре (имена там
+    // регистр сохраняют), а списки — верхний: сравниваем приведённым, иначе
+    // <svg> проскочил бы как «неизвестный тег» и разложился в содержимое
+    const tag = String(el.tagName).toUpperCase();
+    if (!KEEP.has(tag)) {
+      if (DROP.has(tag)) {
         el.remove();
         continue;
       }
@@ -1885,12 +2067,19 @@ async function googleTranslate(text, source, target, signal) {
 }
 
 async function myMemoryTranslate(text, source, target, signal) {
-  const pair = (source && source !== "auto" ? source : "en") + "|" + target;
+  // «en» вместо неизвестного источника заставлял MyMemory переводить так,
+  // будто текст написан по-английски: на выходе был мусор, и панель показывала
+  // его как успешный перевод. Честнее сразу отказаться.
+  if (!source || source === "auto") {
+    const err = new Error("MyMemory: нужен явный исходный язык — авто-определением он не владеет");
+    err.noSourceLang = true;
+    throw err;
+  }
   const url =
     "https://api.mymemory.translated.net/get?q=" +
     encodeURIComponent(text) +
     "&langpair=" +
-    encodeURIComponent(pair);
+    encodeURIComponent(source + "|" + target);
   const data = await fetchJson(url, { signal, label: "MyMemory" });
   const out = data && data.responseData && data.responseData.translatedText;
   if (!out) throw new Error("MyMemory: пустой ответ");
@@ -1905,8 +2094,8 @@ async function myMemoryTranslate(text, source, target, signal) {
 }
 
 function enginePair(engine) {
-  const google = { name: "Google", fn: googleTranslate, concurrency: CONCURRENCY_GOOGLE, limit: 1600 };
-  const mymemory = { name: "MyMemory", fn: myMemoryTranslate, concurrency: CONCURRENCY_MYMEMORY, limit: 480 };
+  const google = { id: "google", name: "Google", fn: googleTranslate, concurrency: CONCURRENCY_GOOGLE, limit: 1600 };
+  const mymemory = { id: "mymemory", name: "MyMemory", fn: myMemoryTranslate, concurrency: CONCURRENCY_MYMEMORY, limit: 480 };
   return engine === "mymemory" ? { primary: mymemory, fallback: google } : { primary: google, fallback: mymemory };
 }
 
@@ -1926,7 +2115,7 @@ async function translateText(text, { sourceLang, targetLang, engine, skipSameLan
   const shape = paragraphs.map((para) => {
     if (!para.trim()) return [];
     return splitChunks(para, primary.limit).map((chunk) => {
-      const job = { chunk, key: cacheKey(chunk, engine, sourceLang, targetLang) };
+      const job = { chunk, key: cacheKey(chunk, primary.id, sourceLang, targetLang) };
       // фрагмент уже на целевом языке — переводчик ему не нужен
       if (canSkip && looksLikeTargetLang(chunk, targetLang)) job.same = true;
       jobs.push(job);
@@ -1943,6 +2132,7 @@ async function translateText(text, { sourceLang, targetLang, engine, skipSameLan
     skipped: 0,
     fellBack: 0,
     failed: 0,
+    needSourceLang: false,
     engine: primary.name,
     fallbackName: fallback.name
   };
@@ -1980,15 +2170,26 @@ async function translateText(text, { sourceLang, targetLang, engine, skipSameLan
       }
 
       let out = null;
+      let by = primary.id;
       try {
         out = await primary.fn(job.chunk, sourceLang, targetLang, signal);
       } catch (e) {
         if (isAbort(e) || (signal && signal.aborted)) throw abortErr();
+        // У фолбэка лимит куска обычно меньше (MyMemory — 480 знаков против
+        // 1600 у Google), поэтому целый кусок он отсекает гарантированно и
+        // ошибка выглядит как «сервис недоступен». Дробим под его лимит.
+        const parts = job.chunk.length > fallback.limit ? splitChunks(job.chunk, fallback.limit) : [job.chunk];
         try {
-          out = await fallback.fn(job.chunk, sourceLang, targetLang, signal);
+          const done = [];
+          for (const part of parts) {
+            done.push(await fallback.fn(part, sourceLang, targetLang, signal));
+          }
+          out = done.join(" ");
+          by = fallback.id;
           stats.fellBack++;
         } catch (e2) {
           if (isAbort(e2) || (signal && signal.aborted)) throw abortErr();
+          if (e2.noSourceLang) stats.needSourceLang = true;
           job.text = job.chunk; // оставляем оригинал: лучше непереведённый кусок, чем потерянный
           job.failed = true;
           stats.failed++;
@@ -1999,7 +2200,9 @@ async function translateText(text, { sourceLang, targetLang, engine, skipSameLan
       }
 
       job.text = out;
-      cache.set(job.key, { t: out, at: Date.now() });
+      // Ключ — движок, который реально ответил. Иначе перевод фолбэка
+      // ложечно считается переводом основного движка.
+      cache.set(cacheKey(job.chunk, by, sourceLang, targetLang), { t: out, at: Date.now() });
       scheduleCacheSave();
       stats.done++;
       report();
@@ -2008,6 +2211,12 @@ async function translateText(text, { sourceLang, targetLang, engine, skipSameLan
   );
 
   if (stats.failed && stats.failed === total) {
+    if (stats.needSourceLang) {
+      throw new Error(
+        "Основной сервис недоступен, а резервный (MyMemory) переводит только с указанием исходного языка. " +
+          "Выберите язык источника в настройках и попробуйте ещё раз."
+      );
+    }
     throw new Error("Сервис перевода недоступен. Проверьте интернет и попробуйте ещё раз.");
   }
 
@@ -2132,6 +2341,10 @@ async function aiRewrite(text, settings, opts = {}) {
     // На деле это чаще всего длина текста: потолок растёт с объёмом, но предел
     // у него есть. Говорим это прямо, вместе с тем, что делать.
     timeoutNote: aiTimeoutNote(text),
+    // 4xx у OpenAI-совместимых сервисов объясняет причину телом: неверная модель,
+    // превышенный контекст всей статьи, лимит тарифа. Без него в панели остаётся
+    // «AI: HTTP 400», и человек идёт править рабочий ключ.
+    errorBody: true,
     method: "POST",
     headers: aiHeaders(settings),
     body: JSON.stringify({
@@ -2303,7 +2516,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     try {
       if (msg.type === "getSettings") {
         await migrateLegacySettings();
-        sendResponse({ ok: true, settings: await getSettings() });
+        sendResponse({ ok: true, settings: settingsForSender(await getSettings(), sender) });
         return;
       }
 
@@ -2320,17 +2533,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       if (msg.type === "cancelTranslate") {
-        const ac = activeRequests.get(msg.requestId);
+        const id = msg.requestId;
+        const ac = activeRequests.get(id);
         if (ac) ac.abort(abortErr());
-        sendResponse({ ok: true, cancelled: !!ac });
+        else if (id) {
+          // фазы между собой разделяет await — отмена могла прийти в зазоре,
+          // тогда её примет следующая фаза под тем же id
+          if (cancelledRequests.size > 200) cancelledRequests.delete(cancelledRequests.values().next().value);
+          cancelledRequests.add(id);
+        }
+        sendResponse({ ok: true, cancelled: !!ac || cancelledRequests.has(id) });
         return;
       }
 
       if (msg.type === "translate") {
         const id = msg.requestId || "r" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
         const settings = { ...(await getSettings()), ...(msg.overrides || {}) };
-        const ac = new AbortController();
-        activeRequests.set(id, ac);
+        const ac = registerRequest(id);
 
         // прогресс не чаще 8 раз в секунду, чтобы не заваливать контент-скрипт
         let lastSent = 0;
@@ -2359,8 +2578,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Ключ обязателен только для чужого сервиса: свой принимает запрос без него.
         if (!aiHasAccess(settings)) throw new Error("Не указан API-ключ в настройках расширения");
         const id = msg.requestId || "a" + Date.now();
-        const ac = new AbortController();
-        activeRequests.set(id, ac);
+        const ac = registerRequest(id);
         // Панель должна знать, что ждать долго, — иначе неподвижное «Рерайчу…»
         // неотличимо от зависания. О самом адресе знает только фон.
         if (sender.tab && sender.tab.id != null) {
@@ -2385,8 +2603,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // закрывает `finally` внутри fetchSourceText.
       if (msg.type === "fetchSource") {
         const id = msg.requestId || "s" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-        const ac = new AbortController();
-        activeRequests.set(id, ac);
+        const ac = registerRequest(id);
         try {
           sendResponse({ ok: true, source: await fetchSourceText(msg.url, { signal: ac.signal }) });
         } finally {
@@ -2397,8 +2614,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       if (msg.type === "linkify") {
         const settings = { ...(await getSettings()), ...(msg.overrides || {}) };
-        const res = await buildLinks(msg.text, settings, { refresh: !!msg.refresh });
-        sendResponse({ ok: true, links: res.links, stats: res.stats });
+        // Подбор ссылок — сетевой шаг (чужие карты сайтов), и он отменяется тем
+        // же путём, что перевод и забор текста: контроллер на время шага.
+        const id = msg.requestId || "l" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+        const ac = registerRequest(id);
+        try {
+          const res = await buildLinks(msg.text, settings, { refresh: !!msg.refresh, signal: ac.signal });
+          sendResponse({ ok: true, links: res.links, stats: res.stats });
+        } finally {
+          activeRequests.delete(id);
+        }
         return;
       }
 

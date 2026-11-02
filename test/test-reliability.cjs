@@ -10,13 +10,24 @@ const SRC = path.join(PATHS.REPO, "src", "extension-src", "background.js");
 
 // ------------------------------------------------------------- подставной chrome
 const localStore = {};
+// Медленная запись в хранилище: на ней видно, что происходит, когда человек
+// жмёт «Очистить кэш» посреди сохранения переводов.
+let slowWriteMs = 0;
+const storeOps = [];
 const chrome = {
   storage: {
     sync: { get: async (d) => ({ ...d }), set: async () => {} },
     local: {
       get: async (d) => ({ ...d, ...localStore }),
-      set: async (o) => Object.assign(localStore, o),
-      remove: async (k) => { delete localStore[k]; }
+      set: async (o) => {
+        storeOps.push("set");
+        if (slowWriteMs) await sleep(slowWriteMs);
+        Object.assign(localStore, o);
+      },
+      remove: async (k) => {
+        storeOps.push("remove");
+        delete localStore[k];
+      }
     }
   },
   runtime: { onMessage: { addListener() {} }, onInstalled: { addListener() {} } },
@@ -28,9 +39,21 @@ const chrome = {
 const src = fs.readFileSync(SRC, "utf8");
 const api = new Function(
   "chrome",
-  src + "\nreturn { translateText, splitChunks, fetchJson, mapPool, clearCache, hashStr, looksLikeTargetLang, DEFAULTS };"
+  src +
+    "\nreturn { translateText, splitChunks, fetchJson, mapPool, clearCache, hashStr, " +
+    "looksLikeTargetLang, myMemoryTranslate, DEFAULTS };"
 )(chrome);
-const { translateText, splitChunks, fetchJson, mapPool, clearCache, looksLikeTargetLang, DEFAULTS } = api;
+const {
+  translateText,
+  splitChunks,
+  fetchJson,
+  mapPool,
+  clearCache,
+  hashStr,
+  looksLikeTargetLang,
+  myMemoryTranslate,
+  DEFAULTS
+} = api;
 
 const results = [];
 function check(name, ok, detail) {
@@ -38,6 +61,8 @@ function check(name, ok, detail) {
   console.log("  %s %s%s", ok ? "PASS" : "FAIL", name, detail ? "  — " + detail : "");
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// сборка частей в кусок добавляет лишние пробелы — сравниваем по сути текста
+const squash = (s) => String(s).replace(/\s+/g, "");
 
 const SETTINGS = { sourceLang: "auto", targetLang: "ru", engine: "google" };
 
@@ -60,13 +85,15 @@ function installFetch() {
 function jsonRes(body) {
   return {
     ok: true, status: 200, headers: { get: () => null },
-    json: async () => body
+    json: async () => body,
+    text: async () => JSON.stringify(body)
   };
 }
 function plainRes(status, headers) {
   return {
     ok: false, status, headers: { get: (k) => headers[k.toLowerCase()] || null },
-    json: async () => ({})
+    json: async () => ({}),
+    text: async () => ""
   };
 }
 function googleBody(text) {
@@ -74,6 +101,34 @@ function googleBody(text) {
 }
 function mmBody(text) {
   return { responseStatus: 200, responseData: { translatedText: text } };
+}
+
+/**
+ * Подставной chrome для прогонов через настоящий обработчик сообщений: воркер
+ * грузится заново, а его слушатель попадает в `box`. Каждому прогону нужен
+ * свежий экземпляр — иначе состояния модуля перемешаются.
+ */
+function mockWorkerChrome(box, store = {}) {
+  return {
+    storage: {
+      sync: { get: async (d) => ({ ...d }), set: async () => {} },
+      local: { get: async (d) => ({ ...d, ...store }), set: async () => {}, remove: async () => {} }
+    },
+    runtime: { onMessage: { addListener: (fn) => { box.listener = fn; } }, onInstalled: { addListener() {} } },
+    contextMenus: { removeAll() {}, create() {}, onClicked: { addListener() {} } },
+    commands: { onCommand: { addListener() {} } },
+    tabs: {
+      sendMessage: async () => {},
+      query: async () => [],
+      create: async () => ({ id: 1 }),
+      remove: async () => {},
+      onUpdated: { addListener() {}, removeListener() {} },
+      update: async () => {}
+    },
+    permissions: { contains: async () => true, request: async () => true },
+    scripting: { executeScript: async () => [{ result: null }] },
+    action: { badgeText: { set: async () => {} } }
+  };
 }
 
 // ------------------------------------------------------------------- прогоны
@@ -145,7 +200,9 @@ async function main() {
       google: () => ({ status: 503 }),
       mymemory: ({ q }) => ({ body: mmBody("MM:" + q) })
     };
-    const res = await translateText("Кусок текста.", SETTINGS);
+    // Исходный язык обязан быть назван: MyMemory не определяет язык, и при
+    // auto он отказывает (проверка отказа — в разделе 21).
+    const res = await translateText("Кусок текста.", { ...SETTINGS, sourceLang: "en" });
     check("текст получен со второго движка", res.text === "MM:Кусок текста.", JSON.stringify(res.text));
     check("stats.fellBack = 1", res.stats.fellBack === 1, JSON.stringify(res.stats));
     check("stats.failed = 0", res.stats.failed === 0);
@@ -469,6 +526,293 @@ async function main() {
     ]);
     globalThis.fetch = prevFetch;
     check("висячий сайт не вешает чтение карты", outcome === "done", "исход: " + outcome);
+  }
+
+  console.log("\n=== 18. панель экранирует чужие строки в уведомлениях ===");
+  {
+    // toast() пишет сообщение в innerHTML. Значения, приехавшие извне — текст
+    // ошибки (фон кладёт в него кусок тела ответа AI-сервиса), имена движков,
+    // описание редактора со страницы — обязаны идти через escapeHtml, иначе
+    // чужая разметка исполнится на dzen.ru. Проверка статическая и вычитает уже
+    // закрытые escapeHtml-скобки, поэтому ловит именно «забыли экранировать», а
+    // не просто ищет слово в файле.
+    const csrc = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "content.js"), "utf8");
+    const RISKY = ["err.message", "aiNote", "describeEditor(", "ts.engine", "ts.fallbackName"];
+
+    function closeAt(text, open) {
+      let depth = 0;
+      for (let i = open; i < text.length; i++) {
+        if (text[i] === "(") depth++;
+        else if (text[i] === ")") {
+          depth--;
+          if (depth === 0) return i;
+        }
+      }
+      return -1;
+    }
+    function stripEscaped(text) {
+      let out = "", i = 0;
+      for (;;) {
+        const at = text.indexOf("escapeHtml(", i);
+        if (at === -1) { out += text.slice(i); break; }
+        const end = closeAt(text, at + "escapeHtml(".length - 1);
+        if (end === -1) { out += text.slice(i); break; }
+        out += text.slice(i, at) + "«экранировано»";
+        i = end + 1;
+      }
+      return out;
+    }
+
+    const bare = [];
+    let at = -1;
+    while ((at = csrc.indexOf("toast(", at + 1)) !== -1) {
+      if (csrc.slice(Math.max(0, at - 9), at) === "function ") continue;
+      const open = at + "toast".length;
+      const end = closeAt(csrc, open);
+      if (end === -1) continue;
+      const call = csrc.slice(open, end + 1);
+      const cleaned = stripEscaped(call);
+      for (const r of RISKY) if (cleaned.indexOf(r) !== -1) bare.push(r);
+    }
+    check("в уведомлениях нет неэкранированных чужих строк", bare.length === 0, bare.join(", "));
+    // заодно убеждаемся, что проверка не пустышка: без escapeHtml она обязана сработать
+    const demo = stripEscaped("(\"❌ \" + err.message)");
+    check("проверка видит голую вставку ошибки", demo.indexOf("err.message") !== -1, JSON.stringify(demo));
+    const demo2 = stripEscaped("(\"❌ \" + escapeHtml(String((err && err.message) || err)))");
+    check("проверка пропускает экранированную ошибку", demo2.indexOf("err.message") === -1, JSON.stringify(demo2));
+  }
+
+  console.log("\n=== 19. отмена в зазоре между фазами не запускает следующую ===");
+  {
+    // Прогон панели — это два сообщения под одним requestId: translate, затем
+    // aiRewrite. Контроллер живёт только время фазы, и отмена, нажатая в паузе
+    // между ними, раньше промахивалась: воркер отвечал «отменять нечего», и AI
+    // стартовал уже после «Отменить» — статья переписывалась вопреки обещанию
+    // README. Здесь мы прогоняем именно эту последовательность через обработчик
+    // сообщений, с настоящим разбором ответа и счётчиком сетевых вызовов.
+    const box = {};
+    new Function("chrome", src)(mockWorkerChrome(box));
+    const listener = box.listener;
+    if (!listener) throw new Error("обработчик сообщений не подписан");
+
+    const send = (msg) => new Promise((r) => listener(msg, {}, r));
+    const aiSeen = () => calls.filter((c) => c.host === "other").length;
+
+    routes.google = ({ q }) => ({ body: googleBody(q + " — перевод") });
+    routes.other = () => ({ body: { choices: [{ message: { content: "переписала модель" } }] } });
+
+    const tr = await send({ type: "translate", text: "привет мир.", requestId: "gap-1", overrides: { targetLang: "ru" } });
+    check("первая фаза отработала", tr && tr.ok === true, JSON.stringify(tr && (tr.error || tr.text || "")).slice(0, 80));
+
+    const cancel = await send({ type: "cancelTranslate", requestId: "gap-1" });
+    check("отмена в зазоре засчитана, а не промахнулась", cancel && cancel.ok === true && cancel.cancelled === true, JSON.stringify(cancel));
+
+    const before = aiSeen();
+    const ai = await send({ type: "aiRewrite", text: "привет мир — перевод", requestId: "gap-1", overrides: { aiKey: "sk-test", aiModel: "m", aiPrompt: "перепиши" } });
+    check("вторая фаза под отменённым id не стартовала", ai && ai.ok === false && ai.cancelled === true, JSON.stringify(ai));
+    check("за отменённый прогон не ушло ни одного AI-запроса", aiSeen() === before, "запросов: " + (aiSeen() - before));
+
+    // и проверим обратное: свежий id того же прогона работает как обычно
+    const fresh = await send({ type: "aiRewrite", text: "привет мир — перевод", requestId: "gap-2", overrides: { aiKey: "sk-test", aiModel: "m", aiPrompt: "перепиши" } });
+    check("обычный рерайт под новым id работает", fresh && fresh.ok === true && fresh.text === "переписала модель", JSON.stringify(fresh));
+    check("для него запрос действительно был", aiSeen() === before + 1, "всего AI-вызовов: " + aiSeen());
+  }
+
+  console.log("\n=== 20. ответ не-JSON: одна ошибка и ни одного повтора ===");
+  {
+    // Сервис отвечает 200, а телом — HTML (антибот, captive portal, не тот путь
+    // у aiBaseUrl). Проверим ровно два обещания: человек видит имя сервиса и
+    // начало ответа, а не «Unexpected token», и что такой ответ не повторяется
+    // попытками — иначе он бился бы по платному API ради мусора.
+    const prevFetch = globalThis.fetch;
+    let hits = 0;
+    globalThis.fetch = async () => {
+      hits++;
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        text: async () => "<!DOCTYPE html><html><body>Access denied</body></html>",
+        json: async () => { throw new SyntaxError('Unexpected token "<", "<!DOCTYP" is not valid JSON'); }
+      };
+    };
+    let err = null;
+    try {
+      await fetchJson("https://api.openai.com/v1/chat/completions", { label: "AI", tries: 4, timeout: 500 });
+    } catch (e) {
+      err = e;
+    }
+    globalThis.fetch = prevFetch;
+    check("отказ называет сервис и начало ответа", !!err && /^AI: сервис вернул не JSON/.test(err.message) && /Access denied/.test(err.message), err && err.message.slice(0, 90));
+    check("не-JSON не повторяется попытками", hits === 1, "запросов: " + hits);
+  }
+
+  console.log("\n=== 21. фолбэк: свой лимит куска, свой ключ кэша и честный отказ при auto ===");
+  {
+    // Кусок режется по лимиту основного движка (у Google 1600 знаков). Когда
+    // отвечает резервный, у которого лимит 480, целый кусок он отбрасывает с
+    // «QUERY LENGTH LIMIT» — и панель выдаёт «сервис недоступен», хотя второй
+    // переводчик жив. Плюс перевод резервного раньше ложно записывался в кэш
+    // основного, и следующий прогон считал чужую работу своей.
+    await clearCache();
+    calls.length = 0;
+    const text = "alpha beta gamma delta. ".repeat(40).trim();
+    const whole = splitChunks(text, 1600);
+    check("кусок один и он в лимите Google", whole.length === 1 && whole[0].length > 480 && whole[0].length <= 1600, "длина: " + whole[0].length);
+
+    routes = {
+      google: () => ({ status: 400 }),
+      mymemory: ({ q }) => ({ body: mmBody(q.toUpperCase()) })
+    };
+    const res = await translateText(text, { ...SETTINGS, sourceLang: "en" });
+    const mmCalls = calls.filter((c) => c.host === "mymemory");
+    check("основной движок не вернул перевод", res.stats.fellBack === 1 && res.stats.failed === 0, JSON.stringify(res.stats));
+    check("резервный получил не один большой кусок", mmCalls.length > 1, "кусков: " + mmCalls.length);
+    check("каждый кусок в лимите резервного", mmCalls.every((c) => c.q.length <= 480), "макс: " + Math.max(...mmCalls.map((c) => c.q.length)));
+    check("текст собран из частей", squash(res.text) === squash(mmCalls.map((c) => c.q.toUpperCase()).join("")), JSON.stringify(res.text).slice(0, 60));
+
+    let keys = [];
+    for (let i = 0; i < 24 && !keys.length; i++) {
+      keys = Object.keys(localStore.dzrCache || {});
+      if (!keys.length) await sleep(25);
+    }
+    check("кэш переводов заполнен", keys.length > 0, "ключей: " + keys.length);
+    check("перевод резервного не притворяется переводом основного", keys.every((k) => k.indexOf("google|") !== 0), keys.join(" "));
+    check("он лежит под ключом ответившего движка", keys.some((k) => k.indexOf("mymemory|en|ru|") === 0 && k.endsWith(hashStr(whole[0]))), keys.join(" "));
+
+    // Обратный случай: язык источника не выбран. Резервный обязан отказаться, а
+    // не переводить текст «как английский», и в сеть ему уходить незачем.
+    await clearCache();
+    calls.length = 0;
+    routes = { google: () => ({ status: 400 }), mymemory: ({ q }) => ({ body: mmBody(q) }) };
+    let err = null;
+    try {
+      await translateText("One more fragment.", SETTINGS);
+    } catch (e) {
+      err = e;
+    }
+    check("при auto резервный не вызывался", calls.filter((c) => c.host === "mymemory").length === 0, "всего вызовов: " + calls.length);
+    check("отказ объясняет про язык источника", !!err && /язык/.test(err.message) && /MyMemory/.test(err.message), err && err.message);
+
+    const direct = await myMemoryTranslate("whatever", "auto", "ru").catch((e) => e);
+    check("при прямом вызове на auto отказ помечен", !!direct && direct.noSourceLang === true, String(direct && direct.message));
+  }
+
+  console.log("\n=== 22. перелинковка отменяется, а не дожидается чужих сайтов ===");
+  {
+    // Подбор ссылок — сетевой шаг: он обходит карты сайтов и канала. Пока он
+    // висел без контроллера, кнопка «Отменить» его не касалась, и человек ждал
+    // чужой сайт даже тогда, когда решил отменить прогон.
+    const box = {};
+    new Function("chrome", src)(mockWorkerChrome(box));
+    const send = (msg) => new Promise((r) => box.listener(msg, {}, r));
+
+    const prevFetch = globalThis.fetch;
+    let opened = 0, cut = 0;
+    globalThis.fetch = (url, opts = {}) =>
+      new Promise((res, rej) => {
+        if (!/sitemap|\.xml/.test(url)) { res(jsonRes({})); return; }
+        opened++;
+        const s = opts.signal;
+        // как настоящий fetch: уже отменённый сигнал не начинает загрузку
+        if (s.aborted) { cut++; rej(new Error("соединение не началось — отмена")); return; }
+        s.addEventListener("abort", () => { cut++; rej(new Error("соединение оборвано по отмене")); });
+      });
+
+    const pending = send({
+      type: "linkify",
+      text: "Volvo XC40 поехал на тест-драйв, а Toyota Camry осталась в гараже.",
+      requestId: "lk-1",
+      overrides: { linkSites: "site.ru" }
+    });
+    await sleep(50);
+    const cancel = await send({ type: "cancelTranslate", requestId: "lk-1" });
+    check("отмена застала перелинковку за работой", cancel && cancel.ok === true && cancel.cancelled === true, JSON.stringify(cancel));
+    const res = await pending;
+    globalThis.fetch = prevFetch;
+    check("перелинковка отвечает об отмене, а не о ссылке", res && res.ok === false && res.cancelled === true, JSON.stringify(res));
+    check("чужой сайт оборван, а не дочитан", opened > 0 && cut === opened, "открыто: " + opened + ", оборвано: " + cut);
+    check("после отмены перебор карт останавливается", opened === 1, "открыто соединений: " + opened);
+
+    // свежий id при этом работает как обычно
+    routes.other = () => ({ body: {} });
+    const fresh = await send({
+      type: "linkify",
+      text: "Volvo XC40 поехал.",
+      requestId: "lk-2",
+      overrides: { linkSites: "" }
+    });
+    check("перелинковка под новым id доходит до ответа", fresh && fresh.ok === true && !!fresh.stats, JSON.stringify(fresh));
+  }
+
+  console.log("\n=== 23. очистка кэша не воскрешает старые переводы ===");
+  {
+    // Запись кэша — асинхронная, и она может идти в тот момент, когда человек
+    // жмёт «Очистить кэш». Без ожидания `set` ложится поверх `remove`, и
+    // очищенный кэш возвращается в хранилище целиком.
+    await clearCache();
+    calls.length = 0;
+    routes = {
+      google: ({ q }) => ({ body: googleBody(q.toUpperCase()) }),
+      mymemory: ({ q }) => ({ body: mmBody(q) })
+    };
+    slowWriteMs = 120;
+    storeOps.length = 0;
+    const saving = translateText("Первый абзац.\n\nВторой абзац.", SETTINGS);
+    await sleep(40); // запись уже в полёте
+    const cleared = clearCache();
+    await saving;
+    await cleared;
+    slowWriteMs = 0;
+    // Дожидаемся хвоста: если идущая запись всё-таки ляжет поверх удаления,
+    // увидеть это надо здесь, а не после того, как тест уже отчитался.
+    await sleep(250);
+    check("хранилище чистое", localStore.dzrCache === undefined, JSON.stringify(Object.keys(localStore)));
+    check(
+      "удаление было последним шагом",
+      storeOps[storeOps.length - 1] === "remove",
+      "порядок операций: " + storeOps.join(", ")
+    );
+
+    // И обычный путь тоже работает: почистили — следующий прогон идёт в сеть.
+    calls.length = 0;
+    const res = await translateText("Первый абзац.\n\nВторой абзац.", SETTINGS);
+    check("после очистки кэш пуст", res.stats.cached === 0 && calls.length > 0, JSON.stringify(res.stats));
+  }
+
+  console.log("\n=== 24. чужой странице API-ключ не отдаётся ===");
+  {
+    // Ключ живёт в local и подставляется в воркере. Панель стоит на чужой
+    // странице (и во всех её iframe), и отдавать ей ключ — значит положить
+    // секрет в DOM-мир, где его может прочитать скрипт площадки.
+    const KEY = "sk-секретный-ключ";
+    const box = {};
+    new Function("chrome", src)(mockWorkerChrome(box, { aiKey: KEY, glossary: "Subaru = Субару" }));
+    const listener = box.listener;
+    if (!listener) throw new Error("обработчик сообщений не подписан");
+    const send = (msg, sender) => new Promise((r) => listener(msg, sender || {}, r));
+
+    const popup = await send({ type: "getSettings" }, { url: "chrome-extension://abc/popup.html" });
+    check(
+      "своему попапу ключ показан — его туда и сохраняют",
+      popup && popup.ok === true && popup.settings.aiKey === KEY,
+      JSON.stringify(popup && popup.settings && popup.settings.aiKey)
+    );
+
+    const panel = await send({ type: "getSettings" }, { url: "https://dzen.ru/i/a1b2c3" });
+    check(
+      "панели на чужой странице ключ не уходит",
+      panel && panel.ok === true && panel.settings.aiKey === undefined,
+      "пришло: " + JSON.stringify(Object.keys((panel && panel.settings) || {}))
+    );
+    check(
+      "обычные настройки панель получает",
+      !!((panel && panel.settings) || {}).targetLang,
+      JSON.stringify((panel && panel.settings) || {}).slice(0, 120)
+    );
+
+    // iframe чужой площадки на той же странице — тот же отказ: all_frames
+    // ставит контент-скрипт внутрь чужого документа.
+    const frame = await send({ type: "getSettings" }, { url: "https://dzen.ru/i/a1b2c3", frameId: 7 });
+    check("фрейму на чужой странице ключ тоже не отдаётся", frame && frame.settings && frame.settings.aiKey === undefined, JSON.stringify((frame && frame.settings) || {}).slice(0, 80));
   }
 
   console.log("\n=== ИТОГ ===");
