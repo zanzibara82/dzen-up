@@ -1,7 +1,14 @@
 // Уборка временных папок, которые оставляют тесты.
 //
-//   node tools/clean-profiles.cjs            # удалить лишнее
-//   node tools/clean-profiles.cjs --dry-run  # только показать
+//   node tools/clean-profiles.cjs                  # удалить лишнее
+//   node tools/clean-profiles.cjs --dry-run        # только показать
+//   node tools/clean-profiles.cjs --wipe-persistent# снести и постоянные профили
+//
+// Зачем --wipe-persistent. Постоянные профили переиспользуются между прогонами —
+// это экономит время на каждом наборе, но они раздуваются: `dzr-test-profile-mocks`
+// дорос до 2,4 ГБ, весь набор — до 6,1 ГБ. Полный зелёный прогон поэтому сносит их
+// целиком: следующий прогон соберёт их заново, а диск не забивается. При частичном
+// или упавшем прогоне флаг НЕ ставят — по профилю разбираются постмортем.
 //
 // Зачем. Раньше копии расширения и профили Chrome носили имена с pid и временем,
 // поэтому каждый прогон создавал НОВЫЕ папки: за четыре дня набралось 756 копий
@@ -14,11 +21,10 @@
 // старый профиль лишним — а если выписать имена в константу, она разъедется с
 // тестами и уборщик начнёт удалять рабочие папки.
 //
-// Профилями пользуются не только наборы: `tools/live-rewrite-check.cjs` держит
-// `liverw`, а инструмент проверки прав — свой. Пока список собирался из
-// одного `test/`, эти профили считались лишними и удалялись — уборщик сносил то,
-// чем работают. Поэтому смотрим в оба каталога: имя берётся из того же
-// `testProfile(…)`, просто лежит в другом файле.
+// Профилями пользуются не только наборы: `tools/live-rewrite-check.cjs` держит свой
+// `liverw`. Пока список собирался из одного `test/`, этот профиль считался лишним и
+// удалялся — уборщик сносил то, чем работают. Поэтому смотрим в оба каталога: имя
+// берётся из того же `testProfile(…)`, просто лежит в другом файле.
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -28,6 +34,7 @@ const SCAN_DIRS = [path.join(ROOT, "test"), path.join(ROOT, "tools")];
 const TMP = os.tmpdir();
 const PREFIX = "dzr-";
 const DRY = process.argv.includes("--dry-run");
+const WIPE = process.argv.includes("--wipe-persistent");
 
 const tags = new Set();
 for (const dir of SCAN_DIRS) {
@@ -45,15 +52,19 @@ if (tags.size === 0) throw new Error("не нашёл ни одного testProf
 
 // Постоянные имена совпадают с именами профилей: и копии расширения
 // (test-ext-<tag>), и профили (dzr-test-profile-<tag>) собираются из того же тега.
-const keep = new Set([...tags].map((t) => "dzr-test-profile-" + t));
+const persistent = new Set([...tags].map((t) => "dzr-test-profile-" + t));
+// При --wipe-persistent «нужного» не остаётся: список тегов всё равно собран,
+// потому что он же сторож — если ни одного testProfile(…) не найдено, выше уже
+// брошена ошибка, и сметающий всё уборщик обязан быть тем, кто устарел заметно.
+const keep = WIPE ? new Set() : persistent;
 
 const all = fs.readdirSync(TMP).filter((n) => n.startsWith(PREFIX));
 const legacy = all.filter((n) => !keep.has(n));
 
 console.log("папка:               " + TMP);
 console.log("всего dzr-папок:     " + all.length);
-console.log("постоянных:          " + keep.size);
-for (const n of [...keep].sort()) console.log("  оставляю  " + n);
+console.log("постоянных:          " + persistent.size + (WIPE ? " (сметаю по флагу)" : ""));
+if (!WIPE) for (const n of [...persistent].sort()) console.log("  оставляю  " + n);
 console.log("лишних:              " + legacy.length);
 for (const n of legacy.sort()) console.log("  удаляю    " + n);
 

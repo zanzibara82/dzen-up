@@ -183,15 +183,84 @@ async function main() {
       return { evalJs, sessionId };
     };
 
-    const clickGo = async (evalJs, sessionId) => {
-      const rect = await evalJs(`(() => {
-        const b = document.querySelector('#dzr-bar .dzr-go');
-        const r = b.getBoundingClientRect();
-        return { x: r.left + r.width/2, y: r.top + r.height/2 };
+    // Наблюдаемое состояние панели: статус, подпись кнопки (в работе она
+    // «Отменить») и текст тоста. Всё это меняет только действие на странице.
+    const barSig = (evalJs) => evalJs(`(() => {
+      const st = document.querySelector('#dzr-bar .dzr-status');
+      const go = document.querySelector('#dzr-bar .dzr-go');
+      const toast = document.getElementById('dzr-toast');
+      return [st && st.textContent, go && go.textContent.trim(), toast && toast.textContent].join(" || ");
+    })()`);
+    const isBusy = (evalJs) => evalJs(`!!document.querySelector('#dzr-bar .dzr-go.dzr-cancel')`);
+    /** Признак того, что клик дошёл: состояние панели сдвинулось относительно снимка. */
+    const sigMoved = (evalJs, prev) => async () => (await barSig(evalJs)) !== prev;
+    const inProgress = (evalJs) =>
+      evalJs(`(() => {
+        const st = document.querySelector('#dzr-bar .dzr-status');
+        return !!st && /Перевожу|Рерайчу|Вставляю|Отменяю/.test(st.textContent);
       })()`);
-      await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y, button: "none" }, sessionId);
-      await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
-      await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
+
+    /**
+     * Клик по элементу панели, подтверждённый эффектом.
+     *
+     * Одиночный CDP-клик в нагруженном прогоне уходит мимо: панель в этот
+     * момент ещё разкладывается, а только что созданный таржет не успел стать
+     * активным. Молча спать после клика нельзя — прогон не запускается, а
+     * проверки «структура сохранена» проходят по совпадению, потому что «до» и
+     * «после» одинаковы. Поэтому ждём обещанного изменения, а не дождавшись —
+     * меряем кнопку заново и кликаем ещё раз.
+     *
+     * `guard` обязателен там, где повтор клика уже опасен: клик отмены,
+     * опоздавший на завершившийся перевод, запустил бы новый прогон. Перед
+     * каждым повтором смотрим, что обстановка для клика всё ещё годится; не
+     * годится — возвращаем false, и сценарий сам решает, что делать дальше.
+     */
+    const clickSel = async (sel, evalJs, sessionId, until, what, guard) => {
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        if (attempt > 1 && guard && !(await guard())) {
+          console.log("  клик %s: обстановка изменилась — повтор невозможен", what);
+          return false;
+        }
+        const rect = await evalJs(`(() => {
+          const b = document.querySelector(${JSON.stringify(sel)});
+          if (!b) return null;
+          const r = b.getBoundingClientRect();
+          return { x: r.left + r.width/2, y: r.top + r.height/2 };
+        })()`);
+        if (!rect) throw new Error("нет элемента " + sel);
+        await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y, button: "none" }, sessionId);
+        await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
+        await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
+        for (let i = 0; i < 50; i++) {
+          if (await until()) return true;
+          await sleep(100);
+        }
+        console.log("  клик %s не возымел эффекта (попытка %d)", what, attempt);
+      }
+      throw new Error("клик «" + what + "» ничего не изменил — панель не приняла ни одной попытки");
+    };
+
+    const clickGo = (evalJs, sessionId, until, what, guard) => clickSel("#dzr-bar .dzr-go", evalJs, sessionId, until, what, guard);
+
+    /** Ждёт, что прогон закончился: кнопка вышла из режима отмены и статус не «в работе». */
+    const waitDone = async (evalJs) => {
+      for (let i = 0; i < 120; i++) {
+        if (!(await isBusy(evalJs)) && !(await inProgress(evalJs))) return;
+        await sleep(250);
+      }
+      throw new Error("прогон не завершился за 30 с");
+    };
+
+    /** Первый клик при пустом выделении: панель должна попросить подтвердить всю статью. */
+    const askConfirm = (evalJs) => async () =>
+      /всю статью/i.test(String(await evalJs(`(document.getElementById('dzr-toast')||{}).textContent || ''`)));
+
+    /** Прогон «всей статьи»: клик просит подтверждение, второй запускает, ждём конца. */
+    const runWholeArticle = async (evalJs, sessionId) => {
+      await clickGo(evalJs, sessionId, askConfirm(evalJs), "просьба подтвердить всю статью");
+      const sig = await barSig(evalJs);
+      await clickGo(evalJs, sessionId, sigMoved(evalJs, sig), "старт прогона (вся статья)");
+      await waitDone(evalJs);
     };
 
     const snapshot = (evalJs) => evalJs(`(() => {
@@ -228,8 +297,9 @@ async function main() {
         const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
         return s.toString();
       })()`);
-      await clickGo(evalJs, sessionId);
-      await sleep(3000);
+      const sigA = await barSig(evalJs);
+      await clickGo(evalJs, sessionId, sigMoved(evalJs, sigA), "старт прогона (выделен абзац)");
+      await waitDone(evalJs);
       const after = await snapshot(evalJs);
       const dbg = JSON.parse((await evalJs(`document.documentElement.getAttribute("data-dzr-debug-info")`)) || "null");
       console.log("после: теги=%s img=%d strong=%d em=%d links=%j",
@@ -251,8 +321,7 @@ async function main() {
         JSON.stringify(before.tags), before.imgs, before.figures, before.strong, before.em, before.links);
 
       // первый клик — должен только попросить подтверждение
-      await clickGo(evalJs, sessionId);
-      await sleep(700);
+      await clickGo(evalJs, sessionId, askConfirm(evalJs), "просьба подтвердить всю статью");
       const st1 = await evalJs(`document.querySelector('#dzr-bar .dzr-status').textContent`);
       const toast1 = await evalJs(`(document.getElementById('dzr-toast')||{}).textContent || ''`);
       const label1 = await evalJs(`document.querySelector('#dzr-bar .dzr-go').textContent`);
@@ -262,8 +331,9 @@ async function main() {
       check("B: 1-й клик ничего не изменил", (await snapshot(evalJs)).imgs === before.imgs && (await snapshot(evalJs)).strong === before.strong);
 
       // второй клик — обработка
-      await clickGo(evalJs, sessionId);
-      await sleep(6000);
+      const sigB = await barSig(evalJs);
+      await clickGo(evalJs, sessionId, sigMoved(evalJs, sigB), "старт прогона (вся статья)");
+      await waitDone(evalJs);
       const after = await snapshot(evalJs);
       const dbg = JSON.parse((await evalJs(`document.documentElement.getAttribute("data-dzr-debug-info")`)) || "null");
       console.log("после: теги=%s img=%d figure=%d figcaption=%d strong=%d em=%d links=%j",
@@ -280,14 +350,8 @@ async function main() {
       check("B: текст переведён", /[а-яё]/i.test(after.text));
 
       // откат
-      const undoRect = await evalJs(`(() => {
-        const b = document.querySelector('#dzr-bar .dzr-icon-btn:not([hidden])');
-        const r = b.getBoundingClientRect();
-        return { x: r.left + r.width/2, y: r.top + r.height/2 };
-      })()`);
-      await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: undoRect.x, y: undoRect.y, button: "left", clickCount: 1 }, sessionId);
-      await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: undoRect.x, y: undoRect.y, button: "left", clickCount: 1 }, sessionId);
-      await sleep(1200);
+      const sigUndo = await barSig(evalJs);
+      await clickSel("#dzr-bar .dzr-icon-btn:not([hidden])", evalJs, sessionId, sigMoved(evalJs, sigUndo), "откат вставки");
       const undone = await snapshot(evalJs);
       const undbg = await evalJs(`document.documentElement.getAttribute("data-dzr-undo")`);
       console.log("откат (debug): %s", undbg);
@@ -300,10 +364,7 @@ async function main() {
     // скриншот результата обработки всей статьи
     {
       const { evalJs, sessionId } = await openPage();
-      await clickGo(evalJs, sessionId);
-      await sleep(400);
-      await clickGo(evalJs, sessionId);
-      await sleep(7000);
+      await runWholeArticle(evalJs, sessionId);
       const shot = await c.send("Page.captureScreenshot", { format: "png" }, sessionId);
       const p = path.join(TMP, `shot-format-${path.basename(PAGE, ".html")}.png`);
       fs.writeFileSync(p, Buffer.from(shot.data, "base64"));
@@ -327,10 +388,7 @@ async function main() {
       ].join("\n\n");
       await evalJs(`document.documentElement.setAttribute("data-dzr-fake-translate", ${JSON.stringify(fake)})`);
 
-      await clickGo(evalJs, sessionId);
-      await sleep(400);
-      await clickGo(evalJs, sessionId);
-      await sleep(1500);
+      await runWholeArticle(evalJs, sessionId);
 
       const after = await snapshot(evalJs);
       const dbg = JSON.parse((await evalJs(`document.documentElement.getAttribute("data-dzr-debug-info")`)) || "null");
@@ -376,10 +434,7 @@ async function main() {
       const d0 = await deep({ evalJs });
       console.log("до:   %j", d0);
 
-      await clickGo(evalJs, sessionId);
-      await sleep(400);
-      await clickGo(evalJs, sessionId);
-      await sleep(7000);
+      await runWholeArticle(evalJs, sessionId);
 
       const after = await snapshot(evalJs);
       const d1 = await deep({ evalJs });
@@ -411,8 +466,8 @@ async function main() {
     if (IS_LONG) {
     console.log("\n=== E. Длинная статья: отмена и прогресс ===");
     {
-      const { evalJs, sessionId } = await openPage();
-      const before = await snapshot(evalJs);
+      let { evalJs, sessionId } = await openPage();
+      let before = await snapshot(evalJs);
       const readBtn = () => evalJs(`(() => {
         const b = document.querySelector('#dzr-bar .dzr-go');
         return { label: b.textContent.trim(), cancel: b.classList.contains('dzr-cancel'), disabled: b.disabled };
@@ -422,21 +477,44 @@ async function main() {
       console.log("кнопка до старта: %j", await readBtn());
 
       // ---- часть 1: отмена ------------------------------------------------
-      // Стартуем и сразу отменяем: окно между стартом и отменой маленькое,
-      // иначе перевод успевает завершиться и клик запускает новый прогон.
-      await clickGo(evalJs, sessionId);   // 1-й клик — подтверждение
-      await sleep(300);
-      await clickGo(evalJs, sessionId);   // 2-й клик — старт
-      await sleep(180);
-
-      const during = await readBtn();
-      const stDuring = await readStatus();
-      console.log("во время перевода: кнопка=%j статус=%j", during, stDuring);
-      check("E: во время работы кнопка стала «Отменить»", during.cancel && /Отмен/i.test(during.label), JSON.stringify(during));
-      check("E: кнопка не заблокирована (можно нажать)", during.disabled === false);
-
-      await clickGo(evalJs, sessionId);   // отменяем
-      await sleep(1600);
+      // Отмена имеет смысл, только пока прогон идёт: перевод длинной статьи с
+      // подставным движком укладывается в секунду, и клик, припозднившийся на
+      // «Готово», запустил бы новый прогон вместо отмены. Поэтому пытаемся
+      // дождаться статуса отмены, а не спать фиксированную паузу; если прогон
+      // успел завершиться сам (клик-отмена невозможен) — пробуем ещё раз на
+      // свежей странице.
+      let cancelled = false;
+      let during = null;
+      let stDuring = "";
+      for (let attempt = 1; attempt <= 3 && !cancelled; attempt++) {
+        if (attempt > 1) {
+          const page = await openPage();
+          evalJs = page.evalJs;
+          sessionId = page.sessionId;
+          before = await snapshot(evalJs);
+        }
+        await clickGo(evalJs, sessionId, askConfirm(evalJs), "просьба подтвердить (часть 1)");
+        const sigStart = await barSig(evalJs);
+        await clickGo(evalJs, sessionId, sigMoved(evalJs, sigStart), "старт прогона (часть 1)");
+        during = await readBtn();
+        stDuring = await readStatus();
+        console.log("во время перевода: кнопка=%j статус=%j", during, stDuring);
+        if (!(await isBusy(evalJs))) {
+          console.log("  отменять нечего — прогон уже завершился (попытка %d)", attempt);
+          continue;
+        }
+        cancelled = await clickGo(
+          evalJs,
+          sessionId,
+          async () => /Отмен/i.test(String(await readStatus())),
+          "отмена прогона",
+          () => isBusy(evalJs)
+        );
+        if (!cancelled) console.log("  прогон завершился, пока мы целились по кнопке отмены (попытка %d)", attempt);
+      }
+      check("E: во время работы кнопка стала «Отменить»", !!during && during.cancel && /Отмен/i.test(during.label), JSON.stringify(during));
+      check("E: кнопка не заблокирована (можно нажать)", !!during && during.disabled === false);
+      await waitDone(evalJs);
       const stAfter = await readStatus();
       const toastAfter = await evalJs(`(document.getElementById('dzr-toast')||{}).textContent || ''`);
       const btnAfter = await readBtn();
@@ -468,9 +546,9 @@ async function main() {
         return true;
       })()`);
 
-      await clickGo(evalJs, sessionId);
-      await sleep(300);
-      await clickGo(evalJs, sessionId);
+      await clickGo(evalJs, sessionId, askConfirm(evalJs), "просьба подтвердить (часть 2)");
+      const sig2 = await barSig(evalJs);
+      await clickGo(evalJs, sessionId, sigMoved(evalJs, sig2), "старт прогона (часть 2)");
 
       // ждём завершения (перевод длинной статьи идёт небыстро)
       let done = false;

@@ -36,7 +36,7 @@
     var msg = chrome.runtime.lastError && chrome.runtime.lastError.message;
     return {
       ok: false,
-      error: (msg ? msg + ". " : "") + "Фон не ответил: обновите расширение на странице browser://extensions и откройте панель заново."
+      error: (msg ? msg + ". " : "") + "Фон не ответил: обновите расширение на странице chrome://extensions и откройте панель заново."
     };
   }
 
@@ -225,6 +225,13 @@
       tabs.forEach(function (t) {
         chrome.tabs.sendMessage(t.id, { type: "settingsUpdated" }).catch(function () {});
       });
+    } catch (e) {
+      // Ветка нужна именно здесь, а не в `checkKey`-подобном порядке: без неё
+      // при отклонённом промисе (контекст расширения загнан, вкладка исчезла)
+      // `finally` вернул бы кнопку в жизнь, а статус так и висел бы «⏳ Сохраняю…»
+      // — человек ждал бы итога, которого уже не будет.
+      st.className = "status err";
+      st.textContent = "❌ " + ((e && e.message) || e);
     } finally {
       btn.disabled = false;
     }

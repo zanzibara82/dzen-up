@@ -31,6 +31,11 @@
 
   var busy = false;
   var lastOriginal = "";
+  // «Настройки прочитаны» и «язык выбрала панель». Нужны, чтобы отличить своё
+  // значение от значения по умолчанию: без этого панель могла послать в фон
+  // догадку вместо того, что человек сохранял в попапе. См. `panelOverrides`.
+  var settingsReady = false;
+  var langTouched = false;
   var bar, statusEl, goBtn, undoBtn, langSel, modeSel, presetSel, linkBtn, srcUrlInput, srcBtn;
   // Слушатели на window и document живут вне панели: при перерисовке Дзена
   // панель пересоздаётся, а они бы копились слой за слоем. Поэтому подписка
@@ -1952,6 +1957,9 @@
     });
     langSel.addEventListener("change", function () {
       S.targetLang = langSel.value;
+      // Выбор человека — не догадка панели: этот язык можно слать в фон даже
+      // когда настройки не прочитались.
+      langTouched = true;
       send({ type: "saveSettings", settings: { targetLang: S.targetLang } });
     });
     modeSel.addEventListener("change", function () {
@@ -2518,6 +2526,9 @@
     var parts = [];
     if (s.unmapped && s.unmapped.length) parts.push("не нашёл материал для: " + s.unmapped.join(", "));
     if (s.noSitemap && s.noSitemap.length) parts.push("без карты сайта: " + s.noSitemap.join(", "));
+    // Не «карты нет», а «карту не потянули»: править нужно на сайте, и человек
+    // должен видеть, что файл существует и оборван на середине.
+    if (s.bigMap && s.bigMap.length) parts.push("карта слишком большая, дочитали не всю: " + s.bigMap.join(", "));
     if (s.noChannel && s.noChannel.length) parts.push("канал не удалось обойти: " + s.noChannel.join(", "));
     return (
       "⚠️ Перелинковка: ссылок не поставил.<br>" +
@@ -2560,6 +2571,9 @@
       }
       notes.push(where.join(" · "));
     }
+    // Тот же разговор, что и в отчёте «ссылок не поставил»: если карту только
+    // начали читать и оборвали по размеру, «нет sitemap.xml» — неправда.
+    if (s.bigMap && s.bigMap.length) notes.push("карта слишком большая, дочитали не всю: " + s.bigMap.join(", "));
     // Рубрика — не статья: человек должен видеть, что ссылка ведёт на подборку
     // материалов по теме, а не на конкретный текст.
     var toTag = placed.filter(function (p) {
@@ -3105,7 +3119,7 @@
             type: "translate",
             text: source,
             requestId: runId,
-            overrides: { targetLang: S.targetLang, sourceLang: S.sourceLang }
+            overrides: panelOverrides()
           });
           if (currentRunId !== runId) throw cancelError();
           if (!tr.ok) {
@@ -3313,6 +3327,7 @@
         return;
       }
       S = Object.assign(S, res.settings);
+      settingsReady = true;
       if (langSel) langSel.value = S.targetLang;
       if (modeSel) modeSel.value = S.mode;
       if (presetSel) presetSel.value = S.aiPreset;
@@ -3334,6 +3349,26 @@
       "⚠️ Настройки не прочитаны" + (why ? ": " + escapeHtml(String(why)) : "") + ". Панель работает на значениях по умолчанию.",
       "warn"
     );
+  }
+
+  /**
+   * Что панель имеет права передавать фону поверх сохранённых настроек.
+   *
+   * Фон схлопывает `{...getSettings(), ...overrides}`, поэтому каждое поле
+   * здесь — приказ, а не пожелание. Значит слать можно только то, что панель
+   * действительно знает: после отказа читать настройки `S` держит значения по
+   * умолчанию, и отправленный `targetLang: "ru"` молча подменил бы язык,
+   * который человек сохранял в попапе.
+   *
+   * Язык цели отдельно: его панель знает и без настроек, если человек сам
+   * выбрал в этом сеансе. Языка источника в панели нет вовсе — он приходит
+   * только из настроек.
+   */
+  function panelOverrides() {
+    var o = {};
+    if (settingsReady || langTouched) o.targetLang = S.targetLang;
+    if (settingsReady) o.sourceLang = S.sourceLang;
+    return o;
   }
 
   function boot() {

@@ -394,14 +394,36 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
   throw lastErr || new Error(label + ": неизвестная ошибка");
 }
 
-/** Начало тела ответа одной строкой — для текста ошибки. */
+/**
+ * Начало тела ответа одной строкой — для текста ошибки.
+ *
+ * Секретоподобное вычёркивается: текст ошибки показывается тостом на странице
+ * Дзена, а тело 4xx от своего адреса API или прокси вполне может содержать
+ * фрагмент ключа. Ключ пользователя не обязан появляться ни на странице, ни в
+ * логах — поэтому зачистка стоит здесь, а не на месте вызова.
+ */
 async function shortBody(res, limit = 300) {
   try {
     const t = await res.text();
-    return String(t || "").replace(/\s+/g, " ").trim().slice(0, limit);
+    return redactSecrets(String(t || "").replace(/\s+/g, " ")).trim().slice(0, limit);
   } catch (e) {
     return "";
   }
+}
+
+/**
+ * Вычёркивает из чужого текста то, что похоже на ключ или заголовок авторизации.
+ *
+ * Значение ключа ограничено символом, которым в чужом ответе оно кончается
+ * (кавычка, запятая, скобка), а не любой непробельный: жадный `\S+` в однострочном
+ * JSON уносил бы и `"type":"invalid_request_error"`, то есть всё объяснение
+ * причины, ради которого тело 4xx к ошибке и прикладывается.
+ */
+function redactSecrets(text) {
+  return String(text || "").replace(
+    /(sk-[A-Za-z0-9_-]{8,}|Bearer\s+[^"',}\s]+|api[_-]?key"?\s*[:=]\s*"?[^"',}\s]+)/gi,
+    "[ключ скрыт]"
+  );
 }
 
 /** Простой пул: не больше `limit` одновременных задач, порядок результата сохраняется. */
@@ -1207,6 +1229,7 @@ async function loadSitemap(site, signal) {
   const urls = [];
   let files = 0;
   let read = false;
+  let big = false;
   const tried = [];
   while (queue.length && files < SITEMAP_MAX_FILES) {
     const url = queue.shift();
@@ -1219,6 +1242,14 @@ async function loadSitemap(site, signal) {
       // Отмена — не «карты нет»: продолжить перебор значило бы дочитывать
       // чужой сайт после нажатого «Отменить».
       if (isAbort(e) || (signal && signal.aborted)) throw abortErr();
+      // Потолок размера — тоже не «карты нет»: файл есть, мы его просто не
+      // потянули. Молчаливое `continue` отправило бы хост в отчёт «без карты
+      // сайта», а README обещает явную ошибку. Дальше перебирать нечего:
+      // следующие кандидаты того же сайта упираются в тот же потолок.
+      if (e && e.tooBig) {
+        big = true;
+        break;
+      }
       continue;
     }
     const locs = parseSitemap(xml);
@@ -1231,7 +1262,7 @@ async function loadSitemap(site, signal) {
     else urls.push.apply(urls, locs);
     if (urls.length >= SITEMAP_MAX_URLS) break;
   }
-  return { urls: urls.slice(0, SITEMAP_MAX_URLS), tried, read };
+  return { urls: urls.slice(0, SITEMAP_MAX_URLS), tried, read, big };
 }
 
 async function sitemapFor(site, signal, refresh) {
@@ -1250,16 +1281,19 @@ async function sitemapFor(site, signal, refresh) {
     // Запись прошлой версии — плоский список, где статьи лежат вперемешку с
     // рубриками. Перечитываем её через то же деление: сети не просим, профиль
     // не чистим, но подборка не встаёт под якорь как статья.
-    if (!Array.isArray(hit.tags)) return Object.assign(splitSitemapUrls(hit.urls || []), { read: true });
-    return { urls: hit.urls || [], tags: hit.tags, read: true };
+    if (!Array.isArray(hit.tags)) return Object.assign(splitSitemapUrls(hit.urls || []), { read: true, big: !!hit.big });
+    return { urls: hit.urls || [], tags: hit.tags, read: true, big: !!hit.big };
   }
 
   const res = await loadSitemap(site, signal);
   const map = splitSitemapUrls(res.urls);
   if (res.urls.length) {
-    await mergeLocalCache(SITEMAP_CACHE_KEY, key, { at: Date.now(), urls: map.urls, tags: map.tags });
+    // Признак «не дочитали из-за потолка» едет в кэш вместе с адресами: иначе
+    // второй забор за 12 часов показал бы «карта прочитана» там, где мы её
+    // оборвали, и предупреждение пропало бы без следа.
+    await mergeLocalCache(SITEMAP_CACHE_KEY, key, { at: Date.now(), urls: map.urls, tags: map.tags, big: !!res.big });
   }
-  return Object.assign(map, { read: res.read });
+  return Object.assign(map, { read: res.read, big: !!res.big });
 }
 
 /** Адрес элемента пула: строка (карта сайта) или {url, title} (статья канала). */
@@ -1643,6 +1677,7 @@ async function buildLinks(text, settings, opts = {}) {
     channels: channels.length,
     links: 0,
     noSitemap: [],
+    bigMap: [],
     noChannel: [],
     siteOnly: 0,
     tagLinks: 0,
@@ -1684,7 +1719,11 @@ async function buildLinks(text, settings, opts = {}) {
       if (isAbort(e) || (opts.signal && opts.signal.aborted)) throw abortErr();
       map = { urls: [], tags: [], read: false };
     }
-    if (!map.read) stats.noSitemap.push(hostOf(site) || site);
+    // Карта есть, но её не потянули по размеру, — отдельная причина: «без карты
+    // сайта» человеку ничего не скажет, а правиться тут нечем, кроме как
+    // сжать саму карту на сайте.
+    if (map.big) stats.bigMap.push(hostOf(site) || site);
+    else if (!map.read) stats.noSitemap.push(hostOf(site) || site);
     pools.set(site, map);
   }
   for (const name of channels) {
@@ -1764,6 +1803,23 @@ const SOURCE_TABS_KEY = "dzrSourceTabs"; // вкладки забора, пер�
 // Номера вкладок, которые этот воркер открыл и ещё не закрыл. Нужны, чтобы
 // уборка хвостов не закрыла живую вкладку идущего рядом забора.
 const liveSourceTabs = new Set();
+// Сироты, которые уборка не стала закрывать (их читают) и обязана продолжить
+// помнить: без этого запись списка от конца другого забора вычёркивала их, и
+// фоновая вкладка оставалась открытой навсегда — уже без всякого учёта.
+const keptSourceTabs = new Set();
+
+/**
+ * Полный список вкладок забора: наши открытые плюс те, что не стали закрывать.
+ * Запись идёт отсюда, а не из каждого места своего: мест три (старт забора, его
+ * конец, уборка), и каждое знает только своё. По отдельности они затирать бы
+ * друг друга — а инвариант нужен такой: в списке обязаны остаться все наши
+ * открытые вкладки.
+ */
+async function syncSourceTabs() {
+  const all = new Set(liveSourceTabs);
+  for (const id of keptSourceTabs) all.add(id);
+  await writeSourceTabs([...all]);
+}
 
 /** Список вкладок забора в хранилище сеанса: оно выживает между перезапусками воркера. */
 async function readSourceTabs() {
@@ -1792,20 +1848,34 @@ async function writeSourceTabs(list) {
  * забора, и его `finally` уже не сработает — у человека копятся фоновые вкладки.
  * Активную вкладку не трогаем никогда: номер вкладки в том же сеансе мог
  * оказаться у чужой страницы, а закрывать то, что человек читает, — не наша работа.
+ * Такую вкладку при этом продолжаем помнить — см. `keptSourceTabs`.
  */
 async function reapOrphanSourceTabs() {
   const list = await readSourceTabs();
   const orphans = list.filter((id) => !liveSourceTabs.has(id));
   if (!orphans.length) return;
-  await writeSourceTabs(list.filter((id) => liveSourceTabs.has(id)));
   for (const id of orphans) {
     try {
       const tab = await chrome.tabs.get(id);
-      if (tab && !tab.active) await chrome.tabs.remove(id);
+      if (tab && !tab.active) {
+        await chrome.tabs.remove(id);
+        keptSourceTabs.delete(id);
+      } else {
+        // Активную не закрываем — и НЕ вычёркиваем из списка. Раз вкладка жива,
+        // она обязана остаться в учёте: снятая, она больше никогда не попадёт
+        // сюда, и у человека вечно висит фоновая вкладка от нашего забора.
+        keptSourceTabs.add(id);
+      }
     } catch (e) {
-      /* вкладки уже нет — это и есть нужный итог */
+      // Вкладки уже нет — помнить нечего. Снимает с учёта и ту, которую
+      // прошлая уборка оставила: её закрыл человек.
+      keptSourceTabs.delete(id);
     }
   }
+  // Пишем ПОСЛЕ цикла закрытия. Раньше запись стояла до него и фильтровала
+  // снимок, прочитанный заранее: вкладку забора, стартовавшего рядом, в
+  // снимке ещё нет — и запись стирала её из учёта, пока сосед ждал загрузки.
+  await syncSourceTabs();
 }
 
 /**
@@ -1861,7 +1931,7 @@ async function fetchSourceText(url, opts = {}) {
     const tab = await chrome.tabs.create({ url: target, active: false });
     tabId = tab.id;
     liveSourceTabs.add(tabId);
-    await writeSourceTabs([...liveSourceTabs]);
+    await syncSourceTabs();
     await waitLoaded();
     const injected = await chrome.scripting.executeScript({
       target: { tabId },
@@ -1889,8 +1959,6 @@ async function fetchSourceText(url, opts = {}) {
     throw e;
   } finally {
     chrome.tabs.onUpdated.removeListener(listener);
-    liveSourceTabs.delete(tabId);
-    await writeSourceTabs([...liveSourceTabs]);
     if (tabId != null) {
       try {
         await chrome.tabs.remove(tabId);
@@ -1898,6 +1966,13 @@ async function fetchSourceText(url, opts = {}) {
         /* вкладку уже закрыли — пользователю об этом нечего сообщать */
       }
     }
+    // Снимаем с учёта ПОСЛЕ закрытия. В обратном порядке между двумя этими
+    // операциями попадал разрыв: воркера MV3 убивают именно здесь, вкладка
+    // остаётся открытой и уже не числится — следующая уборка её не найдёт, и
+    // хвост висит до конца сеанса браузера.
+    liveSourceTabs.delete(tabId);
+    keptSourceTabs.delete(tabId);
+    await syncSourceTabs();
   }
 
   /** Промежуток между «вкладку создали» и «страница догрузилась». */
@@ -2374,7 +2449,7 @@ async function aiRewrite(text, settings, opts = {}) {
 
 /** Начало ответа для текста ошибки: без него форма ответа не видна. */
 function headOf(xml) {
-  return String(xml || "").replace(/\s+/g, " ").trim().slice(0, 300);
+  return redactSecrets(String(xml || "").replace(/\s+/g, " ")).trim().slice(0, 300);
 }
 
 // ------------------------------------------------------- проверка ключей ---

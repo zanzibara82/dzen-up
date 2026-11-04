@@ -793,6 +793,10 @@ async function main() {
     const head = await loadSitemap("https://head.ru/sitemap.xml", null);
     eq("гигант по content-length не читается", head.urls, []);
     check("гигант по content-length не считается картой", head.read === false, "read = " + JSON.stringify(head.read));
+    // Причина отказа обязана доехать до отчёта: «без карты сайта» про сайт с
+    // гигантским файлом — неправда, а человек пошёл бы проверять, опубликован
+    // ли sitemap.xml вообще.
+    check("гигант по content-length помечен «слишком большая»", head.big === true, "big = " + JSON.stringify(head.big));
 
     // Тот же размер без заголовка: сервер льёт поток, и оборвать его должен сам
     // воркер — иначе соединение держится, а байты приходят дальше.
@@ -802,12 +806,14 @@ async function main() {
     const stream = await loadSitemap("https://stream.ru/sitemap.xml", null);
     eq("поток крупнее потолка отклонён", stream.urls, []);
     check("поток крупнее потолка оборван", streamRoute.cancelled === true, "cancel не вызван");
+    check("поток крупнее потолка помечен «слишком большая»", stream.big === true, "big = " + JSON.stringify(stream.big));
 
     // Обычная карта при этом читается целиком — потолок не должен срезать то,
     // что заведомо меньше него.
     routes = { "https://small.ru/sitemap.xml": { body: sm(["https://small.ru/toyota-camry/"]) } };
     const small = await loadSitemap("https://small.ru/sitemap.xml", null);
     eq("карта меньше потолка читается", small.urls, ["https://small.ru/toyota-camry/"]);
+    check("обычная карта не помечена «слишком большая»", small.big === false, "big = " + JSON.stringify(small.big));
 
     // Кириллица на границе двух кусков потока: байты одного знака нельзя
     // превращать в два вопросительных — адрес перестанет собираться с названием.
@@ -829,6 +835,13 @@ async function main() {
     };
     const cp = await loadSitemap("https://cp.ru/sitemap.xml", null);
     eq("карта в windows-1251 прочитана по заголовку", cp.urls, ["https://cp.ru/кайенна/"]);
+
+    // И то же самое в сборке ссылок: хост обязан попасть в отдельную корзину,
+    // иначе в отчёте панели он прочитается как «карты нет».
+    routes = { "https://big.ru/sitemap.xml": { body: sm(["https://big.ru/toyota-camry/"]), headers: { "content-length": String(max + 1) } } };
+    res = await buildLinks("Toyota Camry", { linkSites: "big.ru" }, { refresh: true, rand: () => 0 });
+    eq("сборка: слишком большая карта — отдельная причина", res.stats.bigMap, ["big.ru"]);
+    eq("сборка: слишком большая карта не числится отсутствующей", res.stats.noSitemap, []);
   }
 
   // ---- итог ---------------------------------------------------------------

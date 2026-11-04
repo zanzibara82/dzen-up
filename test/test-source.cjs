@@ -191,6 +191,15 @@ async function openEditor(c, url) {
   const readUi = () =>
     evalJs(`(document.querySelector('#dzr-bar .dzr-status')||{}).textContent + ' | ' + ((document.getElementById('dzr-toast')||{}).textContent||'')`);
 
+  /** Снимок всего видимого состояния панели — по нему сверяем эффект клика. */
+  const barSig = () =>
+    evalJs(`[
+      (document.querySelector('#dzr-bar .dzr-status')||{}).textContent||'',
+      (document.querySelector('#dzr-bar .dzr-src-btn')||{}).textContent||'',
+      (document.getElementById('dzr-toast')||{}).textContent||'',
+      document.querySelector('#dzr-preview')?'pv':''
+    ].join(' || ')`);
+
   // Ждём панель И готовность настроек: до ответа фона панель живёт на значениях
   // по умолчанию, и поле адреса было бы пустым не потому, что его не сохранили.
   const waitPanel = async () => {
@@ -213,7 +222,7 @@ async function openEditor(c, url) {
       return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
     })()`);
 
-  const click = async (sel) => {
+  const dispatchClick = async (sel) => {
     // Свёрнутая в пузырёк панель держит строку адреса с нулевым размером, и
     // клик по её координатам ушёл бы в угол страницы. Ждём раскладки.
     let p = null;
@@ -228,17 +237,99 @@ async function openEditor(c, url) {
     await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: p.x, y: p.y, button: "left", clickCount: 1 }, sessionId);
   };
 
+  const activeIs = (sel) =>
+    evalJs(`(() => {
+      const b = document.querySelector(${JSON.stringify(sel)});
+      return !!b && document.activeElement === b;
+    })()`);
+
+  /**
+   * Клик, при необходимости подтверждённый эффектом.
+   *
+   * Одиночный CDP-клик в нагруженном прогоне уходит мимо: панель ещё
+   * разкладывается, а свежий таржет не успел стать активным. Без `until` клик
+   * остаётся одиночным — так было всегда, и там, где эффект ждёт отдельный
+   * опрос, это видно по провалу. Где же провал только запутывает («поле
+   * пустое», «вкладка не закрылась»), передают предикат: не дождались —
+   * меряем элемент заново и кликаем ещё раз.
+   *
+   * `guard` обязателен для кликов, повтор которых опасен: отмена забора
+   * второй раз уже не отменит, а запустит новый забор.
+   */
+  const click = async (sel, until, what, guard) => {
+    if (!until) { await dispatchClick(sel); return; }
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      if (attempt > 1 && guard && !(await guard())) {
+        console.log("  клик %s: обстановка изменилась — повтор невозможен", what || sel);
+        return;
+      }
+      await dispatchClick(sel);
+      for (let i = 0; i < 50; i++) {
+        if (await until()) return;
+        await sleep(100);
+      }
+      console.log("  клик %s не возымел эффекта (попытка %d)", what || sel, attempt);
+    }
+    throw new Error("клик «" + (what || sel) + "» ничего не изменил — панель не приняла ни одной попытки");
+  };
+
+  /**
+   * Ввод в поле «как человек»: клик, фокус, выделение и печать через
+   * отладочный канал — с проверкой, что поле действительно приняло текст.
+   */
+  const fill = async (sel, text) => {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      await click(sel, () => activeIs(sel), "фокус в " + sel);
+      await key("a", "KeyA", 65, 2);
+      await c.send("Input.insertText", { text }, sessionId);
+      let ok = false;
+      for (let i = 0; i < 30 && !ok; i++) {
+        ok = (await evalJs(`(function(){var e=document.querySelector(${JSON.stringify(sel)});return e?e.value:null})()`)) === text;
+        if (!ok) await sleep(100);
+      }
+      if (ok) return;
+      console.log("  поле %s не приняло адрес (попытка %d)", sel, attempt);
+    }
+    throw new Error("поле " + sel + " не приняло введённый адрес");
+  };
+
   const key = async (k, code, vk, modifiers) => {
     await c.send("Input.dispatchKeyEvent", { type: "keyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers }, sessionId);
     await c.send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, modifiers }, sessionId);
+  };
+
+  /** Снимает надпись статуса и уведомление, чтобы эффект следующего клика был виден. */
+  const resetUi = () =>
+    evalJs(`(() => {
+      const s = document.querySelector('#dzr-bar .dzr-status'), t = document.getElementById('dzr-toast');
+      if (s) s.textContent = '';
+      if (t) { t.textContent = ''; t.classList.remove('dzr-show'); }
+      return true;
+    })()`);
+
+  /** Кнопка забора стала «Отменить» — значит забор идёт и повторный клик отменит его. */
+  const srcBusy = () => evalJs(`/Отменить/.test((document.querySelector('#dzr-bar .dzr-src-btn')||{}).textContent||'')`);
+
+  /** Предикат эффекта клика: видимое состояние панели сдвинулось. */
+  const sigMoved = (prev) => async () => (await barSig()) !== prev;
+
+  /**
+   * Клик, эффект которого заведомо заметен: статус и уведомление очищены,
+   * поэтому любое появившееся письмо — ответ панели, а не то, что стояло раньше.
+   */
+  const clickConfirmed = async (sel, what, guard) => {
+    await resetUi();
+    const sig = await barSig();
+    await click(sel, sigMoved(sig), what, guard);
   };
 
   return {
     evalJs,
     waitPanel,
     click,
-    type: (text) => c.send("Input.insertText", { text }, sessionId),
-    selectAllField: () => key("a", "KeyA", 65, 2),
+    clickConfirmed,
+    fill,
+    srcBusy,
     value: (sel) => evalJs(`(function(){var e=document.querySelector(${JSON.stringify(sel)});return e?e.value:null})()`),
     textOf: (sel) => evalJs(`(function(){var e=document.querySelector(${JSON.stringify(sel)});return e?e.textContent:null})()`),
     htmlOf: (sel) => evalJs(`(function(){var e=document.querySelector(${JSON.stringify(sel)});return e?e.innerHTML:null})()`),
@@ -436,12 +527,22 @@ async function main() {
     // набор как человек: клик по полю, затем ввод через отладочный канал.
     // Протокол пишем прямо: голый хост воркер по правилам дотягивает до
     // «https://», а наш мок-сервер живёт на простом http.
-    await page.click(SRC_INPUT);
-    await page.type("http://localhost:" + PORT_HTTP + "/mock-source-article.html");
+    /**
+     * Вводит адрес и жмёт «Взять текст», подтверждая оба действия.
+     *
+     * До клика снимается всё видимое состояние панели, а не только надпись
+     * статуса: панель может показать ровно ту же фразу, что стояла до клика
+     * («Отменено» за «Отменено»), и тогда сдвиг не виден. Поэтому статус и
+     * уведомление сначала очищаются.
+     */
+    const submitSource = async (url) => {
+      await page.fill(SRC_INPUT, url);
+      await page.clickConfirmed(SRC_BTN, "забор " + url.split("/").pop());
+    };
+
+    await submitSource("http://localhost:" + PORT_HTTP + "/mock-source-article.html");
     const typed = await page.value(SRC_INPUT);
     check("введённый адрес остался в поле", /mock-source-article\.html$/.test(typed || ""), JSON.stringify(typed));
-
-    await page.click(SRC_BTN);
     let previewOpen = false;
     for (let i = 0; i < 80 && !previewOpen; i++) {
       previewOpen = await page.hasEl("#dzr-preview");
@@ -456,7 +557,7 @@ async function main() {
     check("статья в редакторе ещё не изменена", !/клиренс важнее/.test(before), JSON.stringify(before.slice(0, 60)));
     check("фоновая вкладка закрыта после забора", (await tabsLike(c, "mock-source-article")) === 0);
 
-    await page.click("#dzr-preview .dzr-pv-apply");
+    await page.clickConfirmed("#dzr-preview .dzr-pv-apply", "применение забранного текста");
     let inserted = false;
     for (let i = 0; i < 80 && !inserted; i++) {
       inserted = /клиренс важнее полного привода/.test(await page.bodyText());
@@ -473,7 +574,7 @@ async function main() {
     // копирование в буфер обмена тост не имеет права.
     const UNDO = '#dzr-bar .dzr-icon-btn[title*="Отменить вставку"]';
     check("после вставки появилась кнопка отката", (await page.hasEl(UNDO)) && !(await page.evalJs(`document.querySelector(${JSON.stringify(UNDO)}).hidden`)));
-    await page.click(UNDO);
+    await page.clickConfirmed(UNDO, "откат вставки");
     const undoMsg = await page.waitMessage(/Вставка отменена/);
     check("откат убрал вставленный текст", !/клиренс важнее/.test(await page.bodyText()), JSON.stringify((await page.bodyText()).slice(0, 60)));
     check("тост отката не обещает буфер обмена", !/Оригинал скопирован/.test(undoMsg || ""), JSON.stringify(String(undoMsg).slice(0, 110)));
@@ -488,20 +589,55 @@ async function main() {
       page.evalJs(
         `(() => { var e = document.querySelector('#dzr-bar .dzr-src-url'); if (!e) return false; var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()`
       );
-    await page.click("#dzr-bar .dzr-toggle");
+    await page.click("#dzr-bar .dzr-toggle", async () => !(await fieldLaidOut()), "свернуть панель");
     for (let i = 0; i < 40 && (await fieldLaidOut()); i++) await sleep(150);
     check("сворачивание в пузырёк скрыло поле адреса", !(await fieldLaidOut()));
-    await page.click("#dzr-bar .dzr-toggle");
+    await page.click("#dzr-bar .dzr-toggle", async () => await fieldLaidOut(), "развернуть панель");
     for (let i = 0; i < 40 && !(await fieldLaidOut()); i++) await sleep(150);
     check("адрес пережил сворачивание в пузырёк", /mock-source-article\.html$/.test((await page.value(SRC_INPUT)) || ""), await page.value(SRC_INPUT));
     await page.reload(EDITOR_URL);
     check("адрес пережил перезагрузку страницы", /mock-source-article\.html$/.test((await page.value(SRC_INPUT)) || ""), await page.value(SRC_INPUT));
 
+    // ---- фильтр забранной разметки --------------------------------------
+    // Забранный HTML едет с чужой страницы и вставляется в редактор. Воркер
+    // пропускает его через белый список, панель — через свой второй проход
+    // (screenHtml). Проверка обязана быть поведенческой: не «в коде есть
+    // фильтр», а «ни один обработчик с чужой страницы не ожил». Приманка
+    // поднялась — значит разметка дожила до живого документа.
+    await submitSource("http://localhost:" + PORT_HTTP + "/mock-source-evil.html");
+    let evilOpen = false;
+    for (let i = 0; i < 80 && !evilOpen; i++) {
+      evilOpen = await page.hasEl("#dzr-preview");
+      if (!evilOpen) await sleep(150);
+    }
+    check("ловушка забрана в предпросмотр", evilOpen, await page.readUi());
+    const evilPv = String((await page.htmlOf("#dzr-preview .dzr-pv-body")) || "");
+    check("в предпросмотре не осталось обработчиков", !/\son\w+\s*=/i.test(evilPv), JSON.stringify(evilPv.slice(0, 120)));
+    // Запрещённую схему вычёркиваем из ЗНАЧЕНИЯ атрибута. Само слово в тексте
+    // ссылки остаётся: это текст статьи, и выбросить его — значит исказить
+    // забранный материал.
+    check("у ссылки не осталось javascript-адреса", !/=\s*["']?\s*javascript\s*:/i.test(evilPv), JSON.stringify(evilPv.slice(0, 120)));
+    check("в предпросмотр вычищены script, svg, iframe и img", !/<\s*(script|svg|iframe|img)/i.test(evilPv), JSON.stringify(evilPv.slice(0, 120)));
+    check("текст из незнакомых тегов сохранён", /текст из тега, которого в статье быть не должно/.test(evilPv), JSON.stringify(evilPv.slice(0, 120)));
+
+    await page.clickConfirmed("#dzr-preview .dzr-pv-apply", "применение статьи-ловушки");
+    let evilInserted = false;
+    for (let i = 0; i < 80 && !evilInserted; i++) {
+      evilInserted = /обычный текст статьи/.test(await page.bodyText());
+      if (!evilInserted) await sleep(150);
+    }
+    check("статья-ловушка вставилась в редактор", evilInserted, JSON.stringify((await page.bodyText()).slice(0, 60)));
+    const evilBody = String((await page.htmlOf(".body")) || "");
+    check("в редактор не уехали обработчики", !/\son\w+\s*=/i.test(evilBody), JSON.stringify(evilBody.slice(0, 120)));
+    check("в редактор не уехала картинка-приманка", !/<\s*img/i.test(evilBody), JSON.stringify(evilBody.slice(0, 120)));
+    // Главный признак: подписчик onerror не выполнился ни в предпросмотре, ни
+    // после вставки. Поднимется — фильтр пропустил живую разметку.
+    const honey = await page.evalJs("window.__dzrHoney === true");
+    check("приманка с чужой страницы не выполнилась", !honey, "window.__dzrHoney = " + JSON.stringify(honey));
+    await page.reload(EDITOR_URL);
+
     // ---- ошибки: человек должен понять, что нажать, а не гадать ----
-    await page.click(SRC_INPUT);
-    await page.selectAllField();
-    await page.type("это не адрес");
-    await page.click(SRC_BTN);
+    await submitSource("это не адрес");
     const errBad = await page.waitMessage(/адрес/i);
     check("мусорный адрес назван мусорным", /адрес/i.test(errBad || ""), JSON.stringify(String(errBad).slice(0, 90)));
     check("мусорный адрес: фоновая вкладка не открыта", (await tabsLike(c, "mock-source")) === 0);
@@ -509,36 +645,25 @@ async function main() {
     // Право на http выдано только localhost и 127.0.0.1, поэтому прочий http
     // обязан отсекаться до открытия вкладки — иначе человек получит подсказку
     // «Разрешить доступ», которая ничего не разрешит.
-    await page.click(SRC_INPUT);
-    await page.selectAllField();
-    await page.type("http://example.com/mock-source-article.html");
-    await page.click(SRC_BTN);
+    await submitSource("http://example.com/mock-source-article.html");
     const errHttp = await page.waitMessage(/только по https/i);
     check("http вне localhost объяснён схемой", /только по https/i.test(errHttp || ""), JSON.stringify(String(errHttp).slice(0, 110)));
     check("http вне localhost: вкладка не открыта", (await tabsLike(c, "example.com")) === 0);
 
-    await page.click(SRC_INPUT);
-    await page.selectAllField();
-    await page.type("http://127.0.0.1:" + PORT_HTTP + "/mock-source-article.html");
-    await page.click(SRC_BTN);
+    await submitSource("http://127.0.0.1:" + PORT_HTTP + "/mock-source-article.html");
     const errPerm = await page.waitMessage(/Разрешить доступ/i);
     check("без права на хост подсказано, что нажать", /«Разрешить доступ к сайтам»/.test(errPerm || ""), JSON.stringify(String(errPerm).slice(0, 120)));
     check("без права на хост: фоновая вкладка закрыта", (await tabsLike(c, "mock-source-article")) === 0);
 
-    await page.click(SRC_INPUT);
-    await page.selectAllField();
-    await page.type("http://localhost:" + PORT_HTTP + "/mock-source-stub.html");
-    await page.click(SRC_BTN);
+    await submitSource("http://localhost:" + PORT_HTTP + "/mock-source-stub.html");
     const errStub = await page.waitMessage(/не статья|похоже/i);
     check("заглушка названа не статьёй", /не статья|похоже/i.test(errStub || ""), JSON.stringify(String(errStub).slice(0, 120)));
     check("заглушка: фоновая вкладка закрыта", (await tabsLike(c, "mock-source-stub")) === 0);
 
     // ---- отмена: страница грузится вечно, человек передумал ----
-    await page.click(SRC_INPUT);
-    await page.selectAllField();
-    await page.type("http://localhost:" + PORT_HTTP + "/mock-source-hang.html");
+    await page.fill(SRC_INPUT, "http://localhost:" + PORT_HTTP + "/mock-source-hang.html");
     const basePages = await countPages(c);
-    await page.click(SRC_BTN);
+    await page.clickConfirmed(SRC_BTN, "старт вечного забора");
     const busyLabel = await page.waitLabel(SRC_BTN, /Отменить/);
     check("во время забора кнопка предлагает отмену", /Отменить/.test(busyLabel || ""), JSON.stringify(busyLabel));
     // кнопка «Отменить» появляется раньше вкладки: воркер создаёт её отдельным
@@ -549,7 +674,10 @@ async function main() {
       if (!opened) await sleep(150);
     }
     check("вечная вкладка открыта и ждёт", opened, "страниц: " + (await countPages(c)) + ", ждали " + (basePages + 1) + " — " + (await pagesList(c)));
-    await page.click(SRC_BTN);
+    // Отмена — клик, повтор которого опасен: второй раз по уже свободной кнопке
+    // запустит новый забор. Поэтому guard: повторять только пока кнопка всё ещё
+    // предлагает отмену.
+    await page.click(SRC_BTN, async () => /отмен/i.test(String(await page.readUi())) || !(await page.srcBusy()), "отмена забора", page.srcBusy);
     let gone = false;
     for (let i = 0; i < 60 && !gone; i++) {
       gone = (await countPages(c)) === basePages && (await tabsLike(c, "mock-source-hang")) === 0;

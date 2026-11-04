@@ -815,6 +815,65 @@ async function main() {
     check("фрейму на чужой странице ключ тоже не отдаётся", frame && frame.settings && frame.settings.aiKey === undefined, JSON.stringify((frame && frame.settings) || {}).slice(0, 80));
   }
 
+  console.log("\n=== 25. панель не подставляет фон язык из значений по умолчанию ===");
+  {
+    // Фон схлопывает `{...getSettings(), ...msg.overrides}`, и каждое поле в
+    // overrides — приказ, а не пожелание. Когда настройки не прочитались, в S
+    // лежат дефолты, и отправленный «ru» молча подменял бы язык, который
+    // человек сохранял в попапе. Поэтому overrides собирает одна функция, и
+    // обязана смотреть на признак прочитанности. Поведение это ловится только
+    // при загнанном контексте расширения — здесь сторожим конструкцию, чтобы
+    // ручная рассылка дефолтов не вернулась незамеченной.
+    const csrc = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "content.js"), "utf8");
+    const start = csrc.indexOf("function panelOverrides(");
+    check("передачу настроек собирает одна функция", start !== -1, "function panelOverrides не найдена");
+    const fn = start === -1 ? "" : csrc.slice(start, csrc.indexOf("\n  }", start));
+    check("язык цели идёт только из прочитанных настроек или из выбора человека", /settingsReady \|\| langTouched/.test(fn), JSON.stringify(fn.slice(0, 200)));
+    check("язык источника идёт только из прочитанных настроек", /if \(settingsReady\)\s*o\.sourceLang/.test(fn), JSON.stringify(fn.slice(0, 200)));
+    check("забор языка не вписан руками в сообщение", !/overrides:\s*\{\s*targetLang/.test(csrc), "в translate остался ручной overrides с targetLang");
+    check("переводу передаётся собранный объект", /overrides:\s*panelOverrides\(\)/.test(csrc), "");
+  }
+
+  console.log("\n=== 26. из текста ошибки вычищено то, что похоже на ключ ===");
+  {
+    // Тело 4xx и не-JSON ответы попадают в текст ошибки, а тот показывается
+    // тостом прямо на странице Дзена и остаётся в логах. Свой адрес API или
+    // прокси может ответить эхом присланного ключа — поэтому зачистка стоит
+    // внутри shortBody/headOf, а не на месте вызова. Здесь же сторожим, что
+    // вычёркивание не съедает объяснение причины: «HTTP 400» без слова человек
+    // разобрать не сможет.
+    const prevFetch = globalThis.fetch;
+    let err = null;
+    globalThis.fetch = async () => ({
+      ok: false, status: 400, headers: { get: () => null },
+      text: async () => '{"error":{"message":"invalid api_key: sk-ABCDEFGHIJKLMNOP1234","type":"invalid_request_error"}}',
+      json: async () => ({})
+    });
+    try {
+      await fetchJson("https://api.example.com/v1/chat/completions", { label: "AI", tries: 1, timeout: 500, errorBody: true });
+    } catch (e) {
+      err = e;
+    }
+    check("причина отказа осталась в тексте", !!err && /invalid/.test(err.message) && /invalid_request_error/.test(err.message), err && err.message.slice(0, 120));
+    check("ключ из тела 4xx не ушёл в ошибку", !!err && !/sk-ABCDEFGHIJKLMNOP1234/.test(err.message) && !/sk-[A-Za-z0-9]{6}/.test(err.message), err && err.message.slice(0, 120));
+    check("на месте ключа — явная метка зачистки", !!err && /\[ключ скрыт\]/.test(err.message), err && err.message.slice(0, 120));
+
+    let err2 = null;
+    globalThis.fetch = async () => ({
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => "<html>auth loop: Bearer sk-ZZZZZZZZZZZZZZZZZZZZ</html>",
+      json: async () => { throw new SyntaxError('Unexpected token "<"'); }
+    });
+    try {
+      await fetchJson("https://api.example.com/v1/chat/completions", { label: "AI", tries: 1, timeout: 500 });
+    } catch (e) {
+      err2 = e;
+    }
+    globalThis.fetch = prevFetch;
+    check("ключ из не-JSON ответа тоже вычищен", !!err2 && !/ZZZZ/.test(err2.message) && /\[ключ скрыт\]/.test(err2.message), err2 && err2.message.slice(0, 120));
+    check("начало ответа при этом показано", !!err2 && /auth loop/.test(err2.message), err2 && err2.message.slice(0, 120));
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);

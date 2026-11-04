@@ -23,6 +23,11 @@ const sessionStore = {};
 // Что воркер писал в хранилище сеанса: по этим записям видно, что вкладку
 // поставили на учёт до того, как её закрыли.
 const sessionWrites = [];
+// Общая лента «закрытие вкладки / запись учёта». Два разных массива порядка не
+// дают, а порядок тут — предмет проверки: воркер MV3 умирает именно между этими
+// двумя операциями, и по раздельным спискам не видно, что осталось — открытая
+// вкладка без учёта или закрытая вкладка в списке.
+const journal = [];
 const calls = { created: [], removed: [], injected: [], permissions: [] };
 let updatedListeners = [];
 let injectResult = null; // что вернёт chrome.scripting.executeScript
@@ -64,6 +69,7 @@ const chrome = {
       get: async (d) => ({ ...d, ...sessionStore }),
       set: async (o) => {
         sessionWrites.push({ ...o });
+        journal.push("учёт " + JSON.stringify(o.dzrSourceTabs));
         Object.assign(sessionStore, o);
       },
       remove: async (k) => { delete sessionStore[k]; }
@@ -101,6 +107,7 @@ const chrome = {
     },
     remove: async (ids) => {
       calls.removed.push(ids);
+      journal.push("закрытие " + JSON.stringify([].concat(ids)));
       for (const id of [].concat(ids)) tabsById.delete(id);
     },
     update: async () => {},
@@ -129,11 +136,22 @@ const api = new Function(
     // Пороги читаем как данные: тест сверяет поведение с числом из кода, а не с
     // числом, которое сам же и придумал.
     " SOURCE_MIN_CHARS: typeof SOURCE_MIN_CHARS === \"number\" ? SOURCE_MIN_CHARS : null," +
-    " SOURCE_TIMEOUT_MS: typeof SOURCE_TIMEOUT_MS === \"number\" ? SOURCE_TIMEOUT_MS : null };"
+    " SOURCE_TIMEOUT_MS: typeof SOURCE_TIMEOUT_MS === \"number\" ? SOURCE_TIMEOUT_MS : null," +
+    // Внутренности учёта вкладок наружу: гонку «уборка прочитала список ДО того,
+    // как соседний забор вписал свою вкладку» извне не смоделировать — она
+    // живёт в порядке двух записей, а их тест видит только через эти ссылки.
+    " reapOrphanSourceTabs: typeof reapOrphanSourceTabs === \"function\" ? reapOrphanSourceTabs : null," +
+    " liveSourceTabs: typeof liveSourceTabs === \"object\" ? liveSourceTabs : null," +
+    " keptSourceTabs: typeof keptSourceTabs === \"object\" ? keptSourceTabs : null };"
 )(chrome);
 
 const { looksLikeHost, hostOf, DEFAULTS } = api;
 const fetchSourceText = api.fetchSourceText;
+// Учёт вкладок: уборка и её наборы нужны тесту напрямую — см. пояснение там,
+// где они выгружаются из background.js.
+const reapOrphanSourceTabs = api.reapOrphanSourceTabs;
+const liveSourceTabs = api.liveSourceTabs;
+const keptSourceTabs = api.keptSourceTabs;
 
 // ------------------------------------------------------------- проверки
 const results = [];
@@ -167,7 +185,13 @@ function reset(article) {
   pageLoad = "complete";
   delete sessionStore.dzrSourceTabs;
   sessionWrites.length = 0;
+  journal.length = 0;
   tabsById.clear();
+  // Наборы учёта живут внутри загруженного background.js и между подтестами
+  // переносятся: без этой очистки следующий подтест видит чужую «активную
+  // сироту» и PASS, которого на самом деле не было.
+  if (liveSourceTabs) liveSourceTabs.clear();
+  if (keptSourceTabs) keptSourceTabs.clear();
   injectResult = article
     ? [{ result: article }]
     : [{ result: { html: "<p>Текст статьи.</p>", title: "Как выбирали", chars: 430 } }];
@@ -331,6 +355,14 @@ async function main() {
     check("вкладка забора помечена в хранилище сеанса", marked, "записи: " + JSON.stringify(sessionWrites));
     eq("после успешного забора учёт пуст", sessionStore.dzrSourceTabs, []);
 
+    // Порядок в ленте: вкладка обязана быть ЗАКРЫТА до последней записи, которая
+    // снимает её с учёта. В обратном порядке между этими двумя операциями
+    // попадает разрыв, а воркер MV3 убивают именно в разрыве: вкладка остаётся
+    // открытой и уже не числится — следующая уборка её не найдёт.
+    const closeAt = journal.findIndex((e) => e.indexOf("закрытие") === 0);
+    const lastMark = journal.length - 1 - journal.slice().reverse().findIndex((e) => e.indexOf("учёт") === 0);
+    check("вкладку закрыли до того, как снять с учёта", closeAt >= 0 && closeAt < lastMark, journal.join(" | "));
+
     reset();
     const orphan = orphanTab(777);
     await fetchSourceText("https://src.ru/a/");
@@ -341,6 +373,22 @@ async function main() {
     const read = orphanTab(888, { active: true });
     await fetchSourceText("https://src.ru/a/");
     check("вкладку, которую читают, уборка не трогает", !calls.removed.includes(read), "закрыто: " + JSON.stringify(calls.removed));
+    // Не закрыла — и НЕ забыла. Снятая с учёта активная вкладка больше никогда
+    // сюда не попадёт: человек её дочитает, она останется висеть в окне, а
+    // уборка будет считать, что хвостов нет.
+    check("активную сироту уборка продолжила помнить", (sessionStore.dzrSourceTabs || []).includes(read), JSON.stringify(sessionStore.dzrSourceTabs));
+
+    // Снимок уборки устарел: соседний забор вписал свою вкладку ПОСЛЕ того, как
+    // уборка прочитала список. Запись обязана быть объединением известного, а не
+    // фильтром снимка, — иначе живая вкладка исчезает из учёта, пока её забор
+    // ещё ждёт загрузки, и убийство воркера в этом окне оставляет хвост навсегда.
+    reset();
+    const stale = orphanTab(911);
+    liveSourceTabs.add(60600);
+    await reapOrphanSourceTabs();
+    liveSourceTabs.delete(60600);
+    check("сирота из устаревшего снимка закрыта", calls.removed.includes(stale), "закрыто: " + JSON.stringify(calls.removed));
+    check("вкладка живого забора не исчезла из учёта", (sessionStore.dzrSourceTabs || []).includes(60600), JSON.stringify(sessionStore.dzrSourceTabs));
 
     // Две вкладки живого воркера: уборка обязана знать о соседнем заборе.
     reset();

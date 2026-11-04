@@ -227,17 +227,35 @@ async function main() {
 
     await openPage();
 
-    const clickEl = async (selector) => {
-      const rect = await evalJs(`(() => {
-        const b = document.querySelector(${JSON.stringify(selector)});
-        if (!b) return null;
-        const r = b.getBoundingClientRect();
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-      })()`);
-      if (!rect) throw new Error("нет элемента " + selector);
-      await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y, button: "none" }, sessionId);
-      await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
-      await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
+    /**
+     * Клик по элементу панели, подтверждённый эффектом.
+     *
+     * Одиночный CDP-клик в нагруженном прогоне (полная регрессия — это семнадцать
+     * подряд стартовавших Chrome) уходит мимо: панель ещё разкладывается, а
+     * только что созданный таржет не успел стать активным. Молча ждать потом
+     * «Готово» нельзя — тест падает «не дождался уведомления», хотя код в
+     * порядке, и непонятно, что именно сломалось. Поэтому ждём обещанного
+     * изменения и, не дождавшись, меряем элемент заново и кликаем ещё раз.
+     */
+    const clickEl = async (sel, until, what) => {
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        const rect = await evalJs(`(() => {
+          const b = document.querySelector(${JSON.stringify(sel)});
+          if (!b) return null;
+          const r = b.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        })()`);
+        if (!rect) throw new Error("нет элемента " + sel);
+        await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y, button: "none" }, sessionId);
+        await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
+        await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
+        for (let i = 0; i < 50; i++) {
+          if (await until()) return;
+          await sleep(100);
+        }
+        console.log("  клик %s не возымел эффекта (попытка %d)", what, attempt);
+      }
+      throw new Error("клик «" + what + "» ничего не изменил — панель не приняла ни одной попытки");
     };
 
     const paraText = () => evalJs(`document.querySelector('.body p').innerText.replace(/\\s+/g,' ').trim()`);
@@ -247,6 +265,13 @@ async function main() {
       if (t) { t.innerHTML = ''; t.classList.remove('dzr-show'); }
       return true;
     })()`);
+
+    /** Видимое состояние панели: статус, подпись кнопки и уведомление. */
+    const panelSig = () => evalJs(`[
+      (document.querySelector('#dzr-bar .dzr-status') || {}).textContent || '',
+      (document.querySelector('#dzr-bar .dzr-go') || {}).textContent || '',
+      (document.getElementById('dzr-toast') || {}).textContent || ''
+    ].join(' || ')`);
 
     /** Ставит в абзац нужный текст, выделяет его и жмёт кнопку панели. */
     const runOn = async (text) => {
@@ -259,8 +284,9 @@ async function main() {
         const s = window.getSelection();
         s.removeAllRanges(); s.addRange(r);
       })()`);
-      await clickEl("#dzr-bar .dzr-go");
-      for (let i = 0; i < 40; i++) {
+      const sigBefore = await panelSig();
+      await clickEl("#dzr-bar .dzr-go", async () => (await panelSig()) !== sigBefore, "перевод выделения");
+      for (let i = 0; i < 120; i++) {
         if (/Готово/.test(await toastText())) return true;
         await sleep(150);
       }
