@@ -41,7 +41,10 @@ const api = new Function(
   "chrome",
   src +
     "\nreturn { translateText, splitChunks, fetchJson, mapPool, clearCache, hashStr, " +
-    "looksLikeTargetLang, myMemoryTranslate, DEFAULTS };"
+    "looksLikeTargetLang, myMemoryTranslate, DEFAULTS, " +
+    // Потолок читаем как данные: тест сверяет поведение с числом из кода, а не
+    // с числом, которое сам же и придумал.
+    ' API_MAX_BYTES: typeof API_MAX_BYTES === "number" ? API_MAX_BYTES : null };'
 )(chrome);
 const {
   translateText,
@@ -52,7 +55,8 @@ const {
   hashStr,
   looksLikeTargetLang,
   myMemoryTranslate,
-  DEFAULTS
+  DEFAULTS,
+  API_MAX_BYTES
 } = api;
 
 const results = [];
@@ -103,6 +107,9 @@ function mmBody(text) {
   return { responseStatus: 200, responseData: { translatedText: text } };
 }
 
+/** id расширения, который подставляет макет и который ждут в sender. */
+const EXT_ID = "dzrextensionid";
+
 /**
  * Подставной chrome для прогонов через настоящий обработчик сообщений: воркер
  * грузится заново, а его слушатель попадает в `box`. Каждому прогону нужен
@@ -114,7 +121,14 @@ function mockWorkerChrome(box, store = {}) {
       sync: { get: async (d) => ({ ...d }), set: async () => {} },
       local: { get: async (d) => ({ ...d, ...store }), set: async () => {}, remove: async () => {} }
     },
-    runtime: { onMessage: { addListener: (fn) => { box.listener = fn; } }, onInstalled: { addListener() {} } },
+    runtime: {
+      // id воркеру нужен, чтобы опознать своего отправителя: Chrome ставит в
+      // sender.id id того же расширения, и сверка идёт по нему, а не по одному
+      // лишь виду адреса.
+      id: EXT_ID,
+      getURL: (p) => "chrome-extension://" + EXT_ID + "/" + (p || ""),
+      onMessage: { addListener: (fn) => { box.listener = fn; } }, onInstalled: { addListener() {} }
+    },
     contextMenus: { removeAll() {}, create() {}, onClicked: { addListener() {} } },
     commands: { onCommand: { addListener() {} } },
     tabs: {
@@ -784,20 +798,25 @@ async function main() {
     // странице (и во всех её iframe), и отдавать ей ключ — значит положить
     // секрет в DOM-мир, где его может прочитать скрипт площадки.
     const KEY = "sk-секретный-ключ";
+    const OWN_ID = EXT_ID;
     const box = {};
     new Function("chrome", src)(mockWorkerChrome(box, { aiKey: KEY, glossary: "Subaru = Субару" }));
     const listener = box.listener;
     if (!listener) throw new Error("обработчик сообщений не подписан");
     const send = (msg, sender) => new Promise((r) => listener(msg, sender || {}, r));
 
-    const popup = await send({ type: "getSettings" }, { url: "chrome-extension://abc/popup.html" });
+    const popup = await send({ type: "getSettings" }, { id: OWN_ID, url: "chrome-extension://" + OWN_ID + "/popup.html" });
     check(
       "своему попапу ключ показан — его туда и сохраняют",
       popup && popup.ok === true && popup.settings.aiKey === KEY,
       JSON.stringify(popup && popup.settings && popup.settings.aiKey)
     );
 
-    const panel = await send({ type: "getSettings" }, { url: "https://dzen.ru/i/a1b2c3" });
+    // Контент-скрипт всегда приходит с tab: он живёт во вкладке. Сверка по
+    // одному лишь виду адреса пропускала бы любому контексту, похожему на
+    // страницу расширения, поэтому опора — id отправителя (его подставить
+    // нельзя) плюс адрес внутри наших собственных ресурсов.
+    const panel = await send({ type: "getSettings" }, { id: OWN_ID, url: "https://dzen.ru/i/a1b2c3", tab: { id: 5 } });
     check(
       "панели на чужой странице ключ не уходит",
       panel && panel.ok === true && panel.settings.aiKey === undefined,
@@ -811,8 +830,28 @@ async function main() {
 
     // iframe чужой площадки на той же странице — тот же отказ: all_frames
     // ставит контент-скрипт внутрь чужого документа.
-    const frame = await send({ type: "getSettings" }, { url: "https://dzen.ru/i/a1b2c3", frameId: 7 });
+    const frame = await send({ type: "getSettings" }, { id: OWN_ID, url: "https://dzen.ru/i/a1b2c3", tab: { id: 5 }, frameId: 7 });
     check("фрейму на чужой странице ключ тоже не отдаётся", frame && frame.settings && frame.settings.aiKey === undefined, JSON.stringify((frame && frame.settings) || {}).slice(0, 80));
+
+    // Страница другого расширения выглядит как «chrome-extension://…» — и по
+    // одному только виду адреса мы отдавали бы ей ключ. Права писать к нам у
+    // чужого расширения нет (мы не объявляем externally_connectable), но
+    // опознавать своего следует по id, а не по маске адреса.
+    const alien = await send({ type: "getSettings" }, { id: "otherextension", url: "chrome-extension://otherextension/popup.html" });
+    check("расширению с чужим id ключ не отдаётся", alien && alien.settings && alien.settings.aiKey === undefined, JSON.stringify((alien && alien.settings) || {}).slice(0, 80));
+    check("обычные настройки чужому расширению приходят", !!((alien && alien.settings) || {}).targetLang, "");
+
+    // Пустой url — это не «свой»: у сообщения от подставного контекста адрес
+    // может отсутствовать, а ключ по умолчанию отдаваться не обязан.
+    const noUrl = await send({ type: "getSettings" }, {});
+    check("контексту без адреса и без id ключ не отдаётся", noUrl && noUrl.settings && noUrl.settings.aiKey === undefined, JSON.stringify((noUrl && noUrl.settings) || {}).slice(0, 80));
+
+    // Страницу настроек человек открывает во вкладке, и Chrome может подписать
+    // такое сообщение номером вкладки. Секрет при этом остаётся на нашей же
+    // странице, поэтому признаком «своего» вкладка быть не обязана: опора —
+    // id и адрес внутри нашего же расширения.
+    const options = await send({ type: "getSettings" }, { id: OWN_ID, url: "chrome-extension://" + OWN_ID + "/options.html", tab: { id: 9 } });
+    check("своей странице во вкладке ключ показан", options && options.settings && options.settings.aiKey === KEY, JSON.stringify((options && options.settings) || {}).slice(0, 80));
   }
 
   console.log("\n=== 25. панель не подставляет фон язык из значений по умолчанию ===");
@@ -872,6 +911,68 @@ async function main() {
     globalThis.fetch = prevFetch;
     check("ключ из не-JSON ответа тоже вычищен", !!err2 && !/ZZZZ/.test(err2.message) && /\[ключ скрыт\]/.test(err2.message), err2 && err2.message.slice(0, 120));
     check("начало ответа при этом показано", !!err2 && /auth loop/.test(err2.message), err2 && err2.message.slice(0, 120));
+  }
+
+  console.log("\n=== 27. тело ответа API читается с потолком ===");
+  {
+    // Свой aiBaseUrl — такой же чужой сервер, как и сайт карты: он вправе
+    // ответить 200 на десятки мегабайт, и res.text() заглотил бы их в воркер.
+    // У ответа рерайта потолок обязан быть тем же классом защиты, что у карты.
+    const prevFetch = globalThis.fetch;
+    let n = 0;
+    globalThis.fetch = async () => {
+      n++;
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        text: async () => "x".repeat(API_MAX_BYTES + 10),
+        json: async () => ({})
+      };
+    };
+    let err = null;
+    try {
+      await fetchJson("https://api.example.com/v1/chat/completions", { label: "AI", tries: 3, timeout: 5000 });
+    } catch (e) {
+      err = e;
+    }
+    check("гигантский ответ API отклонён с указанием потолка", !!err && /МБ/.test(err.message), err && err.message.slice(0, 120));
+    // Повторять такой запрос бессмысленно: адрес пришлёт того же гиганта, а
+    // это платный вызов и минуты ожидания впустую.
+    check("гигантский ответ API не повторяется", n === 1, "запросов к API сделано: " + n);
+
+    // Объяснение причины 4xx берётся из начала тела. Ради 300 знаков никто не
+    // обязан читать весь ответ: поток обрывают и откачивают на месте.
+    let textFull = 0;
+    let chunks = 0;
+    let cancelled = false;
+    globalThis.fetch = async () => ({
+      ok: false, status: 400, headers: { get: () => null },
+      text: async () => { textFull++; return "y".repeat(64 * 1024); },
+      json: async () => ({}),
+      body: {
+        getReader: () => ({
+          read: async () => {
+            if (chunks >= 8) return { done: true, value: null };
+            chunks++;
+            const one = new Uint8Array(64 * 1024);
+            one.set(new TextEncoder().encode('{"error":"rate limit exceeded"}'));
+            return { done: false, value: one };
+          },
+          cancel: async () => { cancelled = true; }
+        })
+      }
+    });
+    let err2 = null;
+    try {
+      await fetchJson("https://api.example.com/v1/chat/completions", { label: "AI", tries: 1, timeout: 5000, errorBody: true });
+    } catch (e) {
+      err2 = e;
+    }
+    globalThis.fetch = prevFetch;
+    check("ради объяснения тело целиком не глотают", textFull === 0, "res.text() вызван " + textFull + " раз(а)");
+    check("из потока взято только начало", chunks === 1, "кусков прочитано: " + chunks);
+    check("остаток потока 4xx откачан", cancelled === true, "cancel не вызван");
+    check("начало тела попало в объяснение", !!err2 && /HTTP 400/.test(err2.message) && /rate limit exceeded/.test(err2.message), err2 && err2.message.slice(0, 140));
+    check("потолок ответа API задан", typeof API_MAX_BYTES === "number" && API_MAX_BYTES > 1024 * 1024, "API_MAX_BYTES = " + JSON.stringify(API_MAX_BYTES));
   }
 
   console.log("\n=== ИТОГ ===");

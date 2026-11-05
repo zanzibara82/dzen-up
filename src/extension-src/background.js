@@ -79,15 +79,25 @@ async function getSettings() {
 }
 
 /**
- * Настройки для ответа отправителю. API-ключ получает только собственная
- * страница расширения (попап и options): панели на странице он не нужен —
- * `aiRewrite` отправляется без overrides и воркер берёт ключ сам, а `all_frames`
- * в манифесте значит, что наш контент-скрипт живёт и в чужих iframe внутри
- * dzen.ru. Лишняя копия секрета в таких рамках нам ни к чему.
+ * Настройки для ответа отправителю. API-ключ получает только собственный
+ * контекст расширения (попап и страница настроек): панели на странице он не
+ * нужен — `aiRewrite` отправляется без overrides и воркер берёт ключ сам, а
+ * `all_frames` в манифесте значит, что наш контент-скрипт живёт и в чужих iframe
+ * внутри dzen.ru. Лишняя копия секрета в таких рамках нам ни к чему.
+ *
+ * Своего опознаём по двум признакам сразу. `sender.id` проставляет Chrome, из
+ * чужого контекста его не подделать; раньше же смотрели только на вид адреса,
+ * а под него подходит страница любого другого расширения. Адрес берём из
+ * `chrome.runtime.getURL("")` — это префикс именно наших ресурсов; у
+ * контент-скрипта в `sender.url` стоит адрес страницы, а не скрипта, поэтому
+ * панель Дзена мимо него не проходит, а страница настроек, открытая во вкладке,
+ * проходит: по `sender.tab` судить нельзя, Chrome подписывает вкладкой и наши
+ * страницы.
  */
 function settingsForSender(settings, sender) {
+  const own = chrome.runtime.getURL("");
   const url = (sender && sender.url) || "";
-  if (url.indexOf("chrome-extension://") === 0 || url === "") return settings;
+  if (sender && sender.id === chrome.runtime.id && url.startsWith(own)) return settings;
   const out = { ...settings };
   delete out.aiKey;
   return out;
@@ -351,7 +361,20 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
       // "<"») не называет имени сервиса, на сетевой регэксп ниже не похож — и
       // повторялся бы всеми попытками, то есть бился бы по платному API ради
       // заведомо непригодного ответа.
-      const raw = await res.text();
+      //
+      // Свой aiBaseUrl — такой же чужой сервер, как и сайт карты: он вправе
+      // ответить 200 на десятки мегабайт, и потолок здесь нужен тот же по
+      // классу защиты. Отказ от гиганта — не сетевой сбой: адрес пришлёт
+      // того же гиганта, а это платный вызов и минута ожидания впустую.
+      let raw;
+      try {
+        raw = await readBodyCapped(res, API_MAX_BYTES, "ответ", "его не читаем");
+      } catch (e) {
+        if (!e || !e.tooBig) throw e; // обрыв при чтении — как раньше, в общий обработчик
+        lastErr = new Error(label + ": " + e.message);
+        cleanup();
+        break;
+      }
       cleanup();
       let data;
       try {
@@ -401,10 +424,14 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
  * Дзена, а тело 4xx от своего адреса API или прокси вполне может содержать
  * фрагмент ключа. Ключ пользователя не обязан появляться ни на странице, ни в
  * логах — поэтому зачистка стоит здесь, а не на месте вызова.
+ *
+ * Показываем `limit` знаков, поэтому и читаем не больше: сервер, отвечающий
+ * 4xx страницей на мегабайты, не должен заставлять расширение глотать весь
+ * ответ ради строки в тосте.
  */
 async function shortBody(res, limit = 300) {
   try {
-    const t = await res.text();
+    const t = await readLimited(res, limit * 4); // 4 байта — верх для одного знака utf-8
     return redactSecrets(String(t || "").replace(/\s+/g, " ")).trim().slice(0, limit);
   } catch (e) {
     return "";
@@ -1030,6 +1057,7 @@ const SITEMAP_MAX_URLS = 5000; // больше в статьях не нужно
 const SITEMAP_MAX_FILES = 6; // вложенные карты читаем не бесконечно
 const SITE_TIMEOUT_MS = 30000; // один файл карты: повторять нечего, но и висеть нельзя
 const SITE_MAX_BYTES = 4 * 1024 * 1024; // 4 МБ: карта крупнее — не карта, а ловушка памяти
+const API_MAX_BYTES = 8 * 1024 * 1024; // 8 МБ: свой aiBaseUrl — чужой сервер, он вправе прислать что угодно
 
 /**
  * Служебные сегменты адреса: страница с ними — не статья, а подборка материалов
@@ -1184,13 +1212,18 @@ function decoderFor(contentType) {
  * сайт: гигантская — или намеренно бесконечная — карта укладывает воркер вместе
  * с памятью, и человек получает молчание вместо ответа. Обрезком xml вопрос не
  * решаем: недописанный тег читается как «карты нет», а это враньё в отчёте.
+ *
+ * Потолок меряется байтами, а не знаками строки: кириллический знак в utf-8
+ * стоит два байта, и «4 МБ знаков» — это 8 МБ памяти, то есть ровно вдвое
+ * больше обещанного. В ветке с потоком так и было (считается `byteLength`
+ * кусков), а без потока сверка шла по длине строки.
  */
-async function readBodyCapped(res) {
+async function readBodyCapped(res, maxBytes = SITE_MAX_BYTES, what = "файл", why = "такую карту не читаем") {
   const declared = Number(res.headers && res.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > SITE_MAX_BYTES) throw tooBigError();
+  if (Number.isFinite(declared) && declared > maxBytes) throw tooBigError(maxBytes, what, why);
   if (!res.body || typeof res.body.getReader !== "function") {
     const text = await res.text();
-    if (text.length > SITE_MAX_BYTES) throw tooBigError();
+    if (byteLengthOf(text) > maxBytes) throw tooBigError(maxBytes, what, why);
     return text;
   }
   const reader = res.body.getReader();
@@ -1202,14 +1235,14 @@ async function readBodyCapped(res) {
     if (chunk.done) break;
     const value = chunk.value || new Uint8Array(0);
     total += value.byteLength || value.length || 0;
-    if (total > SITE_MAX_BYTES) {
+    if (total > maxBytes) {
       // Пока соединение открыто, сайт вправе лить байты вечно — отрываемся сами.
       try {
         await reader.cancel();
       } catch (e) {
         /* поток уже закрыт */
       }
-      throw tooBigError();
+      throw tooBigError(maxBytes, what, why);
     }
     parts.push(decoder.decode(value, { stream: true }));
   }
@@ -1217,10 +1250,62 @@ async function readBodyCapped(res) {
   return parts.join("");
 }
 
-function tooBigError() {
-  const err = new Error("файл больше " + Math.round(SITE_MAX_BYTES / (1024 * 1024)) + " МБ — такую карту не читаем");
+function tooBigError(maxBytes, what, why) {
+  const err = new Error(what + " больше " + Math.round(maxBytes / (1024 * 1024)) + " МБ — " + why);
   err.tooBig = true;
   return err;
+}
+
+/**
+ * Вес строки в байтах utf-8.
+ *
+ * Нужен именно вес, а не число знаков: тексты Дзена кириллицей, и по знакам
+ * гигантский ответ выглядел бы вдвое меньше потолка. Декодирование целиком —
+ * та же память, что потом удерживает строка; отдельного копирования не
+ * добавляем.
+ */
+function byteLengthOf(text) {
+  return new TextEncoder().encode(String(text || "")).byteLength;
+}
+
+/**
+ * Начало тела ответа — для текста ошибки, с потолком в байтах.
+ *
+ * В отличие от карты здесь нельзя просто бросить: у 4xx тело и есть
+ * объяснение причины, а выбрасывать из-за него — значит потерять слова сервиса.
+ * Поэтому читаем ровно столько, сколько покажем, и откачиваем поток.
+ */
+async function readLimited(res, maxBytes) {
+  if (!res.body || typeof res.body.getReader !== "function") {
+    return String((await res.text()) || "");
+  }
+  const reader = res.body.getReader();
+  const decoder = decoderFor(res.headers && res.headers.get("content-type"));
+  const parts = [];
+  let total = 0;
+  while (total < maxBytes) {
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      break; // оборванный поток: начало уже в parts, его и показываем
+    }
+    if (chunk.done) break;
+    const value = chunk.value || new Uint8Array(0);
+    total += value.byteLength || value.length || 0;
+    parts.push(decoder.decode(value, { stream: true }));
+  }
+  parts.push(decoder.decode());
+  // Прочитанное начало — не весь ответ: соединение закрываем сами, иначе
+  // сервер продолжал бы лить байты ради строки в тосте.
+  if (total >= maxBytes) {
+    try {
+      await reader.cancel();
+    } catch (e) {
+      /* поток уже закрыт */
+    }
+  }
+  return parts.join("");
 }
 
 /** Читает карту сайта: urlset или sitemapindex с вложенными картами. */

@@ -359,6 +359,66 @@ try {
   check("словарь моделей: размер назван в README", count > 0 && inReadme(count + " моделей"), "моделей: " + count);
 }
 
+// ---------------------------------------- 1б. потолки тела ответа и списки тегов ---
+// Размер ответа — это обещание человеку: «такую карту не читаем» он читает в
+// отчёте, а число берёт из README. Числа здесь берутся из кода, чтобы правка
+// константы не оставила в тексте прежний потолок.
+try {
+  const site = constValue(bg, "SITE_MAX_BYTES");
+  check("карта: в README назван потолок «" + site / (1024 * 1024) + " МБ»",
+    site > 0 && inReadme(site / (1024 * 1024) + " МБ"), "SITE_MAX_BYTES = " + site);
+} catch (e) {
+  check("карта: SITE_MAX_BYTES найдена в коде", false, e.message);
+}
+try {
+  const api = constValue(bg, "API_MAX_BYTES");
+  check("ответ API: в README назван потолок «" + api / (1024 * 1024) + " МБ»",
+    api > 0 && inReadme(api / (1024 * 1024) + " МБ"), "API_MAX_BYTES = " + api);
+} catch (e) {
+  check("ответ API: API_MAX_BYTES найдена в коде", false, e.message);
+}
+
+// Разрешённые теги названы дважды: фон чистит чужую страницу при заборе текста,
+// панель — перед вставкой в живой DOM. Один мир не видит константу другого, так
+// что дубль неизбежен, — но разъезжаться спискам нельзя: тег, пропущенный в одном
+// месте, проходит и в другом.
+{
+  const listOf = (src, name) => {
+    const m = new RegExp("(?:const|var)\\s+" + name + "\\s*=\\s*(?:new Set\\(\\s*)?\\[([^\\]]*)\\]").exec(src);
+    if (!m) return null;
+    return new Set((m[1].match(/"[^"]+"/g) || []).map((s) => s.replace(/"/g, "")));
+  };
+  const keep = listOf(bg, "KEEP");
+  const allowed = listOf(content, "HTML_ALLOWED");
+  check("списки разрешённых тегов найдены в коде", !!keep && !!allowed,
+    "KEEP = " + (keep ? keep.size : "нет") + ", HTML_ALLOWED = " + (allowed ? allowed.size : "нет"));
+  if (keep && allowed) {
+    const onlyKeep = [...keep].filter((t) => !allowed.has(t));
+    const onlyAllowed = [...allowed].filter((t) => !keep.has(t));
+    check("разрешённые теги: фон и панель называют один набор",
+      onlyKeep.length === 0 && onlyAllowed.length === 0,
+      "только в KEEP: " + (onlyKeep.join(", ") || "—") + "; только в HTML_ALLOWED: " + (onlyAllowed.join(", ") || "—"));
+  }
+}
+
+// ---------------------------------------- 1в. у кнопки отмены есть вид ---
+// Кнопка на время шага становится «Отменить» и обязана иметь правило в стилях:
+// человек понимает, что шаг можно прервать, по цвету, а не по одному слову в
+// подписи. Класс-основа берётся из кода панели — появится новая кнопка с
+// `dzr-cancel`, и проверка потребует правило уже для неё.
+{
+  const css = read("content.css");
+  const names = [...new Set([...content.matchAll(/(\w+)\.classList\.add\("dzr-cancel"\)/g)].map((m) => m[1]))];
+  check("кнопки, становящиеся «Отменить», найдены в панели", names.length >= 3, names.join(", "));
+  for (const varName of names) {
+    const cm = new RegExp(varName + "\\.className = \"([^\"]+)\"").exec(content);
+    const base = cm ? cm[1].trim().split(/\s+/)[0] : "";
+    check("отмена: для кнопки «" + varName + "» (" + (base || "?") + ") есть правило в content.css",
+      !!base && new RegExp("\\." + base + "\\.dzr-cancel\\b").test(css),
+      cm ? "className = \"" + cm[1] + "\"" : "className не найден");
+  }
+}
+
 // ---------------------------------------- 2. каждая настройка названа в README ---
 // Соответствие «ключ настройки → фраза в README». Ключ, которого тут нет,
 // считается недокументированным — это и есть сигнал «добавил настройку, забыл

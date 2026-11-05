@@ -43,11 +43,13 @@
   var globalsWired = false;
   var drag = { on: false, x: 0, y: 0, el: null };
 
-  // подпись кнопки по умолчанию и подтверждение обработки всей статьи
+  // Исходные подписи трёх кнопок — перевода, забора текста по адресу и
+  // перелинковки. Пока шаг идёт, каждая из них работает как «Отменить»: меняет
+  // надпись и класс dzr-cancel (вид отмены — в content.css), а в finally
+  // возвращается из этой переменной. Пересобираем не словами на месте: у кнопки
+  // перевода надпись зависит от подтверждения всей статьи.
   var goLabel = "";
   var confirmedAll = false;
-  // подписи кнопок забора текста и перелинковки — та же история, что у goLabel:
-  // во время работы они становятся «Отменить» и обязаны вернуть исходную надпись
   var srcLabel = "";
   var linkLabel = "";
   var confirmTimer = null;
@@ -1930,7 +1932,6 @@
 
     goBtn.addEventListener("click", function (e) {
       e.preventDefault();
-      // во время работы кнопка превращается в «Отменить»
       if (busy) cancelRun();
       else run();
     });
@@ -1943,7 +1944,6 @@
     srcBtn.addEventListener("click", function (e) {
       e.preventDefault();
       e.stopPropagation();
-      // во время забора кнопка работает как «Отменить»
       if (busy) cancelRun();
       else runSourceFetch();
     });
@@ -2638,9 +2638,8 @@
     }
 
     busy = true;
-    // Кнопка на время шага становится «Отменить»: перелинковка читает чужие
-    // карты сайтов, и ждать её после нажатия незачем. id — тот же механизм,
-    // что у перевода и забора текста.
+    // Перелинковка читает чужие карты сайтов, и ждать её после нажатия незачем;
+    // id прогона — тот же механизм отмены, что у перевода и забора текста.
     var runId = "l" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
     currentRunId = runId;
     linkBtn.classList.add("dzr-cancel");
@@ -3090,7 +3089,6 @@
     // видит, что её нажали, даже если ответ уже пришёл
     var runId = currentRunId;
     aiLocal = false; // признак прошлого запуска не должен пережить новый
-    // пока идёт работа, кнопка работает как «Отменить»
     goBtn.disabled = false;
     goBtn.classList.add("dzr-cancel");
     goBtn.innerHTML = icon("close") + "<span>Отменить</span>";

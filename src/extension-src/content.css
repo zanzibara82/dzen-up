@@ -128,6 +128,12 @@
   width: 16px;
   height: 16px;
 }
+/* пока идёт перелинковка, кнопка работает как «Отменить» — и обязана
+   выглядеть как отмена: человек судит о возможности прервать по цвету */
+.dzr-link-btn.dzr-cancel {
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+}
 
 #dzr-bar.dzr-vertical .dzr-link-btn {
   width: 42px;

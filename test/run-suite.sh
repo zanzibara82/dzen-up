@@ -171,8 +171,16 @@ echo "==================================================="
 # на каждом запуске дороже, чем освобождённое место.
 if [ "$TOTAL_SUITES" -eq "${#NAMES[@]}" ] && [ "$FAILED" -eq 0 ] && [ "${DZR_KEEP_PROFILES:-0}" != "1" ]; then
   echo ""
-  node "$REPO/tools/clean-profiles.cjs" --wipe-persistent | tail -4 \
-    || echo "  (профили не убраны — вручную: npm run clean:profiles)"
+  # Код возврата берём именно от node. В записи `node … | tail -4 || echo …` `||`
+  # смотрит на хвост конвейера, а `tail` успешен всегда: не удавшаяся очистка
+  # профилей молча считалась удавшейся и не подсказывала, как убрать их руками.
+  clean_out="$(node "$REPO/tools/clean-profiles.cjs" --wipe-persistent 2>&1)"
+  if [ $? -eq 0 ]; then
+    printf '%s\n' "$clean_out" | tail -8
+  else
+    printf '%s\n' "$clean_out" | tail -6
+    echo "  (профили не убраны — вручную: npm run clean:profiles)"
+  fi
 fi
 
 # Код возврата обязан соответствовать итогам. Раньше скрипт завершался последней

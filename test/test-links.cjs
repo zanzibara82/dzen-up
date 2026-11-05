@@ -815,6 +815,23 @@ async function main() {
     eq("карта меньше потолка читается", small.urls, ["https://small.ru/toyota-camry/"]);
     check("обычная карта не помечена «слишком большая»", small.big === false, "big = " + JSON.stringify(small.big));
 
+    // Потолок меряется БАЙТАМИ. В ветке без потока (ответ пришёл сразу строкой)
+    // сверка по длине строки пропускала кириллицу вдвое крупнее потолка: знак
+    // кириллицы в utf-8 стоит два байта, и «4 МБ знаков» — это 8 МБ памяти.
+    const cyrBig = "а".repeat(Math.floor(max / 2) + 64);
+    routes = { "https://cyrbig.ru/sitemap.xml": { body: cyrBig } };
+    const cyr = await loadSitemap("https://cyrbig.ru/sitemap.xml", null);
+    eq("кириллица крупнее потолка в байтах не читается", cyr.urls, []);
+    check("кириллица крупнее потолка в байтах помечена «слишком большая»", cyr.big === true, "big = " + JSON.stringify(cyr.big));
+
+    // И не срезается то, что в потолок по байтам как раз влезает: правка «на
+    // всякий случай тройной запас» убила бы нормальные большие карты.
+    const fits = sm(["https://cyrok.ru/toyota-camry/"]) + "а".repeat(Math.floor(max / 2) - 4096);
+    routes = { "https://cyrok.ru/sitemap.xml": { body: fits } };
+    const okCyr = await loadSitemap("https://cyrok.ru/sitemap.xml", null);
+    eq("кириллица, вписывающаяся в потолок по байтам, читается", okCyr.urls, ["https://cyrok.ru/toyota-camry/"]);
+    check("вписавшаяся кириллица не помечена «слишком большая»", okCyr.big === false, "big = " + JSON.stringify(okCyr.big));
+
     // Кириллица на границе двух кусков потока: байты одного знака нельзя
     // превращать в два вопросительных — адрес перестанет собираться с названием.
     const bytes = new TextEncoder().encode(sm(["https://split.ru/toyota-camry-обзор/"]));
