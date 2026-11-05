@@ -222,16 +222,25 @@ async function main() {
     await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
     await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
 
-    await sleep(2500);
-
-    const after = await evalJs(`(() => ({
+    // Ждём не по таймеру, а по условию: прогон кончился, когда панель показала
+    // итог или тост уже на экране. Прежние фиксированные 2,5 с в полном прогоне
+    // на загруженной машине не хватало, и набор краснел на ровном месте — это
+    // флейк харнесса, а не расширения: проверка та же, «✅ Готово» обязано
+    // появиться, просто ждём его, а не угадываем секунды.
+    const snapshot = `(() => ({
       status: document.querySelector('#dzr-bar .dzr-status').textContent,
       toast: (document.getElementById('dzr-toast')||{}).textContent || '',
       selLen: window.getSelection().toString().length,
       sel: window.getSelection().toString().slice(0,80),
       bodyHtml: document.querySelector('.body').innerHTML,
       bodyText: document.querySelector('.body').innerText
-    }))()`);
+    }))()`;
+    let after = await evalJs(snapshot);
+    const deadline = Date.now() + 20000;
+    while (!/Готово|Ошибка|Отменено/.test(String(after.status)) && !String(after.toast).trim() && Date.now() < deadline) {
+      await sleep(200);
+      after = await evalJs(snapshot);
+    }
 
     console.log("\n--- ПОСЛЕ КЛИКА ---");
     console.log("статус панели   : %s", JSON.stringify(after.status));
