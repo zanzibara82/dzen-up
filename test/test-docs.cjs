@@ -705,6 +705,42 @@ console.log("\n=== состав обновления против списка �
   // иначе в пакете заведётся мёртвый груз и «обновить» его никогда не принесёт.
   const extra = shipped.filter((p) => p !== "README.md" && need.indexOf(p) < 0);
   check("сборщик не носит лишнего", extra.length === 0, extra.join(", "));
+
+  // update.js обязан опередить popup.js: попап берёт функции из глобального
+  // DzenUpdate, и обратный порядок дал бы «DzenUpdate is not defined» при
+  // открытии настроек — при полностью собранном и зелёном пакете.
+  const orderHtml = popupHtml.indexOf('src="update.js"');
+  const orderPopup = popupHtml.indexOf('src="popup.js"');
+  check("update.js подключён раньше popup.js", orderHtml >= 0 && orderPopup >= 0 && orderHtml < orderPopup, JSON.stringify({ update: orderHtml, popup: orderPopup }));
+  // Фон в воркере грузит тот же файл через importScripts — без него DzenUpdate
+  // там не существует, а юнит-набор этого не увидит: он конкатенирует исходники.
+  check("фон подключает update.js в воркере", /importScripts\(["']update\.js["']\)/.test(bg), "нет importScripts в background.js");
+
+  // Адрес пакета — каталог того же манифеста, а не второй зашитый url: иначе
+  // правка репозитория в одном месте разъехалась бы с другим и «обновить»
+  // начало бы качать из чужого дерева.
+  const manifestUrl = constValue(bg, "UPDATE_MANIFEST_URL");
+  check("префикс пакета выводится из адреса манифеста", /remoteBase[\s\S]{0,120}UPDATE_MANIFEST_URL\.slice/.test(bg), "remoteBase не опирается на UPDATE_MANIFEST_URL");
+  check("домен пакета тот же, что у проверки обновлений", new URL(manifestUrl).origin === "https://raw.githubusercontent.com", manifestUrl);
+  // Права на этот домен спрашиваются с 2.2.0; если бы их не было, «Обновить
+  // сейчас» падало бы на «Failed to fetch» — и ровно поэтому проверка читает
+  // манифест, а не поверена слову в комментарии.
+  const patterns = [].concat(manifest.host_permissions || [], manifest.optional_host_permissions || []);
+  const covered = (url) => {
+    const u = new URL(url);
+    return patterns.some((pat) => {
+      const m = /^(https?|\*):\/\/([^/]+)(\/.*)?$/.exec(pat);
+      if (!m) return false;
+      if (m[1] !== "*" && m[1] !== u.protocol.replace(":", "")) return false;
+      if (m[2] === "*") return true;
+      if (m[2].indexOf("*.") === 0) return u.hostname.slice(-m[2].length + 1) === m[2].slice(1);
+      return m[2] === u.hostname;
+    });
+  };
+  check("домен пакета уже покрыт правами манифеста", covered(manifestUrl), manifestUrl + " приправах " + patterns.join(" "));
+  // Фон обязан отвечать на то сообщение, которое шлёт попап: расхождение имён
+  // типов неловимо иначе, чем живым кликом.
+  check("фон отвечает на updatePackage", /msg\.type === "updatePackage"/.test(bg), "нет обработчика updatePackage");
 }
 
 console.log("\n=== ИТОГ ===");

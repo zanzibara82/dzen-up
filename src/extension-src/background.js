@@ -3,6 +3,12 @@
  * Контент-скрипт не ходит в сеть сам — так нет проблем с CORS.
  */
 
+// Чистые функции обновления живут в update.js — одном файле с попапом: состав
+// файлов и порядок записи должны считаться одинаково там, где их качают, и там,
+// где их пишут. В юнит-наборе воркер грузится как тело функции, где
+// importScripts нет, поэтому подключение проверяется на месте.
+if (typeof importScripts === "function") importScripts("update.js");
+
 // Приписка в конце статьи — стартовое значение, пользователь правит его в настройках.
 // Запятые и «ё» расставлены намеренно: это публичный текст под каждой статьёй.
 const DEFAULT_SIGNATURE =
@@ -316,7 +322,7 @@ function backoffMs(attempt) {
  * нужен там, где человек его вписал; проверка обновлений ходит на GitHub, и
  * адрес API ей не объясняет ничего.
  */
-async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = REQUEST_TIMEOUT_MS, method, headers, body, errorBody = false, timeoutNote = "", networkNote = " Проверьте адрес API и доступ расширения к его домену." } = {}) {
+async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = REQUEST_TIMEOUT_MS, method, headers, body, errorBody = false, timeoutNote = "", networkNote = " Проверьте адрес API и доступ расширения к его домену.", rawBytes = false } = {}) {
   let lastErr = null;
 
   for (let attempt = 0; attempt < tries; attempt++) {
@@ -372,6 +378,14 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
       // того же гиганта, а это платный вызов и минута ожидания впустую.
       let raw;
       try {
+        // Файл пакета обновления читается байтами, а не текстом: png через
+        // «строку → TextEncoder» теряет середину, а сверка «совпало ли на диске»
+        // и запись работают именно с байтами.
+        if (rawBytes) {
+          const bytes = await readBytesCapped(res, API_MAX_BYTES, "файл", "такой файл не берём");
+          cleanup();
+          return bytes;
+        }
         raw = await readBodyCapped(res, API_MAX_BYTES, "ответ", "его не читаем");
       } catch (e) {
         if (!e || !e.tooBig) throw e; // обрыв при чтении — как раньше, в общий обработчик
@@ -1252,6 +1266,49 @@ async function readBodyCapped(res, maxBytes = SITE_MAX_BYTES, what = "файл",
   }
   parts.push(decoder.decode());
   return parts.join("");
+}
+
+/**
+ * Тело ответа байтами, с тем же потолком, что и у текста.
+ *
+ * Отдельная функция, а не `new TextEncoder().encode(await readBodyCapped(...))`:
+ * так файл проходит через декодирование и обратно, и бинарное содержимое
+ * перестаёт быть самим собой. Байты нужны ровно там, где их потом кладут на
+ * диск, — в первую очередь иконки.
+ */
+async function readBytesCapped(res, maxBytes = SITE_MAX_BYTES, what = "файл", why = "такую карту не читаем") {
+  const declared = Number(res.headers && res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) throw tooBigError(maxBytes, what, why);
+  if (!res.body || typeof res.body.getReader !== "function") {
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length > maxBytes) throw tooBigError(maxBytes, what, why);
+    return bytes;
+  }
+  const reader = res.body.getReader();
+  const parts = [];
+  let total = 0;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    const value = chunk.value || new Uint8Array(0);
+    total += value.byteLength || value.length || 0;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch (e) {
+        /* поток уже закрыт */
+      }
+      throw tooBigError(maxBytes, what, why);
+    }
+    parts.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
 }
 
 function tooBigError(maxBytes, what, why) {
@@ -2749,6 +2806,110 @@ async function checkUpdate() {
   };
 }
 
+// ------------------------------------------------------------ пакет обновления ---
+
+// Отдельный таймаут на файл: человек уже выбрал папку и ждёт, а пакет — это
+// десятки запросов. Четыре секунды на манифест годятся для кнопки «Проверить»,
+// для скачивания они роняли бы сборку на половинном ответе CDN.
+const UPDATE_FILE_TIMEOUT_MS = 20000;
+
+/** Каталог, из которого качается пакет: тот же путь, что у адреса манифеста. */
+function remoteBase() {
+  return UPDATE_MANIFEST_URL.slice(0, UPDATE_MANIFEST_URL.lastIndexOf("/") + 1);
+}
+
+/**
+ * Запрос с обходятелем кэша и одной меткой на всю сборку. Метка нужна ровно
+ * одна: raw.githubusercontent отдаёт файл сутки после коммита, а между первым и
+ * последним запросом в main мог появиться новый коммит — тогда пакет состоял бы
+ * из половины старой версии и половины новой, и расширение после записи не
+ * загружалось бы.
+ */
+function updateUrl(rel, stamp) {
+  const url = remoteBase() + rel;
+  return url + (url.indexOf("?") < 0 ? "?" : "&") + "dzr=" + stamp;
+}
+
+async function fetchRemoteFile(rel, stamp) {
+  const bytes = await fetchJson(updateUrl(rel, stamp), {
+    label: "GitHub: " + rel,
+    tries: 2,
+    timeout: UPDATE_FILE_TIMEOUT_MS,
+    rawBytes: true,
+    networkNote: " Проверьте доступ в интернет и разрешение на raw.githubusercontent.com."
+  });
+  // Пустой файл Chrome не примет, а «обновлено до 2.3.0» после его записи будет
+  // враньём: лучше встать до первой записи и сказать причину.
+  if (!bytes || !bytes.length) throw new Error("GitHub: файл «" + rel + "» пришёл пустым — обновление не применяется");
+  return bytes;
+}
+
+function decodeUtf8(bytes) {
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+/**
+ * Далёкий манифест как данные: тот же разбор, что у `checkUpdate`, но из
+ * скачанных байтов. Пересобирать его строкой нельзя — на диск ложатся именно те
+ * байты, по которым считался состав.
+ */
+function parseRemoteManifest(bytes) {
+  const text = decodeUtf8(bytes);
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    data = null;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("Не удалось собрать обновление. GitHub: манифест main вернул не JSON — " + headOf(text));
+  }
+  if (!data.version) {
+    throw new Error("Не удалось собрать обновление: в манифесте main на GitHub нет версии");
+  }
+  return data;
+}
+
+/**
+ * Все байты нового пакета, ни один файл на диске ещё не тронут.
+ *
+ * Состав считается из далёкого манифеста, а страницы обходятся вторым уровнем —
+ * так в набор попадает `popup.js`, которого в манифеста нет. Ответственность за
+ * «не пишем ничего при сбое» здесь, а не в записи: пока не скачано всё, о
+ * полусостоянии можно говорить только как о несбывшемся.
+ */
+async function buildUpdatePackage() {
+  const current = (chrome.runtime.getManifest() || {}).version || "";
+  const stamp = Date.now();
+  const manifestName = DzenUpdate.MANIFEST_NAME;
+  const manifestBytes = await fetchRemoteFile(manifestName, stamp);
+  const remoteManifest = parseRemoteManifest(manifestBytes);
+  const remote = remoteManifest.version;
+  if (compareVersions(current, remote) === null) {
+    throw new Error(
+      "Не удалось собрать обновление: версия «" + remote + "» на GitHub не похожа на номер, сравнивать нечем"
+    );
+  }
+
+  const got = {};
+  got[manifestName] = manifestBytes;
+  const htmlTexts = {};
+  // Страницы качаются первыми: их содержимое определяет остальную часть состава.
+  const pages = DzenUpdate.updateFileSet(remoteManifest, {}).filter((p) => /\.html$/i.test(p));
+  for (const page of pages) {
+    const bytes = await fetchRemoteFile(page, stamp);
+    got[page] = bytes;
+    htmlTexts[page] = decodeUtf8(bytes);
+  }
+  const fileSet = DzenUpdate.updateFileSet(remoteManifest, htmlTexts);
+  for (const rel of fileSet) {
+    if (got[rel]) continue;
+    got[rel] = await fetchRemoteFile(rel, stamp);
+  }
+
+  return { current, remote, files: fileSet.map((rel) => ({ path: rel, bytes: got[rel] })) };
+}
+
 // ------------------------------------------------------------ сообщения ---
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -2900,6 +3061,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       if (msg.type === "checkUpdate") {
         sendResponse({ ok: true, ...(await checkUpdate()) });
+        return;
+      }
+
+      if (msg.type === "updatePackage") {
+        sendResponse({ ok: true, ...(await buildUpdatePackage()) });
         return;
       }
 

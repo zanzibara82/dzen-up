@@ -1189,6 +1189,161 @@ async function main() {
     }
   }
 
+  console.log("\n=== 30. пакет обновления собирается в фоне ===");
+  {
+    // Зачем этот раздел: до первой записи на диск все байты должны быть скачаны,
+    // а состав — взят из далёкого манифеста, а не из списка в коде. Ошибка здесь
+    // двух сортов: недосохранившийся пакет (расширение не загружается) и лишняя
+    // запись чужого пути. Оба ловятся до всякого диалога выбора папки.
+    const updSrc = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "update.js"), "utf8");
+    const base = "https://raw.githubusercontent.com/zanzibara82/dzen-up/main/src/extension-src/";
+    const enc = (s) => new TextEncoder().encode(s);
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const REMOTE_MANIFEST = {
+      manifest_version: 3,
+      name: "Дзен Рерайтер — перевод и рерайт статей",
+      version: "9.9.9",
+      background: { service_worker: "background.js" },
+      content_scripts: [{ js: ["presets.js", "content.js"], css: ["content.css"] }],
+      action: { default_popup: "popup.html", default_icon: { "16": "icons/icon16.png" } },
+      icons: { "16": "icons/icon16.png" }
+    };
+    // popup.js в манифеста нет — он обязан прийти вторым уровнем из popup.html.
+    let remoteFiles = {
+      "manifest.json": enc(JSON.stringify(REMOTE_MANIFEST)),
+      "background.js": enc("background девятого релиза"),
+      "presets.js": enc("presets девятого релиза"),
+      "content.js": enc("content девятого релиза"),
+      "content.css": enc("body{color:red}"),
+      "popup.html": enc('<html><script src="popup.js"></script></html>'),
+      "popup.js": enc("popup девятого релиза"),
+      "icons/icon16.png": PNG
+    };
+    let urls = [];
+    let failWith = null; // {rel, res} — что отдать вместо файла
+    const prevFetch = globalThis.fetch;
+    const prevVersion = manifestVersion;
+    manifestVersion = "2.2.0";
+    globalThis.fetch = async (url) => {
+      const full = String(url);
+      const rel = full.slice(base.length).split("?")[0];
+      urls.push(full);
+      if (failWith && failWith.rel === rel) return failWith.res;
+      const bytes = remoteFiles[rel];
+      if (!bytes) return { ok: false, status: 404, headers: { get: () => null }, text: async () => "", arrayBuffer: async () => new ArrayBuffer(0), json: async () => ({}) };
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (k) => (String(k).toLowerCase() === "content-length" ? String(bytes.byteLength) : null) },
+        body: null,
+        text: async () => new TextDecoder().decode(bytes),
+        arrayBuffer: async () => bytes.slice().buffer
+      };
+    };
+
+    // importScripts воркеру не нужен: update.js конкатенацией, а его отсутствие в
+    // харнессе видно по `typeof importScripts === "function"` в самом фоне.
+    const bgApi = new Function(
+      "chrome",
+      updSrc + "\n" + src +
+      "\nreturn { remoteBase: typeof remoteBase === \"function\" ? remoteBase : null, " +
+      " buildUpdatePackage: typeof buildUpdatePackage === \"function\" ? buildUpdatePackage : null, " +
+      " UPDATE_MANIFEST_URL: typeof UPDATE_MANIFEST_URL === \"string\" ? UPDATE_MANIFEST_URL : null, " +
+      " API_MAX_BYTES: typeof API_MAX_BYTES === \"number\" ? API_MAX_BYTES : null };"
+    )(chrome);
+
+    try {
+      check("фон умеет собирать пакет", !!bgApi.buildUpdatePackage && !!bgApi.remoteBase);
+      check(
+        "префикс адреса — каталог манифеста",
+        !!bgApi.remoteBase && bgApi.remoteBase() === base,
+        bgApi.remoteBase && bgApi.remoteBase()
+      );
+
+      const pkg = await bgApi.buildUpdatePackage();
+      const pathsGotten = pkg.files.map((f) => f.path);
+      check(
+        "состав пакета взят из далёкого манифеста",
+        JSON.stringify(pathsGotten) === JSON.stringify(["background.js", "content.css", "content.js", "icons/icon16.png", "manifest.json", "popup.html", "popup.js", "presets.js"]),
+        pathsGotten.join(", ")
+      );
+      check("версии названы обе", pkg.current === "2.2.0" && pkg.remote === "9.9.9", JSON.stringify({ current: pkg.current, remote: pkg.remote }));
+      // Один файл — один запрос. Проверка нужна ровно из-за manifest.json: его же
+      // читают, чтобы узнать состав, и простая реализация скачала бы его дважды.
+      check("каждый файл запрошен один раз", urls.length === pathsGotten.length && new Set(urls.map((u) => u.split("?")[0])).size === urls.length, urls.length + " запросов: " + urls.map((u) => u.slice(base.length)).join(", "));
+      check("каждый запрос — под обходятелем кэша", urls.every((u) => /[?&]dzr=\d+/.test(u)), urls[0]);
+      check("запросы идут только по каталогу пакета", urls.every((u) => u.indexOf(base) === 0), urls.find((u) => u.indexOf(base) !== 0));
+
+      const icon = pkg.files.filter((f) => f.path === "icons/icon16.png")[0];
+      // png текстом не переносим: decode→encode по utf-8 необратим, и иконка
+      // вернулась бы битой. Проверка байтов, а не длины, ловит ровно это.
+      check(
+        "иконка пришла байт в байт",
+        !!icon && icon.bytes instanceof Uint8Array && icon.bytes.length === PNG.length && Array.from(icon.bytes).join() === Array.from(PNG).join(),
+        icon ? Array.from(icon.bytes).slice(0, 8).join() : "иконы в пакете нет"
+      );
+      const manifestFile = pkg.files.filter((f) => f.path === "manifest.json")[0];
+      check(
+        "манифест пакета — те же байты, что прочитаны",
+        !!manifestFile && new TextDecoder().decode(manifestFile.bytes) === JSON.stringify(REMOTE_MANIFEST),
+        manifestFile ? new TextDecoder().decode(manifestFile.bytes).slice(0, 60) : "манифеста в пакете нет"
+      );
+
+      // ---- сбой на любом файле: не пишем ничего ----
+      const fails = [
+        ["404 на content.js", { rel: "content.js", res: { ok: false, status: 404, headers: { get: () => null }, text: async () => "", arrayBuffer: async () => new ArrayBuffer(0), json: async () => ({}) } }, /content\.js/],
+        ["пустое тело у popup.js", { rel: "popup.js", res: { ok: true, status: 200, headers: { get: () => "0" }, body: null, text: async () => "", arrayBuffer: async () => new ArrayBuffer(0), json: async () => ({}) } }, /popup\.js/],
+        ["файл за потолком", { rel: "background.js", res: { ok: true, status: 200, headers: { get: (k) => (String(k).toLowerCase() === "content-length" ? String((bgApi.API_MAX_BYTES || 0) + 1) : null) }, body: null, text: async () => "", arrayBuffer: async () => new ArrayBuffer(0), json: async () => ({}) } }, /размер|потолок|больше/]
+      ];
+      for (const [title, fault, expected] of fails) {
+        failWith = fault;
+        urls = [];
+        let err = null;
+        try {
+          await bgApi.buildUpdatePackage();
+        } catch (e) {
+          err = e;
+        }
+        check(title + " — пакет не собран", !!err && expected.test(err.message), err ? err.message.slice(0, 160) : "ошибки нет");
+      }
+      failWith = null;
+
+      // Далёкий манифест, который не разобрать, — не «обновлений нет»: человек
+      // ушёл бы на старом пакете, решив, что проверил.
+      const savedManifest = remoteFiles["manifest.json"];
+      remoteFiles["manifest.json"] = enc("<html>rate limit</html>");
+      let err = null;
+      try {
+        await bgApi.buildUpdatePackage();
+      } catch (e) {
+        err = e;
+      }
+      check("не-JSON манифеста назван причиной", !!err && /не JSON|разобр/ig.test(err.message), err ? err.message.slice(0, 160) : "ошибки нет");
+      remoteFiles["manifest.json"] = savedManifest;
+
+      // ---- ответ фона на сообщение попапа ----
+      const box = {};
+      new Function("chrome", updSrc + "\n" + src)(mockWorkerChrome(box));
+      const askPackage = (msg) => new Promise((r) => box.listener(msg, {}, r));
+      urls = [];
+      const okRes = await askPackage({ type: "updatePackage" });
+      check(
+        "фон отвечает на updatePackage пакетом",
+        !!okRes && okRes.ok === true && okRes.remote === "9.9.9" && Array.isArray(okRes.files) && okRes.files.length === 8 && okRes.files[0].bytes instanceof Uint8Array,
+        okRes ? JSON.stringify({ ok: okRes.ok, remote: okRes.remote, файлов: (okRes.files || []).length }) : "ответа нет"
+      );
+      failWith = fails[0][1];
+      const badRes = await askPackage({ type: "updatePackage" });
+      check("сбой помечен ошибкой, а не пустым пакетом", !!badRes && badRes.ok === false && !!badRes.error, JSON.stringify(badRes).slice(0, 180));
+      failWith = null;
+    } catch (e) {
+      check("сборка пакета реализована", false, String((e && e.message) || e));
+    } finally {
+      globalThis.fetch = prevFetch;
+      manifestVersion = prevVersion;
+    }
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);
