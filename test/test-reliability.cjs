@@ -1344,6 +1344,68 @@ async function main() {
     }
   }
 
+  console.log("\n=== 31. выбранная папка проверяется до первой записи ===");
+  {
+    // Зачем этот раздел: человек мог выбрать любую папку — свою сборку другого
+    // расширения, пустой каталог или то, что уже перенесли. Ни один из этих
+    // случаев нельзя «обновить»: файлы легли бы туда, где их никто не читает, а
+    // статус сказал бы «обновлено». Поэтому проверка папки — чистая функция, и
+    // причины у неё канонические: их показывает и попап, и тест.
+    const { makeFakeRoot } = require("./fixtures/fake-dir-handle.cjs");
+    let upd2 = null;
+    let err2 = "";
+    try {
+      const updSrc = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "update.js"), "utf8");
+      upd2 = new Function(updSrc + "\nreturn DzenUpdate;")();
+    } catch (e) {
+      err2 = String((e && e.message) || e);
+    }
+    check(
+      "модуль умеет читать файлы папки и судить о ней",
+      !!upd2 && typeof upd2.readRel === "function" && typeof upd2.installDirProblem === "function",
+      err2
+    );
+
+    try {
+      if (upd2) {
+      const NAME = "Дзен Рерайтер — перевод и рерайт статей";
+      const good = { "manifest.json": JSON.stringify({ manifest_version: 3, name: NAME, version: "2.2.0" }), "popup.html": "<html></html>" };
+      const dir = (files, opts) => upd2.installDirProblem(makeFakeRoot(files, opts), NAME);
+
+      check("годная папка не даёт причины", (await dir(good)) === null, JSON.stringify(await dir(good)));
+      check("папка без манифеста — «не читается»", (await dir({ "popup.html": "<html></html>" })) === "не читается", await dir({ "popup.html": "<html></html>" }));
+      check("манифест не разбирается — «не читается»", (await dir({ "manifest.json": "<html>не json</html>" })) === "не читается", await dir({ "manifest.json": "<html>не json</html>" }));
+      check("пустой манифест — «не читается»", (await dir({ "manifest.json": "" })) === "не читается", await dir({ "manifest.json": "" }));
+      check("вторая версия манифеста — не наша папка", (await dir({ "manifest.json": JSON.stringify({ manifest_version: 2, name: NAME }) })) === "не манифест третьей версии", await dir({ "manifest.json": JSON.stringify({ manifest_version: 2, name: NAME }) }));
+      // Чужое расширение в соседней папке — самый опасный промах: файлы его пакета
+      // были бы перезаписаны нашим кодом, и оно перестало бы загружаться.
+      check("папка другого расширения опознана", (await dir({ "manifest.json": JSON.stringify({ manifest_version: 3, name: "Иное расширение" }) })) === "не то расширение", await dir({ "manifest.json": JSON.stringify({ manifest_version: 3, name: "Иное расширение" }) }));
+      check("папку удалили или перенесли — названо это", (await dir(good, { failOn: "read", failRel: "manifest.json" })) === "папки на месте нет", await dir(good, { failOn: "read", failRel: "manifest.json" }));
+
+      // readRel — единственная дверь к байтам на диске: план сверяется по ней.
+      const root = makeFakeRoot(good);
+      const bytes = await upd2.readRel(root, "manifest.json");
+      check("readRel отдаёт массив байтов", bytes instanceof Uint8Array && new TextDecoder().decode(bytes) === good["manifest.json"], bytes && bytes.constructor.name);
+      check("readRel читает через getFileHandle", root.__calls.indexOf("file:manifest.json") >= 0 && root.__calls.indexOf("read:manifest.json") >= 0, root.__calls.join(", "));
+      check("отсутствующего файла нет — и это не пустой файл", (await upd2.readRel(root, "nope.js")) === null, String(await upd2.readRel(root, "nope.js")));
+      check("чтение по поддомену работает", new TextDecoder().decode(await upd2.readRel(makeFakeRoot({ "icons/icon16.png": "пиксели" }), "icons/icon16.png")) === "пиксели");
+
+      // Имя базы и ключ зафиксированы: рукоять, сохранённая одной версией,
+      // обязана найтись в другой, иначе «обновить» каждый раз звала бы диалог.
+      check(
+        "хранилище рукояти и папка отката названы константами",
+        typeof upd2.IDB_NAME === "string" && !!upd2.IDB_NAME && typeof upd2.IDB_STORE === "string" && !!upd2.IDB_STORE &&
+          typeof upd2.IDB_KEY === "string" && !!upd2.IDB_KEY && upd2.BACKUP_DIR === ".dzr-backup",
+          JSON.stringify({ db: upd2.IDB_NAME, store: upd2.IDB_STORE, key: upd2.IDB_KEY, backup: upd2.BACKUP_DIR })
+        );
+      }
+    } catch (e) {
+      // Падение харнесса вместо провала проверки спрятало бы весь раздел:
+      // ИТОГ этого набора не печатается, и «провалов: 0» значит «не дошли».
+      check("проверка папки не роняет набор", false, String((e && e.message) || e));
+    }
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);

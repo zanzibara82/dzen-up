@@ -10,6 +10,98 @@ var DzenUpdate = (function () {
   // того, в каком порядке файл оказался в составе.
   var MANIFEST_NAME = "manifest.json";
   var INTENT_KEY = "dzrUpdateIntent";
+  // Папка отката — внутри выбранной: пережить закрытие браузера может только
+  // запись на диск, а Chrome лишние файлы в распакованной установке игнорирует.
+  var BACKUP_DIR = ".dzr-backup";
+  // Рукоять на папку сериализуется только в IndexedDB. Имена зафиксированы:
+  // сохранённое одной версией обязано найтись в другой, иначе каждый клик
+  // поднимал бы диалог выбора заново.
+  var IDB_NAME = "dzr-update";
+  var IDB_STORE = "handles";
+  var IDB_KEY = "install-dir";
+
+  function isNotFound(e) {
+    return !!e && e.name === "NotFoundError";
+  }
+
+  /** Каталог и имя, в котором лежит относительный путь. */
+  async function parentOf(root, rel, create) {
+    var parts = String(rel).split("/");
+    var dir = root;
+    for (var i = 0; i < parts.length - 1; i++) {
+      dir = await dir.getDirectoryHandle(parts[i], { create: !!create });
+    }
+    return { dir: dir, name: parts[parts.length - 1] };
+  }
+
+  /**
+   * Байты файла выбранной папки или null, если такого файла там нет.
+   *
+   * Пустой файл и пропавшая папка — разные беды. Отсутствие файла возвращает
+   * null, а сбой при его чтении бросает: по этой грани вызывающий и понимает,
+   * что папку перенесли с места или доступ к ней отозвали.
+   */
+  async function readRel(root, rel) {
+    var at = await parentOf(root, rel, false);
+    var fh;
+    try {
+      fh = await at.dir.getFileHandle(at.name, { create: false });
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+    var file = await fh.getFile();
+    return new Uint8Array(await file.arrayBuffer());
+  }
+
+  /** Относительные пути всех файлов папки, обойти рекурсивно. */
+  async function listRel(root, prefix) {
+    var out = [];
+    var it = root.entries();
+    for await (const pair of it) {
+      var name = pair[0];
+      var handle = pair[1];
+      var rel = prefix ? prefix + "/" + name : name;
+      if (handle && handle.kind === "directory") out = out.concat(await listRel(handle, rel));
+      else out.push(rel);
+    }
+    return out.sort();
+  }
+
+  /**
+   * Почему выбранная папка — не папка этого расширения, или null, если годится.
+   *
+   * Порядок проверок — это порядок, в котором человек узнаёт правду: сначала
+   * «папки нет», потом «манифест не читается», затем «не та версия манифеста» и
+   * только потом «это другое расширение». Ни один файл не будет тронут, пока
+   * здесь не пусто.
+   */
+  async function installDirProblem(root, expectedName) {
+    var listing;
+    try {
+      listing = await listRel(root, "");
+    } catch (e) {
+      return "папки на месте нет";
+    }
+    if (listing.indexOf(MANIFEST_NAME) < 0) return "не читается";
+    var bytes;
+    try {
+      bytes = await readRel(root, MANIFEST_NAME);
+    } catch (e) {
+      return "папки на месте нет";
+    }
+    if (!bytes || !bytes.length) return "не читается";
+    var data = null;
+    try {
+      data = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+    } catch (e) {
+      return "не читается";
+    }
+    if (!data || typeof data !== "object") return "не читается";
+    if (data.manifest_version !== 3) return "не манифест третьей версии";
+    if (data.name !== expectedName) return "не то расширение";
+    return null;
+  }
 
   /**
    * Принимаем только относительный путь с прямыми слэшами внутри выбранной
@@ -113,8 +205,15 @@ var DzenUpdate = (function () {
   return {
     MANIFEST_NAME: MANIFEST_NAME,
     INTENT_KEY: INTENT_KEY,
+    BACKUP_DIR: BACKUP_DIR,
+    IDB_NAME: IDB_NAME,
+    IDB_STORE: IDB_STORE,
+    IDB_KEY: IDB_KEY,
     isSafeRelPath: isSafeRelPath,
     updateFileSet: updateFileSet,
-    planUpdate: planUpdate
+    planUpdate: planUpdate,
+    readRel: readRel,
+    listRel: listRel,
+    installDirProblem: installDirProblem
   };
 })();
