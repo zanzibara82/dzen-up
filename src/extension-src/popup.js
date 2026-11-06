@@ -609,6 +609,99 @@
     st.textContent = "🧹 Кэш переводов очищен.";
   });
 
+  // ---- проверка обновлений -------------------------------------------------
+  // Шаблон права повторён здесь, а не запрошен у фона: chrome.permissions.request
+  // принимает только настоящий жест пользователя, а к моменту ответа фона он уже
+  // потрачен. test-docs.cjs следит, чтобы эта строка не разъехалась с адресом
+  // манифеста из background.js, — иначе кнопка просила бы доступ не туда.
+  var UPDATE_ORIGIN = "https://raw.githubusercontent.com/*";
+  // Команда, полученная от фона: в буфер отдаём её, а не сочинённый здесь текст,
+  // иначе попап мог бы скопировать то, чего в репозитории нет.
+  var updateCommand = "";
+
+  function setUpdateStatus(text, cls) {
+    var el = $("update-status");
+    el.textContent = text;
+    el.className = "hint" + (cls ? " " + cls : "");
+  }
+
+  function hideUpdateCommand() {
+    updateCommand = "";
+    $("update-copy").hidden = true;
+  }
+
+  $("update-check").addEventListener("click", async function () {
+    var btn = $("update-check");
+    // Доступ спрашиваем до запроса: без права фон получил бы «Failed to fetch» и
+    // человек искал бы причину в настройках API, хотя дело в одном баннере.
+    if (!(await chrome.permissions.contains({ origins: [UPDATE_ORIGIN] }))) {
+      var granted = await chrome.permissions.request({ origins: [UPDATE_ORIGIN] });
+      if (!granted) {
+        hideUpdateCommand();
+        setUpdateStatus("⚠️ Нет доступа к raw.githubusercontent.com — без него проверку не сделать.", "err");
+        return;
+      }
+    }
+    btn.disabled = true;
+    setUpdateStatus("⏳ Проверяю…");
+    try {
+      var res = await send({ type: "checkUpdate" });
+      if (!res || !res.ok) {
+        hideUpdateCommand();
+        setUpdateStatus("❌ " + ((res && res.error) || "фон не ответил"), "err");
+        return;
+      }
+      var cur = String(res.current || "?");
+      var remote = String(res.remote || "?");
+      if (res.state === "update") {
+        updateCommand = String(res.command || "");
+        $("update-copy").hidden = !updateCommand;
+        if (updateCommand) {
+          setUpdateStatus(
+            "⬆️ Доступно обновление: " + cur + " → " + remote +
+              ". Выполните команду в папке с исходниками и нажмите ⟳ в chrome://extensions."
+          );
+        } else {
+          // Кнопка копирования без команды бессмысленна, а обещание обновления
+          // без того, чем его выполнить, — хуже честной ошибки.
+          setUpdateStatus("❌ Фон сообщил об обновлении " + remote + ", но команды пересборки не дал.", "err");
+        }
+      } else if (res.state === "ahead") {
+        // Часто для собранной из рабочей копии: пакет уже новее, чем показывает
+        // GitHub. Предложить ему «обновление до 1.9.9» — значит позвать назад.
+        hideUpdateCommand();
+        setUpdateStatus("✅ Установленная версия " + cur + " новее, чем " + remote + " в main на GitHub.");
+      } else if (res.state === "latest") {
+        hideUpdateCommand();
+        setUpdateStatus("✅ Обновлений нет: в main на GitHub та же версия " + remote + ".");
+      } else {
+        // Неожиданная форма ответа не должна оставлять вечное «Проверяю…».
+        hideUpdateCommand();
+        setUpdateStatus("❌ Фон ответил без состояния проверки — обновлений не обещаем.", "err");
+      }
+    } catch (e) {
+      hideUpdateCommand();
+      setUpdateStatus("❌ Не удалось проверить: " + ((e && e.message) || e), "err");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("update-copy").addEventListener("click", function () {
+    if (!updateCommand) return;
+    navigator.clipboard.writeText(updateCommand).then(
+      function () {
+        setUpdateStatus("📋 Скопировано. Выполните в папке с исходниками, затем ⟳ в chrome://extensions.");
+      },
+      function () {
+        // Отказ буфера — не редкость: окно могло потерять фокус. Команду
+        // показываем целиком, иначе человек останется с «не скопировалось»
+        // и без того, ради чего кнопка и нужна.
+        setUpdateStatus("⚠️ Буфер не принял текст. Скопируйте руками: " + updateCommand, "err");
+      }
+    );
+  });
+
   refreshCacheInfo();
 
   // ---- быстрый рерайт ------------------------------------------------------

@@ -464,6 +464,145 @@ async function main() {
       !/Готовлю карту/.test(badShape.status) && /Карта пуста/.test(badShape.status),
       JSON.stringify(badShape));
 
+    // ---- проверка обновлений ----
+    // Распакованное расширение не обновляет себя само, поэтому кнопка обязана
+    // назвать чужую версию и отдать команду пересборки. Сеть подменяем: тест не
+    // должен зависеть от GitHub, а «обновлений нет» при недоступном репозитории
+    // — это ровно та ложь, ради которой написан этот набор.
+    const updUi = await evalJs(`(() => {
+      const btn = document.getElementById('update-check');
+      const copy = document.getElementById('update-copy');
+      const st = document.getElementById('update-status');
+      return {
+        btn: !!btn,
+        copy: !!copy,
+        copyHidden: !!copy && copy.hidden,
+        status: st ? st.textContent : null
+      };
+    })()`);
+    console.log("проверка обновлений: %j", updUi);
+    check("кнопка проверки обновлений есть", updUi.btn === true);
+    check("кнопка копирования команды есть и спрятана до находки", updUi.copy === true && updUi.copyHidden === true, JSON.stringify(updUi));
+
+    const updNewer = await evalJs(`(async () => {
+      const realSend = chrome.runtime.sendMessage;
+      const realContains = chrome.permissions.contains;
+      const realReq = chrome.permissions.request;
+      const asked = [];
+      const msgs = [];
+      chrome.permissions.contains = (p) => Promise.resolve(false);
+      chrome.permissions.request = (p) => { asked.push(p.origins); return Promise.resolve(true); };
+      chrome.runtime.sendMessage = (msg, cb) => {
+        if (msg && msg.type === 'checkUpdate') {
+          msgs.push(msg.type);
+          cb({ ok: true, state: 'update', current: '2.1.1', remote: '2.2.0',
+               command: 'git pull && node tools/build-extension.cjs' });
+          return;
+        }
+        return realSend.call(chrome.runtime, msg, cb);
+      };
+      const copied = [];
+      // Буфер перехватываем на месте: присвоить navigator.clipboard нельзя
+      // (свойство у Navigator только для чтения), и проверка записала бы
+      // настоящую команду в настоящий буфер человека.
+      const clip = navigator.clipboard;
+      const realWrite = clip.writeText;
+      clip.writeText = (t) => { copied.push(t); return Promise.resolve(); };
+
+      document.getElementById('update-check').click();
+      await new Promise((r) => setTimeout(r, 400));
+      const st1 = document.getElementById('update-status');
+      const found = { status: st1.textContent, cls: st1.className, copyHidden: document.getElementById('update-copy').hidden,
+                      btnDisabled: document.getElementById('update-check').disabled };
+      document.getElementById('update-copy').click();
+      await new Promise((r) => setTimeout(r, 300));
+      const out = { found, asked, msgs, copied, copyStatus: document.getElementById('update-status').textContent };
+      clip.writeText = realWrite;
+      chrome.runtime.sendMessage = realSend;
+      chrome.permissions.contains = realContains;
+      chrome.permissions.request = realReq;
+      return out;
+    })()`);
+    console.log("находка обновления: %j", updNewer);
+    check("доступ спрашивается ровно к домену манифеста",
+      JSON.stringify(updNewer.asked) === JSON.stringify([["https://raw.githubusercontent.com/*"]]),
+      JSON.stringify(updNewer.asked));
+    check("находка названа обоими номерами",
+      /2\.1\.1/.test(updNewer.found.status) && /2\.2\.0/.test(updNewer.found.status),
+      JSON.stringify(updNewer.found.status));
+    check("при находке статус не ошибка", !/err/.test(updNewer.found.cls), JSON.stringify(updNewer.found.cls));
+    check("при находке кнопка копирования показана", updNewer.found.copyHidden === false);
+    check("после ответа кнопка снова активна", updNewer.found.btnDisabled === false);
+    check("в буфер ушла команда из ответа фона",
+      updNewer.copied.length === 1 && updNewer.copied[0] === 'git pull && node tools/build-extension.cjs',
+      JSON.stringify(updNewer.copied));
+    check("копирование подтверждено словами", /Скопировано|буфер/.test(updNewer.copyStatus), JSON.stringify(updNewer.copyStatus));
+
+    const updStates = await evalJs(`(async () => {
+      const realSend = chrome.runtime.sendMessage;
+      const realContains = chrome.permissions.contains;
+      const out = {};
+      chrome.permissions.contains = () => Promise.resolve(true);
+      const run = async (res) => {
+        chrome.runtime.sendMessage = (msg, cb) => {
+          if (msg && msg.type === 'checkUpdate') { cb(res); return; }
+          return realSend.call(chrome.runtime, msg, cb);
+        };
+        document.getElementById('update-check').click();
+        await new Promise((r) => setTimeout(r, 400));
+        const st = document.getElementById('update-status');
+        return { status: st.textContent, cls: st.className, copyHidden: document.getElementById('update-copy').hidden };
+      };
+      out.latest = await run({ ok: true, state: 'latest', current: '2.1.1', remote: '2.1.1' });
+      out.ahead = await run({ ok: true, state: 'ahead', current: '2.2.0', remote: '2.1.1' });
+      out.error = await run({ ok: false, error: 'GitHub: запрос не дошёл — нет доступа к raw.githubusercontent.com' });
+      out.junk = await run({ ok: true });
+      chrome.runtime.sendMessage = realSend;
+      chrome.permissions.contains = realContains;
+      return out;
+    })()`);
+    console.log("состояния проверки: %j", updStates);
+    check("равные версии — сказаны словами «обновлений нет»",
+      /обновлений нет/i.test(updStates.latest.status) && updStates.latest.copyHidden === true,
+      JSON.stringify(updStates.latest));
+    check("установленная новее — обновление не предлагается",
+      /новее/i.test(updStates.ahead.status) && updStates.ahead.copyHidden === true,
+      JSON.stringify(updStates.ahead));
+    check("сбой GitHub назван ошибкой, а не «обновлений нет»",
+      /err/.test(updStates.error.cls) && !/обновлений нет/i.test(updStates.error.status) &&
+      updStates.error.copyHidden === true,
+      JSON.stringify(updStates.error));
+    check("кривой ответ не оставляет вечного «Проверяю…»",
+      !/Проверяю/.test(updStates.junk.status) && /err/.test(updStates.junk.cls),
+      JSON.stringify(updStates.junk));
+
+    const updRefused = await evalJs(`(async () => {
+      const realSend = chrome.runtime.sendMessage;
+      const realContains = chrome.permissions.contains;
+      const realReq = chrome.permissions.request;
+      const msgs = [];
+      chrome.permissions.contains = () => Promise.resolve(false);
+      chrome.permissions.request = () => Promise.resolve(false);
+      chrome.runtime.sendMessage = (msg, cb) => {
+        if (msg && msg.type === 'checkUpdate') { msgs.push(msg.type); cb({ ok: true, state: 'update', current: '1', remote: '2' }); return; }
+        return realSend.call(chrome.runtime, msg, cb);
+      };
+      document.getElementById('update-check').click();
+      await new Promise((r) => setTimeout(r, 400));
+      const st = document.getElementById('update-status');
+      const out = { status: st.textContent, cls: st.className, msgs,
+                    btnDisabled: document.getElementById('update-check').disabled,
+                    copyHidden: document.getElementById('update-copy').hidden };
+      chrome.runtime.sendMessage = realSend;
+      chrome.permissions.contains = realContains;
+      chrome.permissions.request = realReq;
+      return out;
+    })()`);
+    check("отказ в доступе назван ошибком и объяснён",
+      /err/.test(updRefused.cls) && /доступ/.test(updRefused.status), JSON.stringify(updRefused));
+    check("без доступа запрос фону не уходит",
+      updRefused.msgs.length === 0 && updRefused.copyHidden === true, JSON.stringify(updRefused));
+
     const savedLinks = await evalJs(`(async () => {
       document.getElementById('linkSites').value = 'auto-dom24.ru\\n# мой второй канал\\nhttps://example.com/';
       document.getElementById('linkChannels').value = 'https://dzen.ru/auto-dom24.ru\\n# второй\\nhttps://dzen.ru/id/123';

@@ -311,8 +311,12 @@ function backoffMs(attempt) {
  * него можно именно на длинной статье. Кто ждал, тот знает и размер текста, и
  * что с этим делать; сам fetchJson этого не знает, поэтому пояснение приходит
  * опцией от вызывающего.
+ *
+ * networkNote: то же про отказ «запрос не дошёл». Совет проверить адрес API
+ * нужен там, где человек его вписал; проверка обновлений ходит на GitHub, и
+ * адрес API ей не объясняет ничего.
  */
-async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = REQUEST_TIMEOUT_MS, method, headers, body, errorBody = false, timeoutNote = "" } = {}) {
+async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = REQUEST_TIMEOUT_MS, method, headers, body, errorBody = false, timeoutNote = "", networkNote = " Проверьте адрес API и доступ расширения к его домену." } = {}) {
   let lastErr = null;
 
   for (let attempt = 0; attempt < tries; attempt++) {
@@ -405,7 +409,7 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
         try { host = new URL(url).host; } catch (err) {}
         lastErr = new Error(
           label + ": запрос не дошёл" + (host ? " — нет доступа к " + host : "") +
-            " или сервис недоступен. Проверьте адрес API и доступ расширения к его домену."
+            " или сервис недоступен." + networkNote
         );
       } else {
         lastErr = e;
@@ -2669,6 +2673,82 @@ async function checkAiKey(settings) {
     : "Ключ рабочий. Модель «" + answered + "» ответила.";
 }
 
+// ------------------------------------------------------------ обновления ---
+// Установка «Загрузить распакованное» сама не обновляется: Chrome не даёт
+// расширению перезаписать свои файлы, а requestUpdateCheck работает только с
+// магазинными установками. Значит честный ответ на «есть ли обновление» — это
+// «в main на GitHub версия новее», и остаётся подтянуть исходники, пересобрать
+// пакет и нажать ⟳. Команду отдаём готовой строкой, чтобы её копировали, а не
+// переписывали руками и не ошибались в имени скрипта.
+//
+// Релизов и тегов у репозитория нет, поэтому сравниваемся с манифестом ветки
+// main: он и есть то, что человек получит по `git pull`.
+const UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/zanzibara82/dzen-up/main/src/extension-src/manifest.json";
+const UPDATE_BUILD_COMMAND = "git pull && node tools/build-extension.cjs";
+// GitHub отвечает доли секунды, а человек стоит перед кнопкой. Два повтора на
+// секунду дольше — и «Проверяю…» уже похоже на зависание.
+const UPDATE_TIMEOUT_MS = 4000;
+
+/**
+ * -1 — a младше b, 0 — равны, 1 — a старше, null — сравнить нечем.
+ *
+ * Разряды сравниваются числами и недостающие считаются нулями: строковое
+ * сравнение посчитало бы 2.10 младше 2.9, и обновление перестало бы
+ * находиться вовсе.
+ */
+function compareVersions(a, b) {
+  const parts = (v) => {
+    const m = /^\d+(\.\d+)*$/.exec(String(v == null ? "" : v).trim());
+    return m ? m[0].split(".").map(Number) : null;
+  };
+  const x = parts(a);
+  const y = parts(b);
+  if (!x || !y) return null;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+/**
+ * Что стоит в main на GitHub против установленного номера.
+ * Бросает ошибку, если ответа нет или его не с чем сравнить: «обновлений нет»
+ * при недоступном репозитории — самая вредная из ответов ложь, человек решит,
+ * что проверил, и останется на старом пакете.
+ */
+async function checkUpdate() {
+  const current = (chrome.runtime.getManifest() || {}).version || "";
+  let data;
+  try {
+    data = await fetchJson(UPDATE_MANIFEST_URL, {
+      label: "GitHub",
+      tries: 2,
+      timeout: UPDATE_TIMEOUT_MS,
+      networkNote: " Проверьте доступ в интернет и разрешение на raw.githubusercontent.com."
+    });
+  } catch (e) {
+    // Сбой GitHub — не повод показывать «ошибка расширения»: называем источник.
+    throw new Error("Не удалось проверить обновления. " + ((e && e.message) || e));
+  }
+  const remote = data && data.version;
+  if (!remote) {
+    throw new Error("Не удалось проверить обновления: в манифесте main на GitHub нет версии");
+  }
+  const cmp = compareVersions(current, remote);
+  if (cmp === null) {
+    throw new Error(
+      "Не удалось проверить обновления: версия «" + remote + "» на GitHub не похожа на номер, сравнивать нечем"
+    );
+  }
+  return {
+    current,
+    remote,
+    state: cmp < 0 ? "update" : cmp > 0 ? "ahead" : "latest",
+    command: UPDATE_BUILD_COMMAND
+  };
+}
+
 // ------------------------------------------------------------ сообщения ---
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -2815,6 +2895,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === "checkKey") {
         const settings = { ...(await getSettings()), ...(msg.overrides || {}) };
         sendResponse({ ok: true, text: await checkAiKey(settings) });
+        return;
+      }
+
+      if (msg.type === "checkUpdate") {
+        sendResponse({ ok: true, ...(await checkUpdate()) });
         return;
       }
 

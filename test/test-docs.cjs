@@ -40,6 +40,25 @@ function read(name) {
 
 // ------------------------------------------------------------- утилиты разбора ---
 
+/** Конец строчного комментария, но только вне кавычек.
+ *  Наивный `split("//")[0]` резал бы и значение: в `"https://example.com/*"`
+ *  двойной слэш — часть адреса, а не начало комментария. С тех пор как в коде
+ *  появились строковые константы с URL, такой разбор давал бы ложный провал. */
+function stripLineComment(expr) {
+  let quote = "";
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i];
+    if (quote) {
+      if (ch === "\\") i++;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+    else if (ch === "/" && expr[i + 1] === "/") return expr.slice(0, i);
+  }
+  return expr;
+}
+
 /** Значение `const NAME = <выражение>;` — вычисляется как есть, вместе с 12*60*60*1000.
  *  Объявление ищем и как const, и как var: в content.js константы панели объявлены
  *  через var, и требование только const роняло проверку на ровном месте.
@@ -48,7 +67,7 @@ function read(name) {
 function constValue(src, name) {
   const m = new RegExp("^\\s*(?:const|var|let)\\s+" + name + "\\s*=\\s*([^;\\n]+)", "m").exec(src);
   if (!m) throw new Error("не нашёл константу " + name);
-  const expr = m[1].split("//")[0].trim();
+  const expr = stripLineComment(m[1]).trim();
   // eslint-disable-next-line no-new-func
   return new Function("return (" + expr + ")")();
 }
@@ -611,6 +630,56 @@ check(
   /--disable-background-networking/.test(pathsSrc) && /--disable-component-update/.test(pathsSrc)
 );
 check("README репозитория: сказано, как тесты берегут диск", inRepo("chromeFlags"));
+
+// --------------------------- 7. кнопка «Проверить обновления» против кода ------
+// Распакованное расширение обновляется только пересборкой пакета, и вся кнопка
+// держится на трёх фактах: какой адрес спрашивать, какой командой пересобирать
+// и какой домен просить у пользователя. Каждый из них может разъехаться с жизнью:
+// файл в репозитории перенесут, скрипт сборки переименуют, адрес репозитория
+// сменят. Тогда кнопка станет врать «обновлений нет», а это хуже absence.
+//
+// Значения берём из кода, а не пишем числом: тест не должен сам становиться
+// вторым источником правды.
+const grab = (src, name) => {
+  try {
+    return constValue(src, name);
+  } catch (e) {
+    return null;
+  }
+};
+{
+  const url = grab(bg, "UPDATE_MANIFEST_URL");
+  const cmd = grab(bg, "UPDATE_BUILD_COMMAND");
+  const origin = grab(popup, "UPDATE_ORIGIN");
+  check("фон задаёт адрес манифеста", !!url, "UPDATE_MANIFEST_URL = " + JSON.stringify(url));
+  check("фон задаёт команду пересборки", !!cmd, "UPDATE_BUILD_COMMAND = " + JSON.stringify(cmd));
+  check("попап задаёт домен для доступа", !!origin, "UPDATE_ORIGIN = " + JSON.stringify(origin));
+  if (typeof url === "string") {
+    // Адрес обязан вести на файл ЭТОГО репозитория: папку исходников перенесли —
+    // и проверка начала молча сравнивать несуществующий манифест.
+    const m = /^https:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/[^/]+\/(.+)$/.exec(url);
+    check("адрес манифеста разобран", !!m, url);
+    if (m) {
+      const file = path.join(paths.REPO, ...m[1].split("/"));
+      check("по этому адресу в репозитории лежит файл", fs.existsSync(file), m[1]);
+      check("это манифест исходников расширения", /manifest\.json$/.test(m[1]) && /extension-src/.test(m[1]), m[1]);
+    }
+    if (typeof origin === "string") {
+      check("попап просит доступ к домену из адреса фона", origin === "https://" + new URL(url).host + "/*", JSON.stringify({ origin, url }));
+    }
+  }
+  if (typeof cmd === "string") {
+    // Команда, скопированная в буфер, обязана существовать: человек вставит её в
+    // терминал и не будет разбираться, что скрипта сборки с таким именем нет.
+    const script = (cmd.match(/node\s+([^\s&]+)/) || [])[1];
+    check("команда зовёт скрипт сборки", !!script && /build-extension\.cjs$/.test(script), cmd);
+    if (script) check("скрипт сборки лежит в репозитории", fs.existsSync(path.join(paths.REPO, ...script.split("/"))), script);
+    check("команда сначала подтягивает main", /git pull/.test(cmd), cmd);
+    check("README приводит команду из кода", inReadme(cmd), cmd);
+  }
+  check("README называет кнопку «Проверить обновления»", inReadme("Проверить обновления"));
+  check("попап: кнопка проверки обновлений есть", /id="update-check"/.test(popupHtml));
+}
 
 console.log("\n=== ИТОГ ===");
 console.log("всего проверок: " + checks + ", провалов: " + fails);

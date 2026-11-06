@@ -14,6 +14,11 @@ const localStore = {};
 // жмёт «Очистить кэш» посреди сохранения переводов.
 let slowWriteMs = 0;
 const storeOps = [];
+// Что показывает chrome.runtime.getManifest().version. Обновление сравнивает
+// установленную версию с той, что лежит в main на GitHub, и обе стороны должны
+// быть подставляемыми: иначе «локальная версия новее» пришлось бы подстраивать
+// под содержимое манифеста в репозитории, а это проверка, которая краснеет сама.
+let manifestVersion = "2.1.1";
 const chrome = {
   storage: {
     sync: { get: async (d) => ({ ...d }), set: async () => {} },
@@ -30,7 +35,7 @@ const chrome = {
       }
     }
   },
-  runtime: { onMessage: { addListener() {} }, onInstalled: { addListener() {} } },
+  runtime: { onMessage: { addListener() {} }, onInstalled: { addListener() {} }, getManifest: () => ({ version: manifestVersion }) },
   contextMenus: { removeAll() {}, create() {}, onClicked: { addListener() {} } },
   commands: { onCommand: { addListener() {} } },
   tabs: { sendMessage: async () => {}, query: async () => [] }
@@ -44,7 +49,13 @@ const api = new Function(
     "looksLikeTargetLang, myMemoryTranslate, DEFAULTS, " +
     // Потолок читаем как данные: тест сверяет поведение с числом из кода, а не
     // с числом, которое сам же и придумал.
-    ' API_MAX_BYTES: typeof API_MAX_BYTES === "number" ? API_MAX_BYTES : null };'
+    " API_MAX_BYTES: typeof API_MAX_BYTES === \"number\" ? API_MAX_BYTES : null, " +
+    // Проверка обновлений: функции читаем как данные — отсутствующая функция
+    // должна дать чистый провал проверки, а не уронить харнесс на ReferenceError.
+    ' compareVersions: typeof compareVersions === "function" ? compareVersions : null, ' +
+    ' checkUpdate: typeof checkUpdate === "function" ? checkUpdate : null, ' +
+    ' UPDATE_MANIFEST_URL: typeof UPDATE_MANIFEST_URL === "string" ? UPDATE_MANIFEST_URL : null, ' +
+    ' UPDATE_BUILD_COMMAND: typeof UPDATE_BUILD_COMMAND === "string" ? UPDATE_BUILD_COMMAND : null };'
 )(chrome);
 const {
   translateText,
@@ -56,7 +67,11 @@ const {
   looksLikeTargetLang,
   myMemoryTranslate,
   DEFAULTS,
-  API_MAX_BYTES
+  API_MAX_BYTES,
+  compareVersions,
+  checkUpdate,
+  UPDATE_MANIFEST_URL,
+  UPDATE_BUILD_COMMAND
 } = api;
 
 const results = [];
@@ -127,7 +142,8 @@ function mockWorkerChrome(box, store = {}) {
       // лишь виду адреса.
       id: EXT_ID,
       getURL: (p) => "chrome-extension://" + EXT_ID + "/" + (p || ""),
-      onMessage: { addListener: (fn) => { box.listener = fn; } }, onInstalled: { addListener() {} }
+      onMessage: { addListener: (fn) => { box.listener = fn; } }, onInstalled: { addListener() {} },
+      getManifest: () => ({ version: manifestVersion })
     },
     contextMenus: { removeAll() {}, create() {}, onClicked: { addListener() {} } },
     commands: { onCommand: { addListener() {} } },
@@ -973,6 +989,104 @@ async function main() {
     check("остаток потока 4xx откачан", cancelled === true, "cancel не вызван");
     check("начало тела попало в объяснение", !!err2 && /HTTP 400/.test(err2.message) && /rate limit exceeded/.test(err2.message), err2 && err2.message.slice(0, 140));
     check("потолок ответа API задан", typeof API_MAX_BYTES === "number" && API_MAX_BYTES > 1024 * 1024, "API_MAX_BYTES = " + JSON.stringify(API_MAX_BYTES));
+  }
+
+  console.log("\n=== 28. проверка обновлений распакованной установки ===");
+  {
+    // Зачем эта проверка вообще существует: Chrome запрещает распакованному
+    // расширению перезаписать свои файлы, поэтому «обновить» изнутри нельзя.
+    // Честный ответ — «в main на GitHub версия новее, пересобери пакет вот этой
+    // командой и нажми ⟳». Проверяем то, что проще всего соврать: чем сравниваются
+    // номера, что именно запрашивается по сети и что человек видит, когда GitHub не
+    // ответил.
+    const prevFetch = globalThis.fetch;
+    const prevVersion = manifestVersion;
+    let requested = [];
+    let mode = "newer";
+    globalThis.fetch = async (url) => {
+      requested.push(String(url));
+      if (mode === "network") throw new TypeError("Failed to fetch");
+      if (mode === "html") {
+        return { ok: true, status: 200, headers: { get: () => null }, text: async () => "<html>rate limit</html>", json: async () => ({}) };
+      }
+      if (mode === "missing") return plainRes(404, {});
+      if (mode === "noversion") return jsonRes({ manifest_version: 3, name: "Дзен Рерайтер" });
+      const version = mode === "same" ? manifestVersion : mode === "older" ? "1.9.9" : "9.9.9";
+      return jsonRes({ manifest_version: 3, name: "Дзен Рерайтер", version });
+    };
+
+    try {
+      // ---- сравнение номеров ----
+      check("сравнение версий реализовано", typeof compareVersions === "function");
+      check("младшая версия опознана младшей", compareVersions("2.1.9", "2.2.0") === -1, String(compareVersions("2.1.9", "2.2.0")));
+      // Строковое сравнение здесь как раз и врёт: «2.10» меньше «2.9», и
+      // расширение forever стояло бы в «обновлений нет» на десятом миноре.
+      check("минор сравнивается числом, а не строкой", compareVersions("2.9.0", "2.10.0") === -1, String(compareVersions("2.9.0", "2.10.0")));
+      check("одинаковые версии равны", compareVersions("2.1.1", "2.1.1") === 0, String(compareVersions("2.1.1", "2.1.1")));
+      check("пропущенный разряд — это ноль", compareVersions("2.1", "2.1.0") === 0, String(compareVersions("2.1", "2.1.0")));
+      check("негодная версия не сравнивается", compareVersions("две", "2.1.1") === null && compareVersions("", "2.1.1") === null);
+
+      // ---- три состояния ----
+      manifestVersion = "2.1.1";
+      mode = "newer";
+      requested = [];
+      let up = await checkUpdate();
+      check("обновление названо обоими номерами", up.state === "update" && up.current === "2.1.1" && up.remote === "9.9.9", JSON.stringify(up));
+      check("запрошен манифест main этого репозитория", requested.length === 1 && /raw\.githubusercontent\.com/.test(requested[0]) && /\/main\/src\/extension-src\/manifest\.json$/.test(requested[0]), requested[0]);
+      check("команда пересборки выдана", typeof up.command === "string" && up.command.includes("build-extension.cjs"), up.command);
+      check("адрес берётся из константы, а не сочинён на ходу", UPDATE_MANIFEST_URL === requested[0], JSON.stringify({ const_: UPDATE_MANIFEST_URL, asked: requested[0] }));
+      check("команда берётся из константы", UPDATE_BUILD_COMMAND === up.command, JSON.stringify({ const_: UPDATE_BUILD_COMMAND, given: up.command }));
+
+      mode = "same";
+      up = await checkUpdate();
+      check("равные версии — обновлений нет", up.state === "latest" && up.remote === "2.1.1", JSON.stringify(up));
+
+      // Собранное из рабочей копии часто новее, чем GitHub уже показывает:
+      // человек пересобрал пакет сразу после коммита. Сказать ему «доступно
+      // обновление 1.9.9» — значит предложить откатиться назад.
+      mode = "older";
+      up = await checkUpdate();
+      check("установленная новее — обновление не предлагается", up.state === "ahead", JSON.stringify(up));
+
+      // ---- когда ответа нет, враньё запрещено ----
+      // «Обновлений нет» — самый худший из возможных ответов при сбое: человек
+      // решит, что проверил, и будет пользоваться старым пакетом. Поэтому любой
+      // сбой обязан быть ошибкой, а не состоянием latest.
+      const fails = [
+        ["network", /не дошёл|доступ|сеть|не удал/],
+        ["missing", /HTTP 404/],
+        ["html", /не JSON/],
+        ["noversion", /верси/]
+      ];
+      for (const [m, expected] of fails) {
+        mode = m;
+        let err = null;
+        try {
+          await checkUpdate();
+        } catch (e) {
+          err = e;
+        }
+        check("сбой «" + m + "» назван причиной", !!err && expected.test(err.message), err ? err.message.slice(0, 140) : "checkUpdate не сообщил об ошибке");
+      }
+
+      // ---- ответ фона на сообщение попапа ----
+      const box = {};
+      new Function("chrome", src)(mockWorkerChrome(box));
+      const sendUpdate = (msg) => new Promise((r) => box.listener(msg, {}, r));
+
+      mode = "newer";
+      const okRes = await sendUpdate({ type: "checkUpdate" });
+      check("фон отвечает на checkUpdate состоянием", !!okRes && okRes.ok === true && okRes.state === "update" && typeof okRes.command === "string", JSON.stringify(okRes).slice(0, 200));
+
+      mode = "network";
+      const badRes = await sendUpdate({ type: "checkUpdate" });
+      check("сбой GitHub помечен как ошибка", !!badRes && badRes.ok === false && !!badRes.error, JSON.stringify(badRes).slice(0, 200));
+    } catch (e) {
+      check("проверка обновлений реализована", false, String((e && e.message) || e));
+    } finally {
+      globalThis.fetch = prevFetch;
+      manifestVersion = prevVersion;
+    }
   }
 
   console.log("\n=== ИТОГ ===");
