@@ -1089,6 +1089,106 @@ async function main() {
     }
   }
 
+  console.log("\n=== 29. состав и план обновления файлов ===");
+  {
+    // Зачем этот раздел: обновление пишет в папку установки ровно то, что посчитало
+    // update.js. Ошибка в составе — это «расширение перестало загружаться», и ловить
+    // её пришлось бы в браузере, где нет ни статуса, ни журнала. Поэтому состав,
+    // фильтр путей и порядок запис проверяются здесь, до всякого диалога выбора папки.
+    const updPath = path.join(PATHS.REPO, "src", "extension-src", "update.js");
+    let upd = null;
+    let updErr = "";
+    try {
+      // update.js — классический скрипт, а не модуль: грузим его как тело функции,
+      // тем же приёмом, чем в этом файле грузится background.js. Иначе юнит
+      // проверял бы не ту копию кода, которая попадёт в пакет.
+      upd = new Function(fs.readFileSync(updPath, "utf8") + "\nreturn DzenUpdate;")();
+    } catch (e) {
+      updErr = String((e && e.message) || e);
+    }
+    check(
+      "update.js отдаёт модуль с тремя функциями",
+      !!upd && typeof upd.updateFileSet === "function" &&
+        typeof upd.isSafeRelPath === "function" && typeof upd.planUpdate === "function",
+      updErr
+    );
+
+    if (upd) {
+      // ---- фильтр путей ----
+      // Путь уходит в getFileHandle внутри выбранной папки. Ведущий слэш, «..» и
+      // обратный слэш — способ уйти за её пределы, поэтому принимаются только
+      // относительные пути с прямыми слэшами и без адреса в конце.
+      const goodPaths = ["popup.js", "content.css", "icons/icon48.png", "a/b/c.js"];
+      const badPaths = ["/x", "..", "a/../../b", "C:\\x", "a?b", "a#b", "icons\\icon48.png", "\\\\server\\x", "https://cdn/x.js", "", null, 7];
+      goodPaths.forEach((p) => check("путь «" + p + "» принят", upd.isSafeRelPath(p) === true, String(upd.isSafeRelPath(p))));
+      badPaths.forEach((p) => check("путь «" + String(p) + "» отвергнут", upd.isSafeRelPath(p) === false, String(upd.isSafeRelPath(p))));
+
+      // ---- состав файлов ----
+      // Состав выводится из манифеста и из HTML-страниц, а не из зашитого списка:
+      // иначе обновление не смогло бы принести новый файл.
+      const manifest = JSON.parse(fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "manifest.json"), "utf8"));
+      const popupHtml = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "popup.html"), "utf8");
+      const set = upd.updateFileSet(manifest, { "popup.html": popupHtml });
+      check("состав отсортирован", JSON.stringify(set) === JSON.stringify(set.slice().sort()), set.join(", "));
+      check("в составе нет дублей", new Set(set).size === set.length, set.join(", "));
+      const mustHave = [
+        "manifest.json", "background.js", "content.js", "rewriter.js", "presets.js",
+        "content.css", "popup.html", "popup.js",
+        "icons/icon16.png", "icons/icon48.png", "icons/icon128.png"
+      ];
+      const missing = mustHave.filter((p) => set.indexOf(p) < 0);
+      check("состав называет все файлы пакета", missing.length === 0, missing.join(", "));
+      // popup.js в манифеста нет — он виден только из popup.html вторым уровнем.
+      // options_ui.page совпадает с action.default_popup: дубль не нужен.
+      check("сторона наружу в состав не попала", set.every((p) => upd.isSafeRelPath(p)), set.filter((p) => !upd.isSafeRelPath(p)).join(", "));
+
+      // Сверка с собранной папкой: неверный состав либо не донесёт нужный файл,
+      // либо принесёт README, которого в манифесте нет. Лишнее — так же плохо, как
+      // недостающее: expansion-пакет с чужим файлом Chrome не примет.
+      const onDisk = [];
+      (function walk(dir, rel) {
+        fs.readdirSync(dir, { withFileTypes: true }).forEach((ent) => {
+          const r = rel ? rel + "/" + ent.name : ent.name;
+          if (ent.isDirectory()) walk(path.join(dir, ent.name), r);
+          else onDisk.push(r);
+        });
+      })(PATHS.EXT, "");
+      const wantList = onDisk.filter((p) => p !== "README.md").sort();
+      check(
+        "состав равен собранной папке без README",
+        JSON.stringify(set.slice().sort()) === JSON.stringify(wantList),
+        JSON.stringify({ посчитано: set.slice().sort(), наДиске: wantList })
+      );
+
+      // ---- журнал и его ключ ----
+      check(
+        "имя манифеста и ключ журнала зафиксированы в модуле",
+        upd.MANIFEST_NAME === "manifest.json" && upd.INTENT_KEY === "dzrUpdateIntent",
+        JSON.stringify({ manifest: upd.MANIFEST_NAME, intent: upd.INTENT_KEY })
+      );
+
+      // ---- план записи ----
+      const bytes = (s) => new TextEncoder().encode(s);
+      const fileSet = ["a.js", "b.css", "manifest.json"];
+      const local = { "a.js": bytes("одинаково"), "b.css": bytes("старое"), "manifest.json": bytes("2.2.0") };
+      const remote = { "a.js": bytes("одинаково"), "b.css": bytes("новое"), "manifest.json": bytes("2.3.0") };
+      const plan = upd.planUpdate(fileSet, local, remote);
+      // Совпавший файл не пишется: повтор клика обязан дописывать ровно то, что
+      // не дописалось, а не перемалывать байты, уже лежащие на диске.
+      check("совпавший файл в план не попал", plan.indexOf("a.js") < 0, plan.join(", "));
+      check("изменённые названы оба", JSON.stringify(plan.slice().sort()) === JSON.stringify(["b.css", "manifest.json"]), plan.join(", "));
+      check("manifest.json пишется последним", plan[plan.length - 1] === "manifest.json", plan.join(", "));
+      check("без отличий план пуст", upd.planUpdate(fileSet, local, local).length === 0, JSON.stringify(upd.planUpdate(fileSet, local, local)));
+      // Файла нет локально — он новый, и «пусто» здесь не значит «совпало».
+      const planNew = upd.planUpdate(["new.js", "manifest.json"], { "manifest.json": bytes("2.2.0") }, { "new.js": bytes("тело"), "manifest.json": bytes("2.3.0") });
+      check("отсутствующий локально файл пишется", planNew.indexOf("new.js") >= 0 && planNew[planNew.length - 1] === "manifest.json", planNew.join(", "));
+      // Разница в один байт в конце тела — это тоже разница: сверка по длине
+      // пропустила бы обрезанный файл.
+      check("сверка идёт побайтно, а не по длине",
+        upd.planUpdate(["x.js"], { "x.js": bytes("12345") }, { "x.js": bytes("12346") }).length === 1);
+    }
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);

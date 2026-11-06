@@ -28,6 +28,7 @@ const FILES = [
   "content.css",
   "popup.html",
   "popup.js",
+  "update.js",
   "README.md"
 ];
 const ICONS = ["icons/icon16.png", "icons/icon48.png", "icons/icon128.png"];

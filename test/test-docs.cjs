@@ -681,6 +681,32 @@ const grab = (src, name) => {
   check("попап: кнопка проверки обновлений есть", /id="update-check"/.test(popupHtml));
 }
 
+console.log("\n=== состав обновления против списка сборки ===\n");
+{
+  // Сторожа нужна из-за парной правки: новый файл добавляют и в popup.html, и в
+  // FILES сборщика. Забыт FILES — файл не попадёт в пакет, и обновление принесёт
+  // расширение, которое не загружается. Молча это не заметит никто: код-то рабочий.
+  const builderSrc = fs.readFileSync(path.join(paths.REPO, "tools", "build-extension.cjs"), "utf8");
+  let shipped = [];
+  try {
+    shipped = constArray(builderSrc, "FILES").concat(constArray(builderSrc, "ICONS"));
+  } catch (e) {
+    check("сборщик называет список файлов", false, String((e && e.message) || e));
+  }
+  const updSrc = fs.readFileSync(path.join(paths.REPO, "src", "extension-src", "update.js"), "utf8");
+  const upd = new Function(updSrc + "\nreturn DzenUpdate;")();
+  const need = upd.updateFileSet(manifest, { "popup.html": popupHtml });
+  check("обновление просит ненулевой состав", need.length > 0, need.join(", "));
+  const absent = need.filter((p) => shipped.indexOf(p) < 0);
+  check("каждый нужный файл в списке сборки", absent.length === 0, absent.join(", "));
+  const notThere = need.filter((p) => !fs.existsSync(path.join(EXT, p)));
+  check("каждый нужный файл лежит в собранной папке", notThere.length === 0, notThere.join(", "));
+  // Обратная связь: сборщик не должен носить файл, о котором обновление не знает,
+  // иначе в пакете заведётся мёртвый груз и «обновить» его никогда не принесёт.
+  const extra = shipped.filter((p) => p !== "README.md" && need.indexOf(p) < 0);
+  check("сборщик не носит лишнего", extra.length === 0, extra.join(", "));
+}
+
 console.log("\n=== ИТОГ ===");
 console.log("всего проверок: " + checks + ", провалов: " + fails);
 process.exit(fails ? 1 : 0);
