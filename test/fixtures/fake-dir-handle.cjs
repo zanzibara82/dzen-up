@@ -112,7 +112,11 @@
           calls.push("remove:" + rel);
           return Promise.resolve();
         },
+        // Обход папки. `failOn: "entries"` роняет его так, как это делает
+        // настоящий Chrome, у которого папку удалили с диска или перенесли:
+        // рукоять ещё жива, а список файлов уже нет.
         entries: function () {
+          if (opts.failOn === "entries") throw err("NotFoundError", prefix || ".");
           var names = {};
           Object.keys(files).forEach(function (rel) {
             if (prefix && rel.indexOf(prefix + "/") !== 0) return;

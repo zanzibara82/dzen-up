@@ -88,6 +88,7 @@ async function main() {
     const { targetId } = await c.send("Target.createTarget", { url: `chrome-extension://${extId}/popup.html` });
     const { sessionId } = await c.send("Target.attachToTarget", { targetId, flatten: true });
     await c.send("Runtime.enable", {}, sessionId);
+    await c.send("Page.enable", {}, sessionId);
     const evalJs = async (expression) => {
       const r = await c.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, sessionId);
       if (r.exceptionDetails) throw new Error(JSON.stringify(r.exceptionDetails).slice(0, 500));
@@ -603,6 +604,144 @@ async function main() {
     check("без доступа запрос фону не уходит",
       updRefused.msgs.length === 0 && updRefused.copyHidden === true, JSON.stringify(updRefused));
 
+    // ---- выбор папки и рукоять (автообновление) ----------------------------
+    // «Обновить сейчас» пишет файлы в папку установки, и этот шаг невозможно
+    // проверить без подставной рукояти: диалог поднимает только живой жест.
+    // Проверки ниже отвечают на три вопроса: диалог не поднимается вторично,
+    // запрос права происходит синхронно с кликом (иначе Chrome его отклонит),
+    // и чужая папка не сохраняется как своя.
+    {
+      try {
+          // Один прогон: фикстуры и подставной диалог ставятся ДО загрузки попапа
+          // (Page.addScriptToEvaluateOnNewDocument), потому что попап читает рукоять
+          // при открытии и GEST обязан быть синхронным с кликом. `seed` закладывает
+          // рукоять в память-IndexedDB до чтения; `ask` — что отдаст
+          // requestPermission; `picker` — живой ли диалог. После reload клик по
+          // «Обновить сейчас» и сбор исхода.
+          const pickCase = async (o) => {
+            const fix = ["fake-dir-handle.cjs", "memory-idb.cjs"]
+              .map((f) => fs.readFileSync(path.join(__dirname, "fixtures", f), "utf8")).join("\n;\n");
+            const setup = `(function () {
+              var root = makeFakeRoot(${JSON.stringify(o.files || {})}, { permission: ${o.query === false ? '"denied"' : '"granted"'}, request: ${o.ask === false ? "false" : "true"}${o.failOn ? ", failOn: " + JSON.stringify(o.failOn) : ""} });
+              var mem = globalThis.memoryIdb;
+              var db = mem.open('dzr-update').__db;
+              db.createObjectStore('handles');
+              ${o.seed ? "mem.seed(db, root);" : ""}
+              window.__pick = { root: root, db: db, journal: [], sent: [], gestureSync: null, afterClick: false };
+              // indexedDB — аксессор только с геттером на прототипе Window:
+              // голое присваивание в нестрогом режиме молча теряется, и попап
+              // писал бы в настоящую базу, где рукоять не клонируется.
+              Object.defineProperty(window, 'indexedDB', { configurable: true, value: { open: function (name) { return mem.open(name); } } });
+              var realReq = root.requestPermission.bind(root);
+              root.requestPermission = function (d) {
+                if (window.__pick.gestureSync === null) window.__pick.gestureSync = !window.__pick.afterClick;
+                return realReq(d);
+              };
+              window.showDirectoryPicker = function (opts) {
+                window.__pick.journal.push('picker:' + ((opts && opts.mode) || '?'));
+                if (window.__pick.gestureSync === null) window.__pick.gestureSync = !window.__pick.afterClick;
+                return ${o.picker === false ? "Promise.reject(Object.assign(new Error('user cancelled'), { name: 'AbortError' }))" : "Promise.resolve(root)"};
+              };
+              var realSend = chrome.runtime.sendMessage;
+              chrome.runtime.sendMessage = function (msg, cb) {
+                if (msg && msg.type === 'updatePackage') { window.__pick.sent.push(msg.type); cb(${JSON.stringify(o.pkg || { ok: true, current: '2.2.0', remote: '2.3.0', files: [] })}); return; }
+                return realSend.apply(chrome.runtime, arguments);
+              };
+            })();`;
+            const { identifier } = await c.send("Page.addScriptToEvaluateOnNewDocument", { source: fix + "\n;\n" + setup }, sessionId);
+            try {
+              await c.send("Page.reload", {}, sessionId);
+              for (let i = 0; i < 50; i++) {
+                if (await evalJs(`document.documentElement?.getAttribute('data-dzr-popup') === 'ready' && !!document.getElementById('update-apply') && !!window.__pick`)) break;
+                await sleep(150);
+              }
+              return await evalJs(`(async () => {
+                var p = window.__pick;
+                p.afterClick = false; p.gestureSync = null; p.journal = []; p.sent = [];
+                // Микрозадача, поставленная до клика, отмечает «стек размотался»:
+                // жест, вызванный раньше неё, синхронный (до первого await).
+                Promise.resolve().then(function () { p.afterClick = true; });
+                var btn = document.getElementById('update-apply');
+                btn.hidden = false;
+                btn.click();
+                await new Promise((r) => setTimeout(r, 800));
+                var st = document.getElementById('update-status');
+                return {
+                  status: st.textContent, cls: st.className,
+                  journal: p.journal, sync: p.gestureSync, sent: p.sent,
+                  saved: !!p.db.__store['install-dir'], sameHandle: p.db.__store['install-dir'] === p.root
+                };
+              })()`);
+            } finally {
+              await c.send("Page.removeScriptToEvaluateOnNewDocument", { identifier }, sessionId);
+            }
+          };
+          // Имя берём из собранного манифеста: попап сравнивает выбор с
+          // chrome.runtime.getManifest().name, и захардкоженное имя разъехалось
+          // бы с реальным при первом же переименовании расширения.
+          const realName = JSON.parse(fs.readFileSync(path.join(SRC_EXT, "manifest.json"), "utf8")).name;
+          const goodManifest = { "manifest.json": JSON.stringify({ manifest_version: 3, name: realName, version: "2.2.0" }) };
+
+          const noHandle = await pickCase({ files: goodManifest, picker: true });
+          console.log("выбор без рукояти: %j", noHandle);
+          check("без сохранённой рукояти диалог поднимается",
+            noHandle.journal.join() === "picker:readwrite", JSON.stringify(noHandle.journal));
+          check("жест делается синхронно с кликом, до первого ожидания",
+            noHandle.sync === true, JSON.stringify(noHandle.sync));
+          check("после выбора рукоять сохранена в IndexedDB",
+            noHandle.saved === true && noHandle.sameHandle === true, JSON.stringify({ saved: noHandle.saved, same: noHandle.sameHandle }));
+
+          const withHandle = await pickCase({ files: goodManifest, seed: true, picker: true });
+          console.log("выбор с рукоятью: %j", withHandle);
+          check("рукоять на месте — диалог не поднимается",
+            withHandle.journal.join() === "", JSON.stringify(withHandle.journal));
+          check("пакет обновления запрошен у фона",
+            withHandle.sent.join() === "updatePackage", JSON.stringify(withHandle.sent));
+
+          const refused = await pickCase({ files: goodManifest, seed: true, ask: false });
+          console.log("отказ в праве: %j", refused);
+          check("отказ в праве назван причиной, а не успехом",
+            /err/.test(refused.cls) && /доступ|прав/i.test(refused.status) && !/обновлено/i.test(refused.status),
+            JSON.stringify(refused));
+          check("при отказе в фон не ходим", refused.sent.length === 0, JSON.stringify(refused.sent));
+
+          const cancelled = await pickCase({ files: goodManifest, picker: false });
+          console.log("отмена диалога: %j", cancelled);
+          check("отмена диалога — статус без обещания обновления",
+            !/обновлено/i.test(cancelled.status) && /выбор|папк/i.test(cancelled.status),
+            JSON.stringify(cancelled));
+
+          const foreign = await pickCase({
+            files: { "manifest.json": JSON.stringify({ manifest_version: 3, name: "Какое-то другое расширение", version: "1.0.0" }) },
+            seed: true
+          });
+          console.log("чужая папка: %j", foreign);
+          check("чужая папка названа словами «не то расширение»",
+            /err/.test(foreign.cls) && /не то расширение/.test(foreign.status), JSON.stringify(foreign));
+          check("рукоять чужой папки не сохраняется",
+            foreign.saved === false, JSON.stringify(foreign.saved));
+
+          const notDir = await pickCase({ files: { "readme.txt": "просто файл" }, seed: true });
+          console.log("папка без манифеста: %j", notDir);
+          check("папка без манифеста названа причиной",
+            /err/.test(notDir.cls) && /манифест/i.test(notDir.status) && notDir.sent.length === 0,
+            JSON.stringify(notDir));
+
+          const moved = await pickCase({ files: goodManifest, seed: true, failOn: "entries" });
+          console.log("папку перенесли: %j", moved);
+          check("перенесённую папку не выдают за отсутствующий файл",
+            /err/.test(moved.cls) && /на месте нет/.test(moved.status) && moved.saved === false,
+            JSON.stringify(moved));
+
+          const named = await pickCase({ files: goodManifest, seed: true });
+          check("статус называет папку, куда пишем",
+            /dzen-rewriter|папк/i.test(named.status) && /2\.2\.0/.test(named.status) && /2\.3\.0/.test(named.status),
+            JSON.stringify(named.status));
+      } catch (e) {
+        check("выбор папки не роняет набор", false, String((e && e.message) || e));
+      }
+    }
+
     const savedLinks = await evalJs(`(async () => {
       document.getElementById('linkSites').value = 'auto-dom24.ru\\n# мой второй канал\\nhttps://example.com/';
       document.getElementById('linkChannels').value = 'https://dzen.ru/auto-dom24.ru\\n# второй\\nhttps://dzen.ru/id/123';
@@ -655,7 +794,9 @@ async function main() {
     await evalJs(`document.documentElement.removeAttribute('data-dzr-popup')`);
     await c.send('Page.reload', {}, sessionId);
     for (let i = 0; i < 40; i++) {
-      if (await evalJs(`document.documentElement.getAttribute('data-dzr-popup') === 'ready'`)) break;
+      // Сразу после reload документ ещё не построен: documentElement бывает null,
+      // и голый getAttribute ронял весь набор. Ждём, пока он появится.
+      if (await evalJs(`document.documentElement?.getAttribute('data-dzr-popup') === 'ready'`)) break;
       await sleep(150);
     }
     const synonymLoaded = await evalJs(`document.getElementById('linkSynonyms')?.value`);

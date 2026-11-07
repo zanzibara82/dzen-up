@@ -427,14 +427,16 @@
 
       <div class="row" style="margin-top:14px; align-items:center; gap:10px">
         <button id="update-check" type="button">Проверить обновления</button>
+        <button id="update-apply" type="button" hidden>Обновить сейчас</button>
         <button id="update-copy" type="button" class="ghost" hidden>Скопировать команду обновления</button>
       </div>
       <div id="update-status" class="hint" style="margin-top:6px"></div>
       <p class="hint" style="margin: 6px 0 0">
-        Обновления смотрятся в ветке <b>main</b> на GitHub. Расширение, загруженное
-        как распакованное, не может перезаписать свои файлы, поэтому кнопка только
-        сообщает о новой версии и отдаёт команду пересборки: выполните её в папке
-        с исходниками и нажмите ⟳ на странице <b>chrome://extensions</b>.
+        Обновления смотрятся в ветке <b>main</b> на GitHub. «Обновить сейчас» записывает
+        новые файлы прямо в папку установки: один раз выберите её в системном диалоге,
+        и браузер перечитает обновление сам. «Скопировать команду обновления» остаётся
+        запасным путём: выполните команду в папке с исходниками и нажмите ⟳ на странице
+        <b>chrome://extensions</b>.
       </p>
     </div>
 

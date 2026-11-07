@@ -628,6 +628,7 @@
   function hideUpdateCommand() {
     updateCommand = "";
     $("update-copy").hidden = true;
+    $("update-apply").hidden = true;
   }
 
   $("update-check").addEventListener("click", async function () {
@@ -654,6 +655,7 @@
       var cur = String(res.current || "?");
       var remote = String(res.remote || "?");
       if (res.state === "update") {
+        $("update-apply").hidden = false;
         updateCommand = String(res.command || "");
         $("update-copy").hidden = !updateCommand;
         if (updateCommand) {
@@ -700,6 +702,103 @@
         setUpdateStatus("⚠️ Буфер не принял текст. Скопируйте руками: " + updateCommand, "err");
       }
     );
+  });
+
+  // ---- рукоять папки установки и автообновление ----------------------------
+  // Рукоять FileSystemDirectoryHandle не переживает chrome.storage: structured
+  // clone не переносит её методы. Единственное место, где она хранится между
+  // открытиями попапа, — IndexedDB страницы расширения. Имена базы, хранилища и
+  // ключа живут в update.js: их сверяют и юнит-набор, и браузерный.
+  function openUpdateDb() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(DzenUpdate.IDB_NAME, 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains(DzenUpdate.IDB_STORE)) db.createObjectStore(DzenUpdate.IDB_STORE);
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error || new Error("не открылась IndexedDB")); };
+    });
+  }
+
+  function withUpdateStore(mode, fn) {
+    return openUpdateDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(DzenUpdate.IDB_STORE, mode);
+        var req = fn(tx.objectStore(DzenUpdate.IDB_STORE));
+        tx.oncomplete = function () { db.close(); resolve(req ? req.result : undefined); };
+        tx.onerror = function () { db.close(); reject(tx.error || new Error("IndexedDB не приняла запись")); };
+      });
+    });
+  }
+
+  function saveDirHandle(handle) {
+    return withUpdateStore("readwrite", function (s) { return s.put(handle, DzenUpdate.IDB_KEY); });
+  }
+  function loadDirHandle() {
+    return withUpdateStore("readonly", function (s) { return s.get(DzenUpdate.IDB_KEY); });
+  }
+  function forgetDirHandle() {
+    return withUpdateStore("readwrite", function (s) { return s.delete(DzenUpdate.IDB_KEY); });
+  }
+
+  // Рукоять читается при открытии попапа, а не в клик: право на папку Chrome
+  // принимает только синхронно с жестом, и к моменту ответа IndexedDB жест уже
+  // потрачен. Поэтому решение «диалог или запрос права» принимается по кэшу.
+  var dirHandle = null;
+  loadDirHandle().then(function (h) { dirHandle = h || null; }).catch(function () { dirHandle = null; });
+
+  // Папка оказалась чужой или перенесённой — рукоять забываем, чтобы следующее
+  // открытие не предлагало писать не туда.
+  function rejectInstallDir(reason) {
+    dirHandle = null;
+    forgetDirHandle().catch(function () {});
+    setUpdateStatus("❌ " + reason + " — ни один файл не тронут. Выберите папку этого расширения заново.", "err");
+  }
+
+  $("update-apply").addEventListener("click", function () {
+    // Жест — синхронно, до первого await: иначе Chrome отклонит и диалог, и запрос
+    // права. Есть сохранённая рукоять — просим право у неё; нет — поднимаем диалог.
+    var gesture = dirHandle
+      ? dirHandle.requestPermission({ mode: "readwrite" })
+      : window.showDirectoryPicker({ mode: "readwrite" });
+
+    Promise.resolve(gesture).then(async function (result) {
+      // requestPermission отдаёт строку ("granted"/"denied"), диалог — рукоять.
+      if (dirHandle) {
+        if (result !== "granted") {
+          setUpdateStatus("⚠️ Нет права на запись в папку «" + dirHandle.name + "» — обновление не применено.", "err");
+          return;
+        }
+      } else {
+        dirHandle = result;
+      }
+      var root = dirHandle;
+      var problem = await DzenUpdate.installDirProblem(root, chrome.runtime.getManifest().name);
+      if (problem) {
+        var human = {
+          "папки на месте нет": "Папки с исходниками на месте нет",
+          "не читается": "В папке «" + root.name + "» не читается манифест",
+          "не манифест третьей версии": "В папке «" + root.name + "» не манифест третьей версии",
+          "не то расширение": "В папке «" + root.name + "» не то расширение"
+        }[problem] || problem;
+        rejectInstallDir(human);
+        return;
+      }
+      await saveDirHandle(root);
+      var pkg = await send({ type: "updatePackage" });
+      if (!pkg || !pkg.ok) {
+        setUpdateStatus("❌ " + ((pkg && pkg.error) || "фон не ответил") + " — папка «" + root.name + "» не тронута.", "err");
+        return;
+      }
+      setUpdateStatus("📁 Папка «" + root.name + "»: " + pkg.current + " → " + pkg.remote + ". Готовлю запись…");
+    }).catch(function (e) {
+      if (e && e.name === "AbortError") {
+        setUpdateStatus("⚠️ Выбор папки не сделан — обновление не применено.", "err");
+        return;
+      }
+      setUpdateStatus("❌ Не удалось выбрать папку: " + ((e && e.message) || e), "err");
+    });
   });
 
   refreshCacheInfo();
