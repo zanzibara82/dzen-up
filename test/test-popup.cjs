@@ -644,6 +644,17 @@ async function main() {
               db.createObjectStore('handles');
               ${o.seed ? "mem.seed(db, root);" : ""}
               window.__pick = { root: root, db: db, journal: [], sent: [], gestureSync: null, afterClick: false, reloads: 0 };
+              // Журнал изолируется между кейсами: chrome.storage переживает reload,
+              // и чужой журнал прошлого кейса поднял бы кнопки восстановления.
+              chrome.storage.local.remove('dzrUpdateIntent');
+              ${o.intent ? "chrome.storage.local.set({ dzrUpdateIntent: " + JSON.stringify(o.intent) + " });" : ""}
+              // Версию в памяти подменяем для исходов A/B: после настоящего reload
+              // она стала бы новой, а исход B — это «диск новый, память старый».
+              var realGetManifest = chrome.runtime.getManifest.bind(chrome.runtime);
+              chrome.runtime.getManifest = function () {
+                var m = realGetManifest();
+                return Object.assign({}, m, { version: ${JSON.stringify(o.manifestVersion || "")} || m.version });
+              };
               // indexedDB — аксессор только с геттером на прототипе Window:
               // голое присваивание в нестрогом режиме молча теряется, и попап
               // писал бы в настоящую базу, где рукоять не клонируется.
@@ -689,9 +700,10 @@ async function main() {
                 // Микрозадача, поставленная до клика, отмечает «стек размотался»:
                 // жест, вызванный раньше неё, синхронный (до первого await).
                 Promise.resolve().then(function () { p.afterClick = true; });
-                var btn = document.getElementById('update-apply');
-                btn.hidden = false;
-                btn.click();
+                var action = ${JSON.stringify(o.action || "apply")};
+                if (action === 'apply') { var btn = document.getElementById('update-apply'); btn.hidden = false; btn.click(); }
+                else if (action === 'resume') { document.getElementById('update-resume').click(); }
+                else if (action === 'restore') { document.getElementById('update-restore').click(); }
                 await new Promise((r) => setTimeout(r, 1200));
                 var st = document.getElementById('update-status');
                 var files = {};
@@ -703,7 +715,10 @@ async function main() {
                   journal: p.journal, sync: p.gestureSync, sent: p.sent,
                   saved: !!p.db.__store['install-dir'], sameHandle: p.db.__store['install-dir'] === p.root,
                   reloads: p.reloads, files: files, calls: p.root.__calls.slice(),
-                  intent: intentRes.dzrUpdateIntent || null, sentinel: sentinelRes.dzrSentinel
+                  intent: intentRes.dzrUpdateIntent || null, sentinel: sentinelRes.dzrSentinel,
+                  resumeHidden: document.getElementById('update-resume').hidden,
+                  restoreHidden: document.getElementById('update-restore').hidden,
+                  restoreLabel: document.getElementById('update-restore').textContent
                 };
               })()`);
             } finally {
@@ -810,6 +825,69 @@ async function main() {
             !!rollback.intent && rollback.intent.aborted === true && !rollback.intent.written,
             JSON.stringify(rollback.intent));
           check("при откате расширение не перезагружается", rollback.reloads === 0, JSON.stringify(rollback.reloads));
+
+          // ---- шесть исходов: журнал при открытии попапа ---------------------
+          // Журнал переживает смерть попапа, поэтому следующее открытие обязано
+          // понять, чем кончилось прошлое обновление, и дать выход в один клик.
+          const outcomeA = await pickCase({
+            files: goodManifest, seed: true, action: "inspect", manifestVersion: "2.3.0",
+            intent: { from: "2.2.0", to: "2.3.0", at: 1, written: true }
+          });
+          console.log("исход A (перечитал): %j", outcomeA);
+          check("исход A: «Обновлено до» и журнал снят",
+            /Обновлено до 2\.3\.0/.test(outcomeA.status) && outcomeA.intent === null, JSON.stringify({ status: outcomeA.status, intent: outcomeA.intent }));
+          check("исход A: кнопок восстановления нет",
+            outcomeA.resumeHidden === true && outcomeA.restoreHidden === true, JSON.stringify({ resume: outcomeA.resumeHidden, restore: outcomeA.restoreHidden }));
+
+          const outcomeB = await pickCase({
+            files: goodManifest, seed: true, action: "inspect", manifestVersion: "2.2.0",
+            intent: { from: "2.2.0", to: "2.3.0", at: 1, written: true }
+          });
+          console.log("исход B (не перечитал): %j", outcomeB);
+          check("исход B: файлы новые, браузер не перечитал — подсказка про ⟳",
+            /не перечитал/.test(outcomeB.status) && /⟳/.test(outcomeB.status) && /2\.3\.0/.test(outcomeB.status), outcomeB.status);
+          check("исход B: журнал остаётся до перечитки, кнопок нет",
+            !!outcomeB.intent && outcomeB.intent.written === true && outcomeB.resumeHidden === true, JSON.stringify(outcomeB.intent));
+
+          const outcomeD = await pickCase({
+            files: goodManifest, seed: true, action: "inspect",
+            intent: { from: "2.2.0", to: "2.3.0", at: 1 }
+          });
+          console.log("исход D (не завершено): %j", outcomeD);
+          check("исход D: статус называет диск и ожидаемую версию",
+            /не завершено/.test(outcomeD.status) && /2\.2\.0/.test(outcomeD.status) && /2\.3\.0/.test(outcomeD.status), outcomeD.status);
+          check("исход D: показаны «Дописать» и «Вернуть 2.2.0»",
+            outcomeD.resumeHidden === false && outcomeD.restoreHidden === false && outcomeD.restoreLabel === "Вернуть 2.2.0",
+            JSON.stringify({ resume: outcomeD.resumeHidden, restore: outcomeD.restoreHidden, label: outcomeD.restoreLabel }));
+
+          const resumed = await pickCase({
+            files: goodManifest, seed: true, action: "resume",
+            intent: { from: "2.2.0", to: "2.3.0", at: 1 }
+          });
+          console.log("дописать: %j", resumed);
+          check("«Дописать» дописывает пакет и перезагружает",
+            /2\.3\.0/.test(resumed.files["manifest.json"] || "") && resumed.intent && resumed.intent.written === true && resumed.reloads === 1,
+            JSON.stringify({ manifest: resumed.files["manifest.json"], intent: resumed.intent, reloads: resumed.reloads }));
+          check("«Дописать» запрашивает право синхронно с кликом", resumed.sync === true, JSON.stringify(resumed.sync));
+
+          const restored = await pickCase({
+            files: {
+              "manifest.json": JSON.stringify({ manifest_version: 3, name: realName, version: "2.3.0" }),
+              "popup.js": "новый попап",
+              ".dzr-backup/2.2.0/manifest.json": goodManifest["manifest.json"],
+              ".dzr-backup/2.2.0/popup.js": "старый попап"
+            },
+            seed: true, action: "restore",
+            intent: { from: "2.2.0", to: "2.3.0", at: 1 }
+          });
+          console.log("вернуть: %j", restored);
+          check("«Вернуть» возвращает файлы из резерва на диске",
+            /2\.2\.0/.test(restored.files["manifest.json"] || "") && restored.files["popup.js"] === "старый попап",
+            JSON.stringify({ manifest: restored.files["manifest.json"], popup: restored.files["popup.js"] }));
+          check("«Вернуть» снимает журнал и прячет кнопки",
+            restored.intent === null && restored.restoreHidden === true && restored.resumeHidden === true,
+            JSON.stringify({ intent: restored.intent, restore: restored.restoreHidden }));
+          check("«Вернуть» называет возвращённую версию", /возвращена версия 2\.2\.0/i.test(restored.status), restored.status);
       } catch (e) {
         check("выбор папки не роняет набор", false, String((e && e.message) || e));
       }

@@ -1489,6 +1489,25 @@ async function main() {
       check("откат после создания нового файла бросает", newRolled, String(newRolled));
       check("новый файл при откате удалён с диска", nRoot.__text("new.js") === null, String(nRoot.__text("new.js")));
       check("манифест остался прежним при откате нового файла", nRoot.__text("manifest.json") === "2.2.0", nRoot.__text("manifest.json"));
+
+      // ---- restoreFromBackup: «Вернуть <версию>» из резерва на диске ----
+      // Резерв переживает убийство браузера, поэтому возврат читает именно диск,
+      // а не память. Восстанавливаются все файлы резерва, манифест в их числе.
+      const restRoot = makeFakeRoot({
+        "manifest.json": "2.3.0",
+        "popup.js": "новый попап",
+        ".dzr-backup/2.2.0/manifest.json": "2.2.0",
+        ".dzr-backup/2.2.0/popup.js": "старый попап"
+      });
+      const restored = await upd.restoreFromBackup(restRoot, "2.2.0");
+      check("restoreFromBackup возвращает список восстановленных файлов",
+        JSON.stringify(restored.slice().sort()) === JSON.stringify(["manifest.json", "popup.js"]), JSON.stringify(restored));
+      check("возврат кладёт старые байты из резерва",
+        restRoot.__text("manifest.json") === "2.2.0" && restRoot.__text("popup.js") === "старый попап",
+        JSON.stringify({ m: restRoot.__text("manifest.json"), p: restRoot.__text("popup.js") }));
+      const emptyRestore = await upd.restoreFromBackup(makeFakeRoot({ "manifest.json": "2.2.0" }), "9.9.9");
+      check("без резерва возврат не трогает файлы и не бросает",
+        emptyRestore.length === 0, JSON.stringify(emptyRestore));
     } catch (e) {
       check("запись пакета не роняет набор", false, String((e && e.message) || e));
     }

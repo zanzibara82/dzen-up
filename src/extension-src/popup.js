@@ -746,7 +746,9 @@
   // принимает только синхронно с жестом, и к моменту ответа IndexedDB жест уже
   // потрачен. Поэтому решение «диалог или запрос права» принимается по кэшу.
   var dirHandle = null;
-  loadDirHandle().then(function (h) { dirHandle = h || null; }).catch(function () { dirHandle = null; });
+  loadDirHandle()
+    .then(function (h) { dirHandle = h || null; return inspectUpdateIntent(); })
+    .catch(function () { dirHandle = null; });
 
   // Папка оказалась чужой или перенесённой — рукоять забываем, чтобы следующее
   // открытие не предлагало писать не туда.
@@ -798,7 +800,10 @@
     chrome.runtime.reload();
   }
 
-  $("update-apply").addEventListener("click", function () {
+  // «Обновить сейчас» и «Дописать» делают одно и то же: жест синхронно с кликом,
+  // проверка папки и запись пакета. План идемпотентен — повтор допишет ровно то,
+  // что не дописалось, поэтому отдельная логика продолжения не нужна.
+  function beginUpdate() {
     // Жест — синхронно, до первого await: иначе Chrome отклонит и диалог, и запрос
     // права. Есть сохранённая рукоять — просим право у неё; нет — поднимаем диалог.
     var gesture = dirHandle
@@ -833,6 +838,7 @@
         setUpdateStatus("❌ " + ((pkg && pkg.error) || "фон не ответил") + " — папка «" + root.name + "» не тронута.", "err");
         return;
       }
+      hideRecovery();
       await runUpdate(root, pkg);
     }).catch(function (e) {
       if (e && e.name === "AbortError") {
@@ -841,7 +847,89 @@
       }
       setUpdateStatus("❌ Не удалось выбрать папку: " + ((e && e.message) || e), "err");
     });
+  }
+  $("update-apply").addEventListener("click", beginUpdate);
+  $("update-resume").addEventListener("click", beginUpdate);
+
+  // ---- восстановление незавершённого обновления ----------------------------
+  var pendingIntent = null;
+
+  function hideRecovery() {
+    pendingIntent = null;
+    $("update-resume").hidden = true;
+    $("update-restore").hidden = true;
+  }
+
+  // «Вернуть <версию>»: право синхронно с кликом, затем файлы из резерва на диске.
+  $("update-restore").addEventListener("click", function () {
+    var intent = pendingIntent;
+    if (!intent) return;
+    var gesture = dirHandle
+      ? dirHandle.requestPermission({ mode: "readwrite" })
+      : window.showDirectoryPicker({ mode: "readwrite" });
+    Promise.resolve(gesture).then(async function (result) {
+      if (dirHandle) {
+        if (result !== "granted") {
+          setUpdateStatus("⚠️ Нет права на запись в папку «" + dirHandle.name + "» — возврат не выполнен.", "err");
+          return;
+        }
+      } else {
+        dirHandle = result;
+      }
+      var root = dirHandle;
+      var restored = await DzenUpdate.restoreFromBackup(root, intent.from);
+      await chrome.storage.local.remove(DzenUpdate.INTENT_KEY);
+      hideRecovery();
+      setUpdateStatus("↩️ Папка «" + root.name + "»: возвращена версия " + intent.from + " (файлов из резерва: " + restored.length + ").");
+    }).catch(function (e) {
+      if (e && e.name === "AbortError") {
+        setUpdateStatus("⚠️ Выбор папки не сделан — возврат не выполнен.", "err");
+        return;
+      }
+      setUpdateStatus("❌ Не удалось вернуть версию: " + ((e && e.message) || e), "err");
+    });
   });
+
+  /**
+   * Разбор журнала при открытии попапа. Журнал переживает смерть попапа, поэтому
+   * любое открытие, заставшее его, знает: прошлое обновление не завершилось.
+   * written + новая версия в памяти — исход A (снять журнал); written при старой
+   * памяти — исход B (файлы новые, браузер не перечитал, подсказать ⟳); без
+   * written — исход D (две кнопки: дописать или вернуть).
+   */
+  async function inspectUpdateIntent() {
+    var got = await chrome.storage.local.get(DzenUpdate.INTENT_KEY);
+    var intent = got[DzenUpdate.INTENT_KEY];
+    if (!intent || !intent.to) return;
+    var memoryVersion = String(chrome.runtime.getManifest().version || "");
+    if (intent.written) {
+      if (memoryVersion === String(intent.to)) {
+        await chrome.storage.local.remove(DzenUpdate.INTENT_KEY);
+        setUpdateStatus("✅ Обновлено до " + intent.to + ".");
+      } else {
+        setUpdateStatus("⚠️ Файлы в папке обновлены до " + intent.to + ", но браузер их не перечитал — нажмите ⟳ на странице chrome://extensions.");
+      }
+      return;
+    }
+    pendingIntent = intent;
+    $("update-resume").hidden = false;
+    $("update-restore").hidden = false;
+    $("update-restore").textContent = "Вернуть " + intent.from;
+    var diskVersion = String(intent.from);
+    if (dirHandle) {
+      try {
+        var perm = await dirHandle.queryPermission({ mode: "readwrite" });
+        if (perm === "granted") {
+          var bytes = await DzenUpdate.readRel(dirHandle, DzenUpdate.MANIFEST_NAME);
+          if (bytes && bytes.length) {
+            var data = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+            if (data && data.version) diskVersion = String(data.version);
+          }
+        }
+      } catch (e) {}
+    }
+    setUpdateStatus("⚠️ Обновление не завершено: на диске " + diskVersion + ", ждали " + intent.to + ". Дописать или вернуть " + intent.from + "?");
+  }
 
   refreshCacheInfo();
 

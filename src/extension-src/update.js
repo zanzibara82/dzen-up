@@ -261,6 +261,29 @@ var DzenUpdate = (function () {
   }
 
   /**
+   * Вернуть файлы из резерва `.dzr-backup/<from>/` на место («Вернуть <версию>»).
+   *
+   * Читается именно диск: резерв для того и кладётся на диск, чтобы пережить
+   * убийство браузера посередине записи. Нет резерва — нечего возвращать, и это
+   * не ошибка: файлы остаются как лежали. Возвращается список восстановленных.
+   */
+  async function restoreFromBackup(root, from) {
+    var parts = (BACKUP_DIR + "/" + from).split("/");
+    var dir = root;
+    try {
+      for (var i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: false });
+    } catch (e) {
+      if (isNotFound(e)) return [];
+      throw e;
+    }
+    var rels = await listRel(dir, "");
+    for (var j = 0; j < rels.length; j++) {
+      await writeRel(root, rels[j], await readRel(dir, rels[j]));
+    }
+    return rels;
+  }
+
+  /**
    * Что писать и в каком порядке: только изменённые, манифест последним.
    *
    * Манифест — последним осознанно: Chrome читает из него список файлов, и
@@ -300,6 +323,7 @@ var DzenUpdate = (function () {
     removeRel: removeRel,
     readLocalMap: readLocalMap,
     backupPlan: backupPlan,
-    applyPlan: applyPlan
+    applyPlan: applyPlan,
+    restoreFromBackup: restoreFromBackup
   };
 })();
