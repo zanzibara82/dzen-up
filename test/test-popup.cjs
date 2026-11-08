@@ -612,9 +612,25 @@ async function main() {
     // и чужая папка не сохраняется как своя.
     {
       try {
+          // Имя берём из собранного манифеста: попап сравнивает выбор с
+          // chrome.runtime.getManifest().name, и захардкоженное имя разъехалось
+          // бы с реальным при первом же переименовании расширения.
+          const realName = JSON.parse(fs.readFileSync(path.join(SRC_EXT, "manifest.json"), "utf8")).name;
+          const goodManifest = { "manifest.json": JSON.stringify({ manifest_version: 3, name: realName, version: "2.2.0" }) };
+          const enc = (s) => new TextEncoder().encode(s);
+          const manifestTo = JSON.stringify({ manifest_version: 3, name: realName, version: "2.3.0" });
+          // Пакет по умолчанию несёт один изменённый манифест: этого хватает,
+          // чтобы проверить запись, резерв, журнал и перезагрузку целиком.
+          const defaultPkg = { ok: true, current: "2.2.0", remote: "2.3.0", files: [{ path: "manifest.json", bytes: enc(manifestTo) }] };
+          // Байты едут в подставной фон массивами и собираются в Uint8Array на
+          // странице: JSON.stringify(Uint8Array) дал бы объект с числовыми ключами.
+          const pkgPayload = (pkg) => JSON.stringify({
+            ok: pkg.ok !== false, current: pkg.current, remote: pkg.remote,
+            files: (pkg.files || []).map((f) => ({ path: f.path, bytes: Array.from(f.bytes) }))
+          });
           // Один прогон: фикстуры и подставной диалог ставятся ДО загрузки попапа
           // (Page.addScriptToEvaluateOnNewDocument), потому что попап читает рукоять
-          // при открытии и GEST обязан быть синхронным с кликом. `seed` закладывает
+          // при открытии и жест обязан быть синхронным с кликом. `seed` закладывает
           // рукоять в память-IndexedDB до чтения; `ask` — что отдаст
           // requestPermission; `picker` — живой ли диалог. После reload клик по
           // «Обновить сейчас» и сбор исхода.
@@ -622,16 +638,19 @@ async function main() {
             const fix = ["fake-dir-handle.cjs", "memory-idb.cjs"]
               .map((f) => fs.readFileSync(path.join(__dirname, "fixtures", f), "utf8")).join("\n;\n");
             const setup = `(function () {
-              var root = makeFakeRoot(${JSON.stringify(o.files || {})}, { permission: ${o.query === false ? '"denied"' : '"granted"'}, request: ${o.ask === false ? "false" : "true"}${o.failOn ? ", failOn: " + JSON.stringify(o.failOn) : ""} });
+              var root = makeFakeRoot(${JSON.stringify(o.files || {})}, { permission: ${o.query === false ? '"denied"' : '"granted"'}, request: ${o.ask === false ? "false" : "true"}${o.failOn ? ", failOn: " + JSON.stringify(o.failOn) : ""}${o.failRel ? ", failRel: " + JSON.stringify(o.failRel) : ""} });
               var mem = globalThis.memoryIdb;
               var db = mem.open('dzr-update').__db;
               db.createObjectStore('handles');
               ${o.seed ? "mem.seed(db, root);" : ""}
-              window.__pick = { root: root, db: db, journal: [], sent: [], gestureSync: null, afterClick: false };
+              window.__pick = { root: root, db: db, journal: [], sent: [], gestureSync: null, afterClick: false, reloads: 0 };
               // indexedDB — аксессор только с геттером на прототипе Window:
               // голое присваивание в нестрогом режиме молча теряется, и попап
               // писал бы в настоящую базу, где рукоять не клонируется.
               Object.defineProperty(window, 'indexedDB', { configurable: true, value: { open: function (name) { return mem.open(name); } } });
+              // reload в браузерном наборе выгрузил бы расширение насовсем —
+              // считаем вызовы шпионом, а не перезагружаем страницу по-настоящему.
+              chrome.runtime.reload = function () { window.__pick.reloads++; };
               var realReq = root.requestPermission.bind(root);
               root.requestPermission = function (d) {
                 if (window.__pick.gestureSync === null) window.__pick.gestureSync = !window.__pick.afterClick;
@@ -644,7 +663,13 @@ async function main() {
               };
               var realSend = chrome.runtime.sendMessage;
               chrome.runtime.sendMessage = function (msg, cb) {
-                if (msg && msg.type === 'updatePackage') { window.__pick.sent.push(msg.type); cb(${JSON.stringify(o.pkg || { ok: true, current: '2.2.0', remote: '2.3.0', files: [] })}); return; }
+                if (msg && msg.type === 'updatePackage') {
+                  window.__pick.sent.push(msg.type);
+                  var pkg = ${pkgPayload(o.pkg || defaultPkg)};
+                  pkg.files.forEach(function (f) { f.bytes = new Uint8Array(f.bytes); });
+                  cb(pkg);
+                  return;
+                }
                 return realSend.apply(chrome.runtime, arguments);
               };
             })();`;
@@ -658,29 +683,33 @@ async function main() {
               return await evalJs(`(async () => {
                 var p = window.__pick;
                 p.afterClick = false; p.gestureSync = null; p.journal = []; p.sent = [];
+                // Метка в chrome.storage: обновление не должно трогать настройки
+                // и ключ — они живут в профиле, а не в папке установки.
+                await chrome.storage.local.set({ dzrSentinel: 'секрет-не-трогать' });
                 // Микрозадача, поставленная до клика, отмечает «стек размотался»:
                 // жест, вызванный раньше неё, синхронный (до первого await).
                 Promise.resolve().then(function () { p.afterClick = true; });
                 var btn = document.getElementById('update-apply');
                 btn.hidden = false;
                 btn.click();
-                await new Promise((r) => setTimeout(r, 800));
+                await new Promise((r) => setTimeout(r, 1200));
                 var st = document.getElementById('update-status');
+                var files = {};
+                Object.keys(p.root.__files).forEach(function (k) { files[k] = new TextDecoder().decode(p.root.__files[k]); });
+                var intentRes = await chrome.storage.local.get('dzrUpdateIntent');
+                var sentinelRes = await chrome.storage.local.get('dzrSentinel');
                 return {
                   status: st.textContent, cls: st.className,
                   journal: p.journal, sync: p.gestureSync, sent: p.sent,
-                  saved: !!p.db.__store['install-dir'], sameHandle: p.db.__store['install-dir'] === p.root
+                  saved: !!p.db.__store['install-dir'], sameHandle: p.db.__store['install-dir'] === p.root,
+                  reloads: p.reloads, files: files, calls: p.root.__calls.slice(),
+                  intent: intentRes.dzrUpdateIntent || null, sentinel: sentinelRes.dzrSentinel
                 };
               })()`);
             } finally {
               await c.send("Page.removeScriptToEvaluateOnNewDocument", { identifier }, sessionId);
             }
           };
-          // Имя берём из собранного манифеста: попап сравнивает выбор с
-          // chrome.runtime.getManifest().name, и захардкоженное имя разъехалось
-          // бы с реальным при первом же переименовании расширения.
-          const realName = JSON.parse(fs.readFileSync(path.join(SRC_EXT, "manifest.json"), "utf8")).name;
-          const goodManifest = { "manifest.json": JSON.stringify({ manifest_version: 3, name: realName, version: "2.2.0" }) };
 
           const noHandle = await pickCase({ files: goodManifest, picker: true });
           console.log("выбор без рукояти: %j", noHandle);
@@ -737,6 +766,50 @@ async function main() {
           check("статус называет папку, куда пишем",
             /dzen-rewriter|папк/i.test(named.status) && /2\.2\.0/.test(named.status) && /2\.3\.0/.test(named.status),
             JSON.stringify(named.status));
+
+          // ---- запись пакета на диск (автообновление) ------------------------
+          // Выбор папки проверен выше; здесь сам клик должен записать новые
+          // байты, завести журнал до первой записи, положить старые в резерв и
+          // перезагрузить расширение. Манифест — последним, иначе полусостояние.
+          check("пакет записан на диск — манифест новой версии",
+            /2\.3\.0/.test(noHandle.files["manifest.json"] || ""), noHandle.files["manifest.json"]);
+          check("старые байты лежат в резерве .dzr-backup/<from>/",
+            /2\.2\.0/.test(noHandle.files[".dzr-backup/2.2.0/manifest.json"] || ""),
+            JSON.stringify(Object.keys(noHandle.files)));
+          check("журнал заведён до записи и помечен written",
+            !!noHandle.intent && noHandle.intent.written === true && noHandle.intent.from === "2.2.0" && noHandle.intent.to === "2.3.0",
+            JSON.stringify(noHandle.intent));
+          const noHandleCloses = noHandle.calls.filter((x) => x.indexOf("close:") === 0);
+          check("манифест записан последним",
+            noHandleCloses[noHandleCloses.length - 1] === "close:manifest.json", noHandleCloses.join(", "));
+          check("расширение перезагружено один раз", noHandle.reloads === 1, JSON.stringify(noHandle.reloads));
+          check("настройки и ключ при записи не тронуты",
+            noHandle.sentinel === "секрет-не-трогать" && (!noHandle.intent || noHandle.intent.aiKey === undefined),
+            JSON.stringify({ sentinel: noHandle.sentinel, intent: noHandle.intent }));
+
+          // Отказ диска посередине: уже записанное возвращается к старым байтам,
+          // журнал прерван, перезагрузки нет — установка не осталась полусостоянием.
+          const rollback = await pickCase({
+            files: { "manifest.json": goodManifest["manifest.json"], "popup.js": "старый попап" },
+            seed: true,
+            pkg: { ok: true, current: "2.2.0", remote: "2.3.0", files: [
+              { path: "popup.js", bytes: enc("новый попап") },
+              { path: "manifest.json", bytes: enc(manifestTo) }
+            ] },
+            failOn: "write", failRel: "manifest.json"
+          });
+          console.log("откат при отказе диска: %j", rollback);
+          check("отказ диска назван ошибкой, а не успехом",
+            /err/.test(rollback.cls) && /оборвалась|возвращены|откат/i.test(rollback.status), rollback.status);
+          check("уже записанный файл возвращён к старым байтам",
+            rollback.files["popup.js"] === "старый попап", rollback.files["popup.js"]);
+          check("манифест при откате остался прежней версии",
+            /2\.2\.0/.test(rollback.files["manifest.json"] || "") && !/2\.3\.0/.test(rollback.files["manifest.json"] || ""),
+            rollback.files["manifest.json"]);
+          check("журнал помечен прерванным, без written",
+            !!rollback.intent && rollback.intent.aborted === true && !rollback.intent.written,
+            JSON.stringify(rollback.intent));
+          check("при откате расширение не перезагружается", rollback.reloads === 0, JSON.stringify(rollback.reloads));
       } catch (e) {
         check("выбор папки не роняет набор", false, String((e && e.message) || e));
       }

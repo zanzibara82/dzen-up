@@ -1406,6 +1406,94 @@ async function main() {
     }
   }
 
+  console.log("\n=== 32. запись пакета на диск: резерв, порядок и откат ===");
+  {
+    // Запись — единственное место, где обновление трогает файлы человека. До
+    // первой записи всё скачано и проверено, но диск может отказать посередине:
+    // тогда уже записанное обязано вернуться к старым байтам, а новый файл —
+    // исчезнуть, иначе установка осталась бы в полусостоянии без выхода.
+    const { makeFakeRoot } = require("./fixtures/fake-dir-handle.cjs");
+    const updSrc = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "update.js"), "utf8");
+    const upd = new Function(updSrc + "\nreturn DzenUpdate;")();
+    const enc = (s) => new TextEncoder().encode(s);
+    const dec = (b) => (b ? new TextDecoder().decode(b) : null);
+
+    check(
+      "модуль умеет писать, удалять и читать карту файлов",
+      typeof upd.writeRel === "function" && typeof upd.removeRel === "function" &&
+        typeof upd.readLocalMap === "function" && typeof upd.backupPlan === "function" &&
+        typeof upd.applyPlan === "function",
+      Object.keys(upd).join(", ")
+    );
+
+    try {
+      // ---- writeRel ----
+      const root = makeFakeRoot({ "manifest.json": "2.2.0" });
+      await upd.writeRel(root, "popup.js", enc("тело попапа"));
+      check("writeRel кладёт байты на диск", root.__text("popup.js") === "тело попапа", root.__text("popup.js"));
+      check("writeRel идёт через createWritable", root.__calls.indexOf("open:popup.js") >= 0 && root.__calls.indexOf("write:popup.js") >= 0 && root.__calls.indexOf("close:popup.js") >= 0, root.__calls.join(", "));
+      await upd.writeRel(root, "icons/icon48.png", enc("пиксели"));
+      check("writeRel создаёт подпапку под файл", root.__text("icons/icon48.png") === "пиксели", root.__text("icons/icon48.png"));
+      await upd.writeRel(root, "popup.js", enc("новое тело"));
+      check("writeRel перезаписывает существующий файл", root.__text("popup.js") === "новое тело", root.__text("popup.js"));
+
+      // ---- removeRel ----
+      await upd.removeRel(root, "popup.js");
+      check("removeRel убирает файл с диска", root.__text("popup.js") === null, String(root.__text("popup.js")));
+      let removedAbsent = true;
+      try { await upd.removeRel(root, "нет-такого.js"); } catch (e) { removedAbsent = false; }
+      check("removeRel отсутствующего файла не бросает", removedAbsent, String(removedAbsent));
+
+      // ---- readLocalMap ----
+      const mapRoot = makeFakeRoot({ "a.js": "байты а", "icons/i.png": "иконка" });
+      const localMap = await upd.readLocalMap(mapRoot, ["a.js", "icons/i.png", "new.js"]);
+      check("readLocalMap отдаёт байты присутствующих", dec(localMap["a.js"]) === "байты а" && dec(localMap["icons/i.png"]) === "иконка", JSON.stringify(Object.keys(localMap)));
+      check("readLocalMap отсутствующий помечает null", localMap["new.js"] === null, String(localMap["new.js"]));
+
+      // ---- backupPlan ----
+      const bRoot = makeFakeRoot({ "a.js": "старое а", "manifest.json": "2.2.0" });
+      const bLocal = { "a.js": enc("старое а"), "new.js": null, "manifest.json": enc("2.2.0") };
+      await upd.backupPlan(bRoot, "2.2.0", ["a.js", "new.js", "manifest.json"], bLocal);
+      check("резерв копирует старые байты в .dzr-backup/<from>/", bRoot.__text(".dzr-backup/2.2.0/a.js") === "старое а" && bRoot.__text(".dzr-backup/2.2.0/manifest.json") === "2.2.0", JSON.stringify(Object.keys(bRoot.__files)));
+      check("новый файл в резерв не попадает — его нечего возвращать", bRoot.__text(".dzr-backup/2.2.0/new.js") === null, String(bRoot.__text(".dzr-backup/2.2.0/new.js")));
+      check("резерв не трогает сами файлы", bRoot.__text("a.js") === "старое а", bRoot.__text("a.js"));
+
+      // ---- applyPlan: порядок и байты ----
+      const aRoot = makeFakeRoot({ "a.js": "старое а", "b.css": "старое б", "manifest.json": "2.2.0" });
+      const aLocal = { "a.js": enc("старое а"), "b.css": enc("старое б"), "manifest.json": enc("2.2.0") };
+      const aRemote = { "a.js": enc("новое а"), "b.css": enc("новое б"), "manifest.json": enc("2.3.0") };
+      const written = await upd.applyPlan(aRoot, ["b.css", "a.js", "manifest.json"], aRemote, aLocal);
+      check("applyPlan возвращает записанные файлы", JSON.stringify(written) === JSON.stringify(["b.css", "a.js", "manifest.json"]), JSON.stringify(written));
+      check("applyPlan кладёт новые байты", aRoot.__text("a.js") === "новое а" && aRoot.__text("b.css") === "новое б" && aRoot.__text("manifest.json") === "2.3.0", JSON.stringify({ a: aRoot.__text("a.js"), m: aRoot.__text("manifest.json") }));
+      const closes = aRoot.__calls.filter((c) => c.indexOf("close:") === 0);
+      check("манифест закрывается последним", closes[closes.length - 1] === "close:manifest.json", closes.join(", "));
+
+      // ---- applyPlan: откат уже записанного при отказе диска ----
+      const rRoot = makeFakeRoot({ "a.js": "старое а", "b.js": "старое б", "manifest.json": "2.2.0" }, { failOn: "write", failRel: "b.js" });
+      const rLocal = { "a.js": enc("старое а"), "b.js": enc("старое б"), "manifest.json": enc("2.2.0") };
+      const rRemote = { "a.js": enc("новое а"), "b.js": enc("новое б"), "manifest.json": enc("2.3.0") };
+      let rolledBack = false;
+      try { await upd.applyPlan(rRoot, ["a.js", "b.js", "manifest.json"], rRemote, rLocal); }
+      catch (e) { rolledBack = true; }
+      check("отказ диска посередине бросает наружу", rolledBack, String(rolledBack));
+      check("откат вернул уже записанный файл к старым байтам", rRoot.__text("a.js") === "старое а", rRoot.__text("a.js"));
+      check("манифест при откате не тронут — версия прежняя", rRoot.__text("manifest.json") === "2.2.0", rRoot.__text("manifest.json"));
+
+      // ---- applyPlan: новый файл при откате удаляется, а не остаётся сиротой ----
+      const nRoot = makeFakeRoot({ "manifest.json": "2.2.0" }, { failOn: "write", failRel: "manifest.json" });
+      const nLocal = { "new.js": null, "manifest.json": enc("2.2.0") };
+      const nRemote = { "new.js": enc("тело нового"), "manifest.json": enc("2.3.0") };
+      let newRolled = false;
+      try { await upd.applyPlan(nRoot, ["new.js", "manifest.json"], nRemote, nLocal); }
+      catch (e) { newRolled = true; }
+      check("откат после создания нового файла бросает", newRolled, String(newRolled));
+      check("новый файл при откате удалён с диска", nRoot.__text("new.js") === null, String(nRoot.__text("new.js")));
+      check("манифест остался прежним при откате нового файла", nRoot.__text("manifest.json") === "2.2.0", nRoot.__text("manifest.json"));
+    } catch (e) {
+      check("запись пакета не роняет набор", false, String((e && e.message) || e));
+    }
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);

@@ -756,6 +756,48 @@
     setUpdateStatus("❌ " + reason + " — ни один файл не тронут. Выберите папку этого расширения заново.", "err");
   }
 
+  // Журнал обновления живёт в chrome.storage.local: он обязан пережить смерть
+  // попапа при reload и убийство браузера посередине записи. Ключ один на все
+  // состояния — от «начал» до «written»/«aborted», по нему попап при следующем
+  // открытии понимает, завершилось ли прошлое обновление.
+  function setIntent(intent) {
+    var wrap = {};
+    wrap[DzenUpdate.INTENT_KEY] = intent;
+    return chrome.storage.local.set(wrap);
+  }
+
+  /**
+   * Записать пакет в папку установки: журнал до первой записи, резерв старых
+   * байтов на диск, план (манифест последним), откат при сбое и перезагрузка.
+   * Настройки и ключ не читаются и не пишутся — они в профиле, а не в папке.
+   */
+  async function runUpdate(root, pkg) {
+    var fileSet = (pkg.files || []).map(function (f) { return f.path; });
+    var remoteMap = {};
+    (pkg.files || []).forEach(function (f) { remoteMap[f.path] = f.bytes; });
+    var localMap = await DzenUpdate.readLocalMap(root, fileSet);
+    var plan = DzenUpdate.planUpdate(fileSet, localMap, remoteMap);
+    var intent = { from: String(pkg.current || ""), to: String(pkg.remote || ""), at: Date.now() };
+    await setIntent(intent);
+    setUpdateStatus("📁 Папка «" + root.name + "»: " + intent.from + " → " + intent.to + ". Готовлю запись…");
+    await DzenUpdate.backupPlan(root, intent.from, plan, localMap);
+    try {
+      await DzenUpdate.applyPlan(root, plan, remoteMap, localMap);
+    } catch (e) {
+      intent.aborted = true;
+      intent.reason = String((e && e.message) || e);
+      await setIntent(intent);
+      setUpdateStatus(
+        "❌ Запись в папку «" + root.name + "» оборвалась: " + intent.reason +
+          ". Уже записанные файлы возвращены к версии " + intent.from + ".", "err");
+      return;
+    }
+    intent.written = true;
+    await setIntent(intent);
+    setUpdateStatus("✅ Папка «" + root.name + "»: " + intent.from + " → " + intent.to + " записана. Перезагружаю расширение…");
+    chrome.runtime.reload();
+  }
+
   $("update-apply").addEventListener("click", function () {
     // Жест — синхронно, до первого await: иначе Chrome отклонит и диалог, и запрос
     // права. Есть сохранённая рукоять — просим право у неё; нет — поднимаем диалог.
@@ -791,7 +833,7 @@
         setUpdateStatus("❌ " + ((pkg && pkg.error) || "фон не ответил") + " — папка «" + root.name + "» не тронута.", "err");
         return;
       }
-      setUpdateStatus("📁 Папка «" + root.name + "»: " + pkg.current + " → " + pkg.remote + ". Готовлю запись…");
+      await runUpdate(root, pkg);
     }).catch(function (e) {
       if (e && e.name === "AbortError") {
         setUpdateStatus("⚠️ Выбор папки не сделан — обновление не применено.", "err");

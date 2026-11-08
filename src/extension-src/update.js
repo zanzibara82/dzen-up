@@ -180,6 +180,87 @@ var DzenUpdate = (function () {
   }
 
   /**
+   * Записать байты в файл выбранной папки, создав каталоги и сам файл.
+   *
+   * Пишем через createWritable + close: только закрытие переносит байты на диск,
+   * и оборванное письмо без close не оставляет обрезанный файл — Chrome либо
+   * принял запись целиком, либо нет. Поэтому сбой close так же опасен, как сбой write.
+   */
+  async function writeRel(root, rel, bytes) {
+    var at = await parentOf(root, rel, true);
+    var fh = await at.dir.getFileHandle(at.name, { create: true });
+    var ws = await fh.createWritable();
+    await ws.write(bytes);
+    await ws.close();
+  }
+
+  /** Убрать файл из папки; отсутствие файла — не ошибка (откат нового файла). */
+  async function removeRel(root, rel) {
+    try {
+      var at = await parentOf(root, rel, false);
+      await at.dir.removeEntry(at.name);
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+  }
+
+  /** Карта локальных байтов по составу: null там, где файла ещё нет. */
+  async function readLocalMap(root, fileSet) {
+    var map = {};
+    for (var i = 0; i < (fileSet || []).length; i++) {
+      map[fileSet[i]] = await readRel(root, fileSet[i]);
+    }
+    return map;
+  }
+
+  /**
+   * Скопировать старые байты затрагиваемых файлов в `.dzr-backup/<from>/`.
+   *
+   * Резерв на диске переживает убийство браузера — память нет. Новый файл
+   * (localMap[rel] === null) не резервируется: возвращать нечего, при откате он
+   * просто удаляется. Сами файлы пакета здесь не трогаются.
+   */
+  async function backupPlan(root, from, plan, localMap) {
+    var local = localMap || {};
+    for (var i = 0; i < (plan || []).length; i++) {
+      var rel = plan[i];
+      if (local[rel] == null) continue;
+      await writeRel(root, BACKUP_DIR + "/" + from + "/" + rel, local[rel]);
+    }
+  }
+
+  /**
+   * Записать файлы плана по порядку и откатить уже записанное при сбое.
+   *
+   * Порядок задаёт planUpdate (манифест последним). Если диск отказал на
+   * середине, каждый уже записанный файл возвращается к старым байтам из
+   * localMap, а созданный с нуля — удаляется: установка не должна остаться в
+   * полусостоянии. Ошибка диска бросается наружу — причину назовёт попап.
+   */
+  async function applyPlan(root, plan, remoteMap, localMap) {
+    var remote = remoteMap || {};
+    var local = localMap || {};
+    var written = [];
+    try {
+      for (var i = 0; i < (plan || []).length; i++) {
+        var rel = plan[i];
+        await writeRel(root, rel, remote[rel]);
+        written.push(rel);
+      }
+      return written;
+    } catch (e) {
+      for (var j = written.length - 1; j >= 0; j--) {
+        var back = written[j];
+        try {
+          if (local[back] == null) await removeRel(root, back);
+          else await writeRel(root, back, local[back]);
+        } catch (e2) {}
+      }
+      throw e;
+    }
+  }
+
+  /**
    * Что писать и в каком порядке: только изменённые, манифест последним.
    *
    * Манифест — последним осознанно: Chrome читает из него список файлов, и
@@ -214,6 +295,11 @@ var DzenUpdate = (function () {
     planUpdate: planUpdate,
     readRel: readRel,
     listRel: listRel,
-    installDirProblem: installDirProblem
+    installDirProblem: installDirProblem,
+    writeRel: writeRel,
+    removeRel: removeRel,
+    readLocalMap: readLocalMap,
+    backupPlan: backupPlan,
+    applyPlan: applyPlan
   };
 })();
