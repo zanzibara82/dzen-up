@@ -744,6 +744,14 @@ console.log("\n=== состав обновления против списка �
   // Фон в воркере грузит тот же файл через importScripts — без него DzenUpdate
   // там не существует, а юнит-набор этого не увидит: он конкатенирует исходники.
   check("фон подключает update.js в воркере", /importScripts\(["']update\.js["']\)/.test(bg), "нет importScripts в background.js");
+  const cs = (manifest.content_scripts || [])[0] || {};
+  const csJs = cs.js || [];
+  check("манифест: images.js подключён перед content.js",
+    csJs.indexOf("images.js") >= 0 && csJs.indexOf("images.js") < csJs.indexOf("content.js"),
+    JSON.stringify(csJs));
+  check("окно подбора открывает настройки",
+    /chrome\.tabs\.create/.test(read("images-page.js")) && /popup\.html/.test(read("images-page.js")),
+    "нет chrome.tabs.create с popup.html");
 
   // Адрес пакета — каталог того же манифеста, а не второй зашитый url: иначе
   // правка репозитория в одном месте разъехалась бы с другим и «обновить»

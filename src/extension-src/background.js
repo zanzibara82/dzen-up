@@ -2871,6 +2871,66 @@ function parseRemoteManifest(bytes) {
   return data;
 }
 
+// ------------------------------------------------------- окно подбора фото ---
+// Номер окна живёт в session-хранилище: перезапуск воркера его не теряет, а
+// закрытие вкладки-окна — удаляет.
+const IMAGE_WINDOW_KEY = "dzrImageWindowId";
+
+function imagePickerUrl(title) {
+  var base = chrome.runtime.getURL("images.html");
+  var t = String(title == null ? "" : title).replace(/\s+/g, " ").trim().slice(0, 300);
+  return t ? base + "?title=" + encodeURIComponent(t) : base;
+}
+
+async function readImageWindowId() {
+  const session = chrome.storage && chrome.storage.session;
+  if (!session) return null;
+  try {
+    const st = await session.get({ [IMAGE_WINDOW_KEY]: null });
+    return st[IMAGE_WINDOW_KEY] || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function writeImageWindowId(id) {
+  const session = chrome.storage && chrome.storage.session;
+  if (!session) return;
+  try {
+    if (id == null) await session.remove(IMAGE_WINDOW_KEY);
+    else await session.set({ [IMAGE_WINDOW_KEY]: id });
+  } catch (e) {}
+}
+
+async function openImagePicker(title) {
+  const url = imagePickerUrl(title);
+  const existing = await readImageWindowId();
+  if (existing != null) {
+    try {
+      await chrome.windows.update(existing, { focused: true });
+      return { ok: true, windowId: existing, reused: true };
+    } catch (e) {
+      await writeImageWindowId(null);
+    }
+  }
+  try {
+    const win = await chrome.windows.create({ url, type: "popup", width: 560, height: 720 });
+    if (win && win.id != null) {
+      await writeImageWindowId(win.id);
+      return { ok: true, windowId: win.id, reused: false };
+    }
+  } catch (e) {}
+  const tab = await chrome.tabs.create({ url });
+  return { ok: true, windowId: null, tabId: tab && tab.id != null ? tab.id : null };
+}
+
+if (chrome.windows && chrome.windows.onRemoved) {
+  chrome.windows.onRemoved.addListener(async (id) => {
+    const current = await readImageWindowId();
+    if (current != null && current === id) await writeImageWindowId(null);
+  });
+}
+
 /**
  * Все байты нового пакета, ни один файл на диске ещё не тронут.
  *
@@ -3067,6 +3127,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       if (msg.type === "updatePackage") {
         sendResponse({ ok: true, ...(await buildUpdatePackage()) });
+        return;
+      }
+
+      if (msg.type === "openImagePicker") {
+        sendResponse(await openImagePicker(msg.title));
         return;
       }
 

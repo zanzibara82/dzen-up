@@ -15,6 +15,14 @@
   display: flex;
   align-items: center;
   gap: 10px;
+  /* Три задачи панели и поле адреса не помещаются в узкое окно одной строкой.
+     Без потолка панель шире окна, и её края — ручка и крестик — оказываются
+     за экраном. Потолок в 12 px с каждой стороны совпадает с EDGE_GAP. */
+  max-width: calc(100vw - 24px);
+  width: max-content;
+  flex-wrap: wrap;
+  justify-content: center;
+  row-gap: 6px;
   padding: 8px 10px 8px 14px;
   border-radius: 999px;
   background: rgba(16, 14, 28, 0.92);
@@ -48,6 +56,7 @@
 #dzr-bar.dzr-collapsed .dzr-status,
 #dzr-bar.dzr-collapsed .dzr-go,
 #dzr-bar.dzr-collapsed .dzr-link-btn,
+#dzr-bar.dzr-collapsed .dzr-images-btn,
 #dzr-bar.dzr-collapsed .dzr-src,
 #dzr-bar.dzr-collapsed .dzr-icon-btn:not(.dzr-toggle) {
   display: none;
@@ -104,7 +113,8 @@
 
 /* Кнопка перелинковки — второстепенная: она не переписывает статью, а только
    расставляет ссылки, поэтому не должна спорить с главной кнопкой за внимание. */
-.dzr-link-btn {
+.dzr-link-btn,
+.dzr-images-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -117,14 +127,17 @@
   cursor: pointer;
   white-space: nowrap;
 }
-.dzr-link-btn:hover {
+.dzr-link-btn:hover,
+.dzr-images-btn:hover {
   background: rgba(255, 255, 255, 0.14);
 }
-.dzr-link-btn:disabled {
+.dzr-link-btn:disabled,
+.dzr-images-btn:disabled {
   opacity: 0.55;
   cursor: default;
 }
-.dzr-link-btn svg {
+.dzr-link-btn svg,
+.dzr-images-btn svg {
   width: 16px;
   height: 16px;
 }
@@ -135,13 +148,15 @@
   color: #fecaca;
 }
 
-#dzr-bar.dzr-vertical .dzr-link-btn {
+#dzr-bar.dzr-vertical .dzr-link-btn,
+#dzr-bar.dzr-vertical .dzr-images-btn {
   width: 42px;
   height: 42px;
   padding: 0;
   justify-content: center;
 }
-#dzr-bar.dzr-vertical .dzr-link-btn > span:last-child {
+#dzr-bar.dzr-vertical .dzr-link-btn > span:last-child,
+#dzr-bar.dzr-vertical .dzr-images-btn > span:last-child {
   display: none;
 }
 

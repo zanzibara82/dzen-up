@@ -330,6 +330,28 @@ async function main() {
         `new Promise((res) => chrome.runtime.sendMessage({ type: 'saveSettings', settings: { mode: 'translate+rewrite' } }, () => res(true)))`
       );
     }
+    // Кнопка подбора изображений: панель не имеет права открывать окно сама —
+    // она отправляет заголовок фону, а фон поднимает страницу расширения.
+    const imgBtn = await evalJs(`(() => {
+      const b = document.querySelector('#dzr-bar .dzr-images-btn');
+      return b ? { text: b.textContent.trim(), title: b.title } : null;
+    })()`);
+    check("в панели есть кнопка подбора изображений",
+      !!imgBtn && /Изображен/i.test(imgBtn.text), JSON.stringify(imgBtn));
+    if (imgBtn) {
+      await evalJs(`document.querySelector('#dzr-bar .dzr-images-btn').click()`);
+      let imgTarget = null;
+      for (let i = 0; i < 40; i++) {
+        const { targetInfos } = await c.send("Target.getTargets");
+        imgTarget = targetInfos.find((t) => /images\.html/.test(t.url));
+        if (imgTarget) break;
+        await sleep(150);
+      }
+      check("кнопка открывает окно подбора с заголовком статьи",
+        !!imgTarget && /images\.html\?title=[^&]*Subaru/.test(imgTarget.url),
+        imgTarget && imgTarget.url);
+      if (imgTarget) await c.send("Target.closeTarget", { targetId: imgTarget.targetId });
+    }
     await c.send("Target.closeTarget", { targetId: probe.targetId });
 
     const errs = c.events.filter((e) => e.method === "Runtime.exceptionThrown");

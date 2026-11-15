@@ -38,7 +38,12 @@ const chrome = {
   runtime: { onMessage: { addListener() {} }, onInstalled: { addListener() {} }, getManifest: () => ({ version: manifestVersion }) },
   contextMenus: { removeAll() {}, create() {}, onClicked: { addListener() {} } },
   commands: { onCommand: { addListener() {} } },
-  tabs: { sendMessage: async () => {}, query: async () => [] }
+  tabs: { sendMessage: async () => {}, query: async () => [] },
+  windows: {
+    create: async () => ({ id: 1 }),
+    update: async () => ({}),
+    onRemoved: { addListener() {} }
+  }
 };
 
 const src = fs.readFileSync(SRC, "utf8");
@@ -157,7 +162,12 @@ function mockWorkerChrome(box, store = {}) {
     },
     permissions: { contains: async () => true, request: async () => true },
     scripting: { executeScript: async () => [{ result: null }] },
-    action: { badgeText: { set: async () => {} } }
+    action: { badgeText: { set: async () => {} } },
+    windows: {
+      create: async () => ({ id: 1 }),
+      update: async () => ({}),
+      onRemoved: { addListener() {} }
+    }
   };
 }
 

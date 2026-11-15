@@ -20,7 +20,7 @@
   "content_scripts": [
     {
       "matches": ["https://dzen.ru/*", "https://zen.yandex.ru/*"],
-      "js": ["presets.js", "rewriter.js", "content.js"],
+      "js": ["presets.js", "rewriter.js", "images.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_idle",
       "all_frames": true

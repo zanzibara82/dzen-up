@@ -36,7 +36,7 @@
   // догадку вместо того, что человек сохранял в попапе. См. `panelOverrides`.
   var settingsReady = false;
   var langTouched = false;
-  var bar, statusEl, goBtn, undoBtn, langSel, modeSel, presetSel, linkBtn, srcUrlInput, srcBtn;
+  var bar, statusEl, goBtn, undoBtn, langSel, modeSel, presetSel, linkBtn, imagesBtn, srcUrlInput, srcBtn;
   // Слушатели на window и document живут вне панели: при перерисовке Дзена
   // панель пересоздаётся, а они бы копились слой за слоем. Поэтому подписка
   // ставится один раз, а состояние перетаскивания держится здесь же.
@@ -1360,7 +1360,8 @@
       spin: '<path d="M21 12a9 9 0 1 1-6.2-8.6"/>',
       chevron: '<path d="M6 15l6-6 6 6"/>',
       link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.5-1.5"/>',
-      download: '<path d="M12 3v11m0 0 4-4m-4 4-4-4"/><path d="M4 19h16"/>'
+      download: '<path d="M12 3v11m0 0 4-4m-4 4-4-4"/><path d="M4 19h16"/>',
+      image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="m21 15-4.5-4.5L9 18"/>'
     };
     return (
       '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" ' +
@@ -1872,6 +1873,15 @@
     linkLabel = icon("link") + "<span>Перелинковка</span>";
     linkBtn.innerHTML = linkLabel;
 
+    // Подбор картинок — третья задача панели: не переписать и не расставить
+    // ссылки, а принести фото к новости. Сама панель файлов не качает: у неё нет
+    // ни рукояти папки, ни права просить доступ к чужим сайтам.
+    imagesBtn = document.createElement("button");
+    imagesBtn.type = "button";
+    imagesBtn.className = "dzr-images-btn";
+    imagesBtn.title = "Подобрать изображения для новости";
+    imagesBtn.innerHTML = icon("image") + "<span>Изображения</span>";
+
     collapseBtn = document.createElement("button");
     collapseBtn.className = "dzr-icon-btn dzr-toggle";
     collapseBtn.title = "Свернуть в пузырёк, чтобы не мешала";
@@ -1917,6 +1927,7 @@
     bar.appendChild(controls);
     bar.appendChild(goBtn);
     bar.appendChild(linkBtn);
+    bar.appendChild(imagesBtn);
     bar.appendChild(srcRow);
     bar.appendChild(statusEl);
     bar.appendChild(undoBtn);
@@ -1940,6 +1951,21 @@
       e.stopPropagation();
       if (busy) cancelRun();
       else runLinkify();
+    });
+    imagesBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var title = "";
+      try {
+        title = globalThis.DzenImages ? DzenImages.guessTitle(document, findEditor()) : "";
+      } catch (err) {
+        title = "";
+      }
+      send({ type: "openImagePicker", title: title }).then(function (res) {
+        if (!res || !res.ok) {
+          setStatus("Не удалось открыть подбор изображений: " + ((res && res.error) || "фон не ответил"), "err");
+        }
+      });
     });
     srcBtn.addEventListener("click", function (e) {
       e.preventDefault();
