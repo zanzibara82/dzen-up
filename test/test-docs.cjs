@@ -463,6 +463,7 @@ const SETTING_DOC = {
   linkChannels: "Каналы Дзена для перелинковки",
   linkSynonyms: "Синонимы для перелинковки",
   linkCount: "Сколько ссылок на статью",
+  imageCount: "Сколько фото скачивать",
   sourceUrl: "Адрес статьи, откуда взять текст",
   aiEnabled: "Использовать AI-рерайт (OpenAI-совместимый API)",
   aiBaseUrl: "Base URL",
@@ -733,6 +734,13 @@ console.log("\n=== состав обновления против списка �
   const orderHtml = popupHtml.indexOf('src="update.js"');
   const orderPopup = popupHtml.indexOf('src="popup.js"');
   check("update.js подключён раньше popup.js", orderHtml >= 0 && orderPopup >= 0 && orderHtml < orderPopup, JSON.stringify({ update: orderHtml, popup: orderPopup }));
+  check("попап: поле количества фото с диапазоном 5–10",
+    /id="imageCount"[^>]*min="5"[^>]*max="10"/.test(popupHtml),
+    "нет поля #imageCount с min=5 и max=10");
+  check("попап: images.js подключён раньше popup.js",
+    popupHtml.indexOf('src="images.js"') >= 0 &&
+    popupHtml.indexOf('src="images.js"') < popupHtml.indexOf('src="popup.js"'),
+    JSON.stringify({ images: popupHtml.indexOf('src="images.js"'), popup: popupHtml.indexOf('src="popup.js"') }));
   // Фон в воркере грузит тот же файл через importScripts — без него DzenUpdate
   // там не существует, а юнит-набор этого не увидит: он конкатенирует исходники.
   check("фон подключает update.js в воркере", /importScripts\(["']update\.js["']\)/.test(bg), "нет importScripts в background.js");

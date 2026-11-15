@@ -23,7 +23,8 @@
     "linkSites",
     "linkChannels",
     "linkSynonyms",
-    "linkCount"
+    "linkCount",
+    "imageCount"
   ];
 
   // Отказ воркера бывает двух видов, и чинят их по-разному. Если фон ответил,
@@ -143,6 +144,9 @@
     FIELDS.forEach(function (f) {
       if ($(f) && settings[f] != null) $(f).value = settings[f];
     });
+    // Число фото храним числом и ограничиваем здесь же: пустое поле — это
+    // «по умолчанию», а не NaN, и окно подбора увидит ровно то, что на экране.
+    if ($("imageCount")) $("imageCount").value = DzenImages.clampCount(settings.imageCount);
     $("aiEnabled").checked = !!settings.aiEnabled;
     $("ai-fields").hidden = !settings.aiEnabled;
     // поле приписки показываем только когда она включена
@@ -211,6 +215,8 @@
       var want = parseInt($("linkCount").value, 10);
       next.linkCount = Math.max(1, Math.min(10, isNaN(want) ? 2 : want));
       $("linkCount").value = next.linkCount;
+      next.imageCount = DzenImages.clampCount($("imageCount").value);
+      $("imageCount").value = next.imageCount;
       var res = await send({ type: "saveSettings", settings: next });
       st.className = "status" + (res.ok ? "" : " err");
       st.textContent = res.ok

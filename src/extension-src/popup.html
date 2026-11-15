@@ -362,6 +362,12 @@
         больше одной на абзац. Если упоминаний моделей в тексте меньше — поставим сколько есть.
       </p>
 
+      <label for="imageCount" style="margin-top: 12px">Сколько фото скачивать</label>
+      <input id="imageCount" type="number" min="5" max="10" step="1" placeholder="8" />
+      <p class="hint" style="margin: 6px 0 0">
+        Сколько фотографий скачивать в папку новости: от 5 до 10. По умолчанию 8.
+      </p>
+
       <div class="switch">
         <input type="checkbox" id="aiEnabled" />
         <label for="aiEnabled" style="margin: 0; text-transform: none; letter-spacing: 0; font-size: 12.5px; color: #d7d3f0">
@@ -444,6 +450,7 @@
 
     <script src="presets.js"></script>
     <script src="rewriter.js"></script>
+    <script src="images.js"></script>
     <script src="update.js"></script>
     <script src="popup.js"></script>
   </body>
