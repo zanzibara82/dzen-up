@@ -131,6 +131,9 @@
 
   // ---- настройки -----------------------------------------------------------
   var settings = {};
+  // До успешного чтения поля пусты, и запись в хранилище стёрла бы рабочие
+  // настройки пустотой. Флаг закрывает все пути сохранения.
+  var loaded = false;
 
   send({ type: "getSettings" }).then(function (res) {
     if (!res.ok) {
@@ -170,6 +173,7 @@
     if (!storedPreset.custom) lastPresetId = storedPreset.id;
 
     refreshLinkPerm();
+    loaded = true;
     ready();
   });
 
@@ -197,8 +201,13 @@
   $("save").addEventListener("click", async function () {
     var btn = $("save");
     if (btn.disabled) return;
-    btn.disabled = true;
     var st = $("settings-status");
+    if (!loaded) {
+      st.className = "status err";
+      st.textContent = "❌ Настройки не прочитаны — закройте окно и откройте его заново.";
+      return;
+    }
+    btn.disabled = true;
     st.className = "status";
     st.textContent = "⏳ Сохраняю…";
     try {
@@ -462,6 +471,10 @@
   }
 
   $("link-allow").addEventListener("click", async function () {
+    if (!loaded) {
+      setPermStatus("Настройки не прочитаны — закройте окно и откройте его заново.", "err");
+      return;
+    }
     var picked = accessOrigins();
     var note = skippedNote(picked.bad);
     if (!picked.origins.length) {

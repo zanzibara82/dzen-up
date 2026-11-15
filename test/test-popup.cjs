@@ -1621,6 +1621,55 @@ async function main() {
     fs.writeFileSync(p, Buffer.from(shot.data, "base64"));
     console.log("\nскриншот попапа: %s", p);
 
+    // ---- сбой чтения настроек: «Сохранить» не имеет права писать пустоту ----
+    // Поля до успешного чтения пусты. Если разрешить сохранение, оно запишет
+    // пустые строки и снятые галочки поверх рабочих настроек — человек увидит
+    // «Сохранено», а Дзен потеряет язык, промпт и глоссарий.
+    {
+      const stub = `(function () {
+        var real = chrome.runtime.sendMessage;
+        window.__loadFail = { sent: [] };
+        chrome.runtime.sendMessage = function (m, cb) {
+          window.__loadFail.sent.push((m && m.type) || '');
+          if (m && m.type === 'getSettings') { if (cb) cb({ ok: false, error: 'хранилище недоступно' }); return; }
+          if (m && m.type === 'saveSettings') { if (cb) cb({ ok: true }); return; }
+          return real.apply(chrome.runtime, arguments);
+        };
+      })();`;
+      const added = await c.send("Page.addScriptToEvaluateOnNewDocument", { source: stub }, sessionId);
+      try {
+        await evalJs(`location.reload()`);
+        for (let i = 0; i < 40; i++) {
+          if (await evalJs(`document.documentElement?.getAttribute('data-dzr-popup') === 'ready'`)) break;
+          await sleep(150);
+        }
+        const loadFail = await evalJs(`(async () => {
+          const st = document.getElementById('settings-status');
+          const initial = st.textContent;
+          document.getElementById('tab-settings').click();
+          document.getElementById('save').click();
+          await new Promise((r) => setTimeout(r, 900));
+          const afterSave = st.textContent;
+          // Кнопка доступа тоже сохраняет поля списков до запроса права. При
+          // непрочитанных настройках она не должна затирать соседний список.
+          document.getElementById('linkSites').value = 'auto-dom24.ru';
+          document.getElementById('link-allow').click();
+          await new Promise((r) => setTimeout(r, 600));
+          return { initial, afterSave, afterAllow: document.getElementById('link-perm').textContent,
+                   sent: window.__loadFail.sent.slice() };
+        })()`);
+        console.log("сбой чтения настроек: %j", loadFail);
+        check("сбой чтения: сохранение не ушло в хранилище",
+          loadFail.sent.indexOf('saveSettings') < 0, JSON.stringify(loadFail.sent));
+        check("сбой чтения: «Сохранить» объясняет отказ",
+          /не прочитан/i.test(loadFail.afterSave), JSON.stringify(loadFail.afterSave));
+        check("сбой чтения: доступ к сайтам не пишет пустой список",
+          /не прочитан/i.test(loadFail.afterAllow), JSON.stringify(loadFail.afterAllow));
+      } finally {
+        await c.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: added.identifier }, sessionId);
+      }
+    }
+
     console.log("\n=== ИТОГ ===");
     const bad = results.filter((r) => !r.ok);
     console.log("всего проверок: %d, провалов: %d", results.length, bad.length);
