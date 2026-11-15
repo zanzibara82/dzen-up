@@ -64,7 +64,8 @@ const api = new Function(
     "\nreturn { DEFAULTS, channelName, channelUrl, parseChannelList, channelPageArticles, " +
     "loadChannel, channelArticles, refreshChannels, pickArticle, findModels, buildLinks, " +
     "escapeXml, xmlComment, channelSitemap, sitemapFileName, exportChannelMaps, " +
-    "sitemapFor, SITEMAP_CACHE_KEY, CHANNEL_CACHE_KEY };"
+    "sitemapFor, SITEMAP_CACHE_KEY, CHANNEL_CACHE_KEY, " +
+    ' channelOwner: typeof channelOwner === "function" ? channelOwner : null };'
 )(chrome);
 
 const {
@@ -85,7 +86,8 @@ const {
   exportChannelMaps,
   sitemapFor,
   SITEMAP_CACHE_KEY,
-  CHANNEL_CACHE_KEY
+  CHANNEL_CACHE_KEY,
+  channelOwner
 } = api;
 
 // ------------------------------------------------------------- подставной fetch
@@ -236,6 +238,26 @@ async function main() {
     3
   );
 
+  // ---- 3в. автор канала: место в схеме и честное молчание ---------------
+  // publisher_id жил в channel.source. Схема платформы меняется, и если поле
+  // уехало, фильтр от чужих статей выключался молча: рекомендации попадали в
+  // карту, в ссылки статьи и в выгруженный sitemap.xml.
+  check(
+    "автор: обычное место publisher_id",
+    channelOwner && channelOwner({ channel: { source: { publisher_id: "111" } } }) === "111",
+    String(channelOwner && channelOwner({ channel: { source: { publisher_id: "111" } } }))
+  );
+  check(
+    "автор: запасное место channel.publisher_id",
+    channelOwner && channelOwner({ channel: { publisher_id: "112" } }) === "112",
+    String(channelOwner && channelOwner({ channel: { publisher_id: "112" } }))
+  );
+  check(
+    "автор: нет данных — автор неизвестен",
+    channelOwner && channelOwner({}) === "",
+    String(channelOwner && channelOwner({}))
+  );
+
   // ---- 4. постраничный обход ---------------------------------------------
   routes = {
     [EXPORT]: { body: { items: [card(DZ + "aaa", "Первая статья")], more: { link: MORE } } },
@@ -276,6 +298,43 @@ async function main() {
     "обход: чужой автор отсеян на обеих страницах",
     (await loadChannel("auto-dom24.ru")).map((a) => a.url),
     [DZ + "aaa"]
+  );
+
+  // Если source уехал, но publisher_id остался на самом канале — берём оттуда.
+  routes = {
+    [EXPORT]: {
+      body: {
+        channel: { publisher_id: "111" },
+        items: [card(DZ + "aaa", "Своя", "111"), card(DZ + "alien", "Чужая", "222")],
+        more: {}
+      }
+    }
+  };
+  eq(
+    "обход: автор найден без channel.source",
+    (await loadChannel("auto-dom24.ru")).map((a) => a.url),
+    [DZ + "aaa"]
+  );
+
+  // Если сведений о канале нет вовсе, своих видно по самим карточкам: в ленте
+  // канала они в явном перевесе. Половина на половину — не повод гадать.
+  routes = {
+    [EXPORT]: {
+      body: {
+        items: [
+          card(DZ + "a1", "Своя 1", "111"),
+          card(DZ + "a2", "Своя 2", "111"),
+          card(DZ + "a3", "Своя 3", "111"),
+          card(DZ + "alien", "Чужая", "222")
+        ],
+        more: {}
+      }
+    }
+  };
+  eq(
+    "обход: автор выведен из карточек по перевесу",
+    (await loadChannel("auto-dom24.ru")).map((a) => a.url),
+    [DZ + "a1", DZ + "a2", DZ + "a3"]
   );
 
   // ---- 5. кэш карты -------------------------------------------------------
@@ -395,6 +454,45 @@ async function main() {
   eq("сборка: без карты ссылка ведёт на сам канал", fallback.links[0].url, "https://dzen.ru/auto-dom24.ru");
   eq("сборка: вид ссылки — канал", fallback.links[0].kind, "site");
   eq("сборка: в отчёте названы необойдённые каналы", fallback.stats.noChannel, ["auto-dom24.ru"]);
+
+  // ---- 7в. фильтр по автору ----------------------------------------------
+  // Автор не определяется — фильтр от чужих статей не включён. Молчать об этом
+  // нельзя: рекомендации попадут в карту, в ссылки статьи и в sitemap.xml.
+  for (const k of Object.keys(localStore)) delete localStore[k];
+  routes = {
+    [EXPORT]: { body: { items: [card(DZ + "aaa", "Renault Trucks T High на маршруте")], more: {} } }
+  };
+  const blind = await buildLinks(
+    text,
+    { ...DEFAULTS, linkSites: "", linkChannels: "auto-dom24.ru" },
+    { refresh: true, rand: () => 0 }
+  );
+  eq("сборка: без автора канала фильтр назван в отчёте", blind.stats.noOwner, ["auto-dom24.ru"]);
+
+  for (const k of Object.keys(localStore)) delete localStore[k];
+  routes = {
+    [EXPORT]: {
+      body: {
+        channel: { source: { publisher_id: "111" } },
+        items: [
+          card(DZ + "aaa", "Renault Trucks T High на маршруте", "111"),
+          card(DZ + "alien", "Чужой текст", "222")
+        ],
+        more: {}
+      }
+    }
+  };
+  const knowing = await buildLinks(
+    text,
+    { ...DEFAULTS, linkSites: "", linkChannels: "auto-dom24.ru" },
+    { refresh: true, rand: () => 0 }
+  );
+  eq("сборка: при известном авторе жалобы нет", knowing.stats.noOwner, []);
+  check(
+    "сборка: чужая карточка не стала ссылкой",
+    !knowing.links.some((l) => l.url === DZ + "alien"),
+    JSON.stringify(knowing.links.map((l) => l.url))
+  );
 
   // Ничего не указано — работаем как раньше, без единого запроса.
   for (const k of Object.keys(localStore)) delete localStore[k];

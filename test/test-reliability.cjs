@@ -1863,6 +1863,79 @@ async function main() {
     }
   }
 
+  console.log("\n=== 39. кэш карт: потолок записей, квота и очистка ===");
+  {
+    // dzrSitemaps и dzrChannels росли без предела: каждая прочитанная карта
+    // остаётся в storage.local навсегда. Упёршись в квоту, запись падала и
+    // глоталась, а «Очистить кэш» эти ключи не трогал — кэш терялся молча.
+    const qStore = {};
+    const QUOTA = 9000;
+    const qChrome = Object.assign({}, chrome, {
+      storage: {
+        ...chrome.storage,
+        local: {
+          get: async (key) =>
+            qStore[key] === undefined ? {} : { [key]: JSON.parse(JSON.stringify(qStore[key])) },
+          set: async (obj) => {
+            const text = JSON.stringify(obj);
+            if (text.length > QUOTA) throw new Error("QUOTA_BYTES quota exceeded");
+            for (const [k, v] of Object.entries(obj)) qStore[k] = JSON.parse(JSON.stringify(v));
+          },
+          remove: async (key) => {
+            delete qStore[key];
+          }
+        }
+      }
+    });
+    const cacheApi = new Function(
+      "chrome",
+      src +
+        "\nreturn { mergeLocalCache, SITEMAP_CACHE_KEY, " +
+        ' LOCAL_CACHE_MAX_ENTRIES: typeof LOCAL_CACHE_MAX_ENTRIES === "number" ? LOCAL_CACHE_MAX_ENTRIES : null };'
+    )(qChrome);
+    const KEY = "dzrSitemaps";
+
+    const seeded = {};
+    for (let i = 0; i < 12; i++) seeded["old" + i + ".ru"] = { at: i, urls: ["https://old" + i + ".ru/"] };
+    qStore[KEY] = seeded;
+    await cacheApi.mergeLocalCache(KEY, "new.ru", { at: 100, urls: [] });
+    const kept = qStore[KEY] || {};
+    const limit = cacheApi.LOCAL_CACHE_MAX_ENTRIES;
+    check("потолок записей кэша карт задан", typeof limit === "number" && limit > 0, "потолок: " + limit);
+    check(
+      "кэш не растёт сверх потолка",
+      !!limit && Object.keys(kept).length <= limit,
+      "записей: " + Object.keys(kept).length
+    );
+    check("свежая запись на месте", !!kept["new.ru"], Object.keys(kept).join(" "));
+    check("самая старая запись вытеснена", !kept["old0.ru"], Object.keys(kept).join(" "));
+
+    // Квота: запись падает — ужимаемся и пробуем снова. Новая карта не должна
+    // пропадать только потому, что старые ещё лежат в хранилище.
+    for (const k of Object.keys(qStore)) delete qStore[k];
+    const blob = "x".repeat(2500);
+    const fat = {};
+    for (let i = 0; i < 6; i++) fat["fat" + i + ".ru"] = { at: i, urls: [blob] };
+    qStore[KEY] = fat;
+    await cacheApi.mergeLocalCache(KEY, "fresh.ru", { at: 100, urls: ["https://fresh.ru/"] });
+    const after = qStore[KEY] || {};
+    check("после квоты запись повторена, а не потеряна", !!after["fresh.ru"], Object.keys(after).join(" "));
+    check(
+      "после квоты запись ужата под потолок хранилища",
+      JSON.stringify({ [KEY]: after }).length <= QUOTA,
+      "длина: " + JSON.stringify({ [KEY]: after }).length
+    );
+    check("ужатие вытеснило старые карты", Object.keys(after).length < 6, "записей: " + Object.keys(after).length);
+
+    // «Очистить кэш» обязан убирать и карты — иначе они не удаляются никогда.
+    localStore.dzrSitemaps = { "a.ru": { at: 1, urls: [] } };
+    localStore.dzrChannels = { ch: { at: 1, articles: [] } };
+    localStore.dzrCache = { k: { at: 1, t: "x" } };
+    await clearCache();
+    check("очистка кэша убирает карты сайтов", localStore.dzrSitemaps === undefined);
+    check("очистка кэша убирает карты каналов", localStore.dzrChannels === undefined);
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);

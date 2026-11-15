@@ -52,7 +52,7 @@ const SRC_TEXT = fs.readFileSync(SRC, "utf8");
 const api = new Function(
   "chrome",
   SRC_TEXT +
-    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap, sitemapFor, SITE_MAX_BYTES };"
+    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap, sitemapFor, SITE_MAX_BYTES, SITEMAP_CACHE_KEY };"
 )(chrome);
 
 const {
@@ -67,7 +67,8 @@ const {
   sitemapFor,
   buildLinks,
   loadSitemap,
-  SITE_MAX_BYTES
+  SITE_MAX_BYTES,
+  SITEMAP_CACHE_KEY
 } = api;
 
 // ------------------------------------------------------------- подставной fetch
@@ -859,6 +860,85 @@ async function main() {
     res = await buildLinks("Toyota Camry", { linkSites: "big.ru" }, { refresh: true, rand: () => 0 });
     eq("сборка: слишком большая карта — отдельная причина", res.stats.bigMap, ["big.ru"]);
     eq("сборка: слишком большая карта не числится отсутствующей", res.stats.noSitemap, []);
+  }
+
+  // ---- 20. чужие хосты в карте -------------------------------------------
+  // Карта сайта — чужой файл: в ней может стоять адрес другого домена (ошибка
+  // выгрузки, взломанный сайт или SSRF-приманка). Такой адрес попадал в href
+  // статьи и в выгруженный sitemap.xml, а вложенная карта на чужом хосте ещё и
+  // скачивалась. Сверяем хост каждого найденного адреса с сайтом из списка.
+  for (const k of Object.keys(localStore)) delete localStore[k];
+  {
+    routes = {
+      "https://own.ru/sitemap.xml": {
+        body: sm(["https://own.ru/toyota-camry/", "https://chuzhoy.example/page/"])
+      }
+    };
+    const own = await loadSitemap("https://own.ru/sitemap.xml", null);
+    eq("чужая карта: адрес чужого хоста не берётся", own.urls, ["https://own.ru/toyota-camry/"]);
+    eq("чужая карта: чужой хост назван", own.foreign, ["chuzhoy.example"]);
+
+    // Вложенная карта на чужом хосте не скачивается вовсе — иначе чужой
+    // сервер получал бы запрос от имени расширения.
+    fetched.length = 0;
+    routes = {
+      "https://idx.ru/sitemap.xml": {
+        body: smIndex(["https://idx.ru/part.xml", "https://chuzhoy.example/part.xml"])
+      },
+      "https://idx.ru/part.xml": { body: sm(["https://idx.ru/toyota-camry/"]) }
+    };
+    const idx = await loadSitemap("https://idx.ru/sitemap.xml", null);
+    eq("вложенная карта: свои адреса прочитаны", idx.urls, ["https://idx.ru/toyota-camry/"]);
+    check(
+      "вложенная карта: чужой хост не скачивался",
+      !fetched.some((u) => /chuzhoy\.example/.test(u)),
+      fetched.join(" ")
+    );
+
+    // Домен с www и без — один и тот же сайт.
+    routes = {
+      "https://www.wwws.ru/sitemap.xml": {
+        body: sm(["https://wwws.ru/toyota-camry/", "https://www.wwws.ru/volvo-xc40/"])
+      },
+      "https://dom.ru/sitemap.xml": { body: sm(["https://www.dom.ru/toyota-camry/"]) }
+    };
+    eq(
+      "www: адрес без www от своего сайта принимается",
+      (await loadSitemap("https://www.wwws.ru/sitemap.xml", null)).urls,
+      ["https://wwws.ru/toyota-camry/", "https://www.wwws.ru/volvo-xc40/"]
+    );
+    eq(
+      "www: адрес с www от своего сайта принимается",
+      (await loadSitemap("https://dom.ru/sitemap.xml", null)).urls,
+      ["https://www.dom.ru/toyota-camry/"]
+    );
+
+    // Относительный адрес и javascript: в href — не ссылка на статью.
+    routes = {
+      "https://rel.ru/sitemap.xml": {
+        body: sm(["/relative/", "javascript:alert(1)", "https://rel.ru/toyota-camry/"])
+      }
+    };
+    eq(
+      "чужая карта: относительные и javascript-адреса отброшены",
+      (await loadSitemap("https://rel.ru/sitemap.xml", null)).urls,
+      ["https://rel.ru/toyota-camry/"]
+    );
+
+    // Запись в кэше могла лечь до этой правки — её тоже фильтруем.
+    localStore[SITEMAP_CACHE_KEY] = {
+      "cached.ru": { at: Date.now(), urls: ["https://chuzhoy.example/x/"], tags: [] }
+    };
+    const fromCache = await sitemapFor("https://cached.ru", null, false);
+    eq("старый кэш: чужой адрес не отдаётся", fromCache.urls, []);
+
+    // И это видно в отчёте: молча пустая карта читалась бы как «материала нет».
+    routes = {
+      "https://mix.ru/sitemap.xml": { body: sm(["https://chuzhoy.example/toyota-camry-obzor/"]) }
+    };
+    const mixed = await buildLinks("Toyota Camry", { linkSites: "mix.ru" }, { refresh: true, rand: () => 0 });
+    check("сборка: чужая ссылка не поставлена", !mixed.links.some((l) => /chuzhoy/.test(l.url)), JSON.stringify(mixed.links));
+    eq("сборка: чужой хост назван в статистике", mixed.stats.foreign, ["mix.ru: chuzhoy.example"]);
   }
 
   // ---- итог ---------------------------------------------------------------

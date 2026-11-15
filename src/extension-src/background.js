@@ -634,6 +634,13 @@ async function clearCache() {
   try {
     await chrome.storage.local.remove(["dzrCache"]);
   } catch (e) {}
+  // Карты сайтов и каналов раньше не удалялись вовсе: у кэша переводов была
+  // кнопка, а у них — нет. Записи оставались в хранилище навсегда.
+  for (const key of [SITEMAP_CACHE_KEY, CHANNEL_CACHE_KEY]) {
+    try {
+      await chrome.storage.local.remove(key);
+    } catch (e) {}
+  }
 }
 
 // ------------------------------------------------- определение языка ---
@@ -1112,6 +1119,20 @@ function hostOf(url) {
   return m ? m[1].toLowerCase() : "";
 }
 
+/**
+ * Адрес принадлежит тому же сайту. Карта сайта — чужой файл: в ней может
+ * стоять адрес другого домена (ошибка выгрузки, взлом, SSRF-приманка), и
+ * такой адрес не должен ни скачиваться, ни попадать в href статьи.
+ * www — тот же сайт: у многих выгрузок адреса идут то с ним, то без.
+ */
+function sameHost(url, site) {
+  const a = hostOf(url);
+  const b = hostOf(site);
+  if (!a || !b) return false; // относительный или javascript: — не адрес статьи
+  const bare = (h) => h.replace(/^www\./, "");
+  return bare(a) === bare(b);
+}
+
 /** Ссылки на вложенные карты в sitemapindex — их тоже надо прочитать. */
 function isSitemapIndex(xml) {
   return /<sitemapindex[\s>]/i.test(String(xml || ""));
@@ -1206,11 +1227,37 @@ async function readLocalCache(key) {
   }
 }
 
+// Карта сайта — до 5000 адресов, карта канала — до 300 статей. Без потолка
+// записи копятся годами, упираются в квоту storage.local и перестают
+// сохраняться вовсе: свежая карта не пишется, старая не удаляется.
+const LOCAL_CACHE_MAX_ENTRIES = 8;
+const LOCAL_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+
+/** Оставить самые свежие записи в пределах потолка записей и размера. */
+function trimLocalCache(cache) {
+  const entries = Object.entries(cache || {}).sort(
+    (a, b) => (Number(b[1] && b[1].at) || 0) - (Number(a[1] && a[1].at) || 0)
+  );
+  const kept = entries.slice(0, LOCAL_CACHE_MAX_ENTRIES);
+  while (kept.length > 1 && JSON.stringify(Object.fromEntries(kept)).length > LOCAL_CACHE_MAX_BYTES) {
+    kept.pop();
+  }
+  return Object.fromEntries(kept);
+}
+
 async function writeLocalCache(key, cache) {
-  try {
-    await chrome.storage.local.set({ [key]: cache });
-  } catch (e) {
-    /* кэш — не ценность: не сохранился, прочитаем в следующий раз */
+  let data = trimLocalCache(cache);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await chrome.storage.local.set({ [key]: data });
+      return;
+    } catch (e) {
+      // Квота: ужимаемся до свежей половины и пробуем ещё раз. Молчаливая
+      // потеря новой карты из-за старых записей — худший из вариантов.
+      const entries = Object.entries(data);
+      if (entries.length <= 1) return;
+      data = Object.fromEntries(entries.slice(0, Math.max(1, Math.floor(entries.length / 2))));
+    }
   }
 }
 
@@ -1430,6 +1477,7 @@ async function readLimited(res, maxBytes) {
 async function loadSitemap(site, signal) {
   const queue = sitemapCandidates(site);
   const urls = [];
+  const hosts = [];
   let files = 0;
   let read = false;
   let big = false;
@@ -1457,15 +1505,26 @@ async function loadSitemap(site, signal) {
     }
     const locs = parseSitemap(xml);
     const index = isSitemapIndex(xml);
+    const own = [];
+    const foreign = [];
+    for (const loc of locs) {
+      if (sameHost(loc, site)) {
+        own.push(loc);
+        continue;
+      }
+      const h = hostOf(loc);
+      if (h && foreign.indexOf(h) === -1) foreign.push(h);
+    }
     // «Карта есть» — это когда из файла хоть что-то достали. Пустой ответ,
     // заглушка антибота или html вместо xml читаются как «карты нет»: у такого
     // источника нет материалов, и врать про них в отчёте не нужно.
     if (locs.length || index) read = true;
-    if (index) queue.push.apply(queue, locs.slice(0, SITEMAP_MAX_FILES - files));
-    else urls.push.apply(urls, locs);
+    if (index) queue.push.apply(queue, own.slice(0, SITEMAP_MAX_FILES - files));
+    else urls.push.apply(urls, own);
+    for (const h of foreign) if (hosts.indexOf(h) === -1) hosts.push(h);
     if (urls.length >= SITEMAP_MAX_URLS) break;
   }
-  return { urls: urls.slice(0, SITEMAP_MAX_URLS), tried, read, big };
+  return { urls: urls.slice(0, SITEMAP_MAX_URLS), tried, read, big, foreign: hosts };
 }
 
 async function sitemapFor(site, signal, refresh) {
@@ -1480,12 +1539,16 @@ async function sitemapFor(site, signal, refresh) {
   const key = hostOf(site) + path;
   const cache = await readLocalCache(SITEMAP_CACHE_KEY);
   const hit = cache[key];
+  // Запись могла лечь до проверки хоста — фильтруем и кэш, а не только сеть.
+  const own = (list) => (list || []).filter((u) => sameHost(u, site));
   if (!refresh && hit && Date.now() - hit.at < SITEMAP_TTL) {
     // Запись прошлой версии — плоский список, где статьи лежат вперемешку с
     // рубриками. Перечитываем её через то же деление: сети не просим, профиль
     // не чистим, но подборка не встаёт под якорь как статья.
-    if (!Array.isArray(hit.tags)) return Object.assign(splitSitemapUrls(hit.urls || []), { read: true, big: !!hit.big });
-    return { urls: hit.urls || [], tags: hit.tags, read: true, big: !!hit.big };
+    if (!Array.isArray(hit.tags)) {
+      return Object.assign(splitSitemapUrls(own(hit.urls)), { read: true, big: !!hit.big, foreign: [] });
+    }
+    return { urls: own(hit.urls), tags: own(hit.tags), read: true, big: !!hit.big, foreign: [] };
   }
 
   const res = await loadSitemap(site, signal);
@@ -1496,7 +1559,7 @@ async function sitemapFor(site, signal, refresh) {
     // оборвали, и предупреждение пропало бы без следа.
     await mergeLocalCache(SITEMAP_CACHE_KEY, key, { at: Date.now(), urls: map.urls, tags: map.tags, big: !!res.big });
   }
-  return Object.assign(map, { read: res.read, big: !!res.big });
+  return Object.assign(map, { read: res.read, big: !!res.big, foreign: res.foreign || [] });
 }
 
 /** Адрес элемента пула: строка (карта сайта) или {url, title} (статья канала). */
@@ -1696,12 +1759,58 @@ function channelPageArticles(data, owner) {
   return out;
 }
 
+/**
+ * Автор канала по ответу выдачи. publisher_id жил в channel.source, но схема
+ * платформы меняется: если поле уехало, смотрим соседние места. Без этого
+ * фильтр от чужих статей выключался молча и в карту попадали рекомендации.
+ */
+function channelOwner(data) {
+  const ch = (data && data.channel) || {};
+  const src = ch.source || {};
+  for (const v of [src.publisher_id, ch.publisher_id, src.channel_id, ch.channel_id]) {
+    const id = v == null ? "" : String(v).trim();
+    if (id) return id;
+  }
+  return "";
+}
+
+/** publisher_id карточек страницы: их видно, даже когда блок channel пропал. */
+function publisherIds(data) {
+  const out = [];
+  for (const it of (data && data.items) || []) {
+    if (!it || it.type !== "card" || it.publisher_id == null) continue;
+    const id = String(it.publisher_id).trim();
+    if (id) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Автор по самим карточкам: в ленте канала своих статей явное большинство.
+ * Берём преобладающий id только при перевесе в 60% и хотя бы трёх карточках:
+ * при случайном совпадении фильтр отсёк бы половину карты.
+ */
+function ownerFromItems(ids) {
+  const counts = new Map();
+  for (const id of ids) counts.set(id, (counts.get(id) || 0) + 1);
+  let best = "";
+  let n = 0;
+  for (const [id, c] of counts) {
+    if (c > n) {
+      best = id;
+      n = c;
+    }
+  }
+  return ids.length >= 3 && n * 5 >= ids.length * 3 ? best : "";
+}
+
 /** Обходим выдачу канала, пока платформа даёт следующую страницу. */
-async function loadChannel(name, signal) {
+async function loadChannelMap(name, signal) {
   const articles = [];
   const seen = new Set();
   let url = CHANNEL_API + "?channel_name=" + encodeURIComponent(name);
   let owner = "";
+  let ownerUnknown = false;
   let pages = 0;
   while (url && pages < CHANNEL_MAX_PAGES && articles.length < CHANNEL_MAX_ARTICLES) {
     pages++;
@@ -1712,9 +1821,11 @@ async function loadChannel(name, signal) {
       if (isAbort(e) || (signal && signal.aborted)) throw abortErr();
       break; // первая страница не открылась — обход бессмысленен
     }
-    if (!owner && data && data.channel && data.channel.source) {
-      owner = String(data.channel.source.publisher_id || "");
-    }
+    const ids = publisherIds(data);
+    if (!owner) owner = channelOwner(data) || ownerFromItems(ids);
+    // Автор не нашёлся — фильтр от чужих статей не включён. Это надо сказать
+    // в отчёте: иначе рекомендации уедут в ссылки статьи и в sitemap.xml.
+    if (pages === 1) ownerUnknown = !owner;
     for (const a of channelPageArticles(data, owner)) {
       if (seen.has(a.url)) continue;
       seen.add(a.url);
@@ -1725,21 +1836,36 @@ async function loadChannel(name, signal) {
     const next = data && data.more && data.more.link;
     url = typeof next === "string" ? next : "";
   }
-  return articles.slice(0, CHANNEL_MAX_ARTICLES);
+  return { articles: articles.slice(0, CHANNEL_MAX_ARTICLES), ownerUnknown };
+}
+
+async function loadChannel(name, signal) {
+  return (await loadChannelMap(name, signal)).articles;
+}
+
+/** Карта канала вместе с признаком «автор неизвестен»: из кэша или обходом. */
+async function channelMap(name, signal, refresh) {
+  const cache = await readLocalCache(CHANNEL_CACHE_KEY);
+  const hit = cache[name];
+  if (!refresh && hit && Date.now() - hit.at < CHANNEL_TTL) {
+    return { articles: hit.articles || [], ownerUnknown: !!hit.ownerUnknown };
+  }
+
+  const res = await loadChannelMap(name, signal);
+  // Пустой обход не затирает прежнюю карту: сеть могла просто отвалиться.
+  if (res.articles.length) {
+    await mergeLocalCache(CHANNEL_CACHE_KEY, name, {
+      at: Date.now(),
+      articles: res.articles,
+      ownerUnknown: res.ownerUnknown
+    });
+  }
+  return res;
 }
 
 /** Карта канала: из кэша или обходом. refresh — обойти заново. */
 async function channelArticles(name, signal, refresh) {
-  const cache = await readLocalCache(CHANNEL_CACHE_KEY);
-  const hit = cache[name];
-  if (!refresh && hit && Date.now() - hit.at < CHANNEL_TTL) return hit.articles;
-
-  const articles = await loadChannel(name, signal);
-  // Пустой обход не затирает прежнюю карту: сеть могла просто отвалиться.
-  if (articles.length) {
-    await mergeLocalCache(CHANNEL_CACHE_KEY, name, { at: Date.now(), articles });
-  }
-  return articles;
+  return (await channelMap(name, signal, refresh)).articles;
 }
 
 /**
@@ -1882,6 +2008,8 @@ async function buildLinks(text, settings, opts = {}) {
     noSitemap: [],
     bigMap: [],
     noChannel: [],
+    foreign: [],
+    noOwner: [],
     siteOnly: 0,
     tagLinks: 0,
     unmapped: []
@@ -1927,17 +2055,28 @@ async function buildLinks(text, settings, opts = {}) {
     // сжать саму карту на сайте.
     if (map.big) stats.bigMap.push(hostOf(site) || site);
     else if (!map.read) stats.noSitemap.push(hostOf(site) || site);
+    // Чужие адреса из карты — не «карты нет»: файл прочитан, но часть
+    // адресов ведёт не на этот сайт. Человек должен видеть, что мы их выкинули.
+    if (map.foreign && map.foreign.length) {
+      stats.foreign.push((hostOf(site) || site) + ": " + map.foreign.join(", "));
+    }
     pools.set(site, map);
   }
   for (const name of channels) {
     let list = [];
+    let ownerUnknown = false;
     try {
-      list = await channelArticles(name, opts.signal, opts.refresh);
+      const map = await channelMap(name, opts.signal, opts.refresh);
+      list = map.articles;
+      ownerUnknown = map.ownerUnknown;
     } catch (e) {
       if (isAbort(e) || (opts.signal && opts.signal.aborted)) throw abortErr();
       list = [];
     }
     if (!list.length) stats.noChannel.push(name);
+    // Фильтр от чужих статей не включён — говорим об этом, а не делаем вид,
+    // что карта канала полная и своя.
+    if (ownerUnknown) stats.noOwner.push(name);
     pools.set(channelUrl(name), { urls: list, tags: [], read: !!list.length });
   }
 

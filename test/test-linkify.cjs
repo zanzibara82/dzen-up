@@ -80,6 +80,16 @@ const CHANNEL_FEED = {
   more: {}
 };
 
+// Лента без сведений об авторе: ни channel, ни publisher_id у карточек.
+// Фильтр от чужих статей тут невозможен, и отчёт обязан сказать это вслух.
+const OWNERLESS_FEED = {
+  items: [
+    { type: "card", share_link: CHANNEL_ARTICLES.volvo, title: "Volvo XC40: честный отзыв после 100 000 км" },
+    { type: "card", share_link: CHANNEL_ARTICLES.scania, title: "Scania T143 — почему её до сих пор покупают" }
+  ],
+  more: {}
+};
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const results = [];
@@ -151,6 +161,11 @@ function startServer() {
       if (name === "broken-channel") {
         res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
         res.end("{}");
+        return;
+      }
+      if (name === "ownerless-channel") {
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(OWNERLESS_FEED));
         return;
       }
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -609,6 +624,25 @@ async function main() {
     check(
       "канал не обошёлся: глагол согласован с числом",
       /1 ведёт на сам канал/.test(toast) && !/1 ведут/.test(toast),
+      toast.replace(/\n/g, " | ")
+    );
+
+    // ==================== 8в. лента без автора ====================
+    // Фильтр от чужих статей включается только при известном авторе. Если
+    // платформа перестала отдавать publisher_id, фильтр молча выключается, и
+    // рекомендации чужих каналов уезжают в ссылки и в sitemap.xml. Человеку
+    // об этом надо сказать, а не делать вид, что всё хорошо.
+    console.log("\n=== 8в. у ленты канала нет автора ===");
+    await setSettings({ linkSites: "", linkChannels: "ownerless-channel", linkCount: 2, stripLinks: "keep" });
+    await openPage();
+    toast = await runLinkify();
+    after = await snapshot();
+    console.log("  уведомление: %j", toast.replace(/\n/g, " | "));
+    console.log("  ссылки: %j", after.links.map((l) => l.text + " → " + l.href));
+    check("без автора: ссылки всё равно поставлены", after.links.length === 2, String(after.links.length));
+    check(
+      "без автора: отчёт предупреждает, что фильтр не включён",
+      /автор канала не определён/i.test(toast),
       toast.replace(/\n/g, " | ")
     );
 
