@@ -2,11 +2,13 @@
 /**
  * Собирает готовую к загрузке папку расширения и zip из src/extension-src.
  *
- *   node tools/build-extension.cjs [--out <папка>] [--no-zip]
+ *   node tools/build-extension.cjs [--out <папка>] [--out=<папка>] [--no-zip] [--force]
  *
  * По умолчанию кладёт результат рядом с репозиторием (..\dzen-rewriter) —
  * именно эту папку грузят в Chrome через «Загрузить распакованное расширение».
- * Переопределить: аргументом --out или переменной DZR_OUT.
+ * Переопределить: аргументом --out или переменной DZR_OUT. Существующую папку
+ * с другим именем сборщик без --force не трогает: рядом с установкой легко
+ * завести резервную копию, и стереть её из-за опечатки в --out нельзя.
  *
  * Зависимостей нет: zip пишется встроенным zlib, чтобы сборка работала
  * на голом Node без npm install.
@@ -114,14 +116,43 @@ function makeZip(entries) {
 
 // ----------------------------------------------------------------- main ---
 
+function usage(msg) {
+  console.error(msg + "\n\n  node tools/build-extension.cjs [--out <папка>] [--out=<папка>] [--no-zip] [--force]");
+  process.exit(2);
+}
+
 function parseArgs(argv) {
-  const out = { out: process.env.DZR_OUT || path.join(REPO, "..", "dzen-rewriter"), zip: true };
+  const out = { out: process.env.DZR_OUT || path.join(REPO, "..", "dzen-rewriter"), zip: true, force: false };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--out" && argv[i + 1]) out.out = path.resolve(argv[++i]);
-    else if (argv[i] === "--no-zip") out.zip = false;
+    const a = argv[i];
+    if (a === "--no-zip") out.zip = false;
+    else if (a === "--force") out.force = true;
+    else if (a === "--out" || a.startsWith("--out=")) {
+      const v = a === "--out" ? argv[++i] : a.slice("--out=".length);
+      if (!v || (a === "--out" && v.startsWith("--"))) usage("--out ждёт путь к папке");
+      out.out = v;
+    } else {
+      // Молча проглоченная опечатка оставляла путь по умолчанию — живую папку
+      // установки, — и сборщик сносил её.
+      usage("неизвестный аргумент: " + a);
+    }
   }
   out.out = path.resolve(out.out);
   return out;
+}
+
+/** Файлы, на которые ссылается манифест: без них пакет не загрузится. */
+function manifestRefs(manifest) {
+  const refs = [];
+  if (manifest.background && manifest.background.service_worker) refs.push(manifest.background.service_worker);
+  for (const cs of manifest.content_scripts || []) refs.push(...(cs.js || []), ...(cs.css || []));
+  if (manifest.action && manifest.action.default_popup) refs.push(manifest.action.default_popup);
+  if (manifest.options_ui && manifest.options_ui.page) refs.push(manifest.options_ui.page);
+  for (const p of Object.values(manifest.icons || {})) refs.push(p);
+  for (const war of manifest.web_accessible_resources || []) {
+    for (const r of war.resources || []) if (!r.includes("*")) refs.push(r);
+  }
+  return refs;
 }
 
 function main() {
@@ -138,54 +169,62 @@ function main() {
 
   const manifest = JSON.parse(fs.readFileSync(path.join(SRC, "manifest.json"), "utf8"));
 
-  // 2. папка. Страховка: сносим только то, что похоже на нашу выходную папку —
-  // иначе опечатка в --out могла бы удалить что-то чужое.
-  if (fs.existsSync(args.out) && !/^dzen-rewriter/.test(path.basename(args.out))) {
+  const notShipped = manifestRefs(manifest).filter((rel) => payload.indexOf(rel) < 0);
+  if (notShipped.length) {
+    console.error("МАНИФЕСТ ССЫЛАЕТСЯ НА ФАЙЛЫ ВНЕ СПИСКА СБОРКИ:");
+    notShipped.forEach((m) => console.error("  " + m));
+    process.exit(1);
+  }
+
+  // 2. папка. Существующую папку с другим именем не трогаем без --force:
+  // «dzen-rewriter-backup» и «dzen-rewriter (копия)» — тоже живые папки, и
+  // стереть их из-за невнимательного --out нельзя.
+  const base = path.basename(args.out);
+  if (fs.existsSync(args.out) && base !== "dzen-rewriter" && !args.force) {
     console.error(
-      "Отказываюсь перезаписывать «" + args.out + "»: имя папки не похоже на сборочную.\n" +
-        "Ожидается папка с именем, начинающимся на «dzen-rewriter»."
+      "Отказываюсь перезаписывать «" + args.out + "»: имя папки не «dzen-rewriter».\n" +
+        "Если это правда сборочная папка, повторите с --force."
     );
     process.exit(1);
   }
 
-  // Подобранные фотографии лежат внутри папки установки, а сборка сносит её
-  // целиком. Переносим news в соседний временный путь до rmSync и возвращаем
-  // после копирования; сосед — та же файловая система, иначе rename упрётся в EXDEV.
-  const NEWS = path.join(args.out, "news");
-  let newsBackup = null;
-  if (fs.existsSync(NEWS)) {
-    newsBackup = fs.mkdtempSync(path.join(path.dirname(args.out), ".dzr-news-"));
-    fs.renameSync(NEWS, path.join(newsBackup, "news"));
-  }
-
+  // Сборка идёт в соседнюю временную папку и подменяет установку переименованием:
+  // осечка посередине копирования не оставит смесь старого и нового кода.
+  // Подобранные фотографии лежат внутри папки установки (news), поэтому они
+  // переезжают в новую папку до того, как старая сойдёт с места.
+  fs.mkdirSync(path.dirname(args.out), { recursive: true });
+  const staging = fs.mkdtempSync(path.join(path.dirname(args.out), "." + base + "-new-"));
+  const oldPath = path.join(path.dirname(args.out), "." + base + "-old-" + process.pid);
+  let newsMoved = false;
   try {
-    fs.rmSync(args.out, { recursive: true, force: true });
     for (const rel of payload) {
-      const dst = path.join(args.out, rel);
+      const dst = path.join(staging, rel);
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       fs.copyFileSync(path.join(SRC, rel), dst);
     }
+    const NEWS = path.join(args.out, "news");
+    if (fs.existsSync(NEWS)) {
+      fs.renameSync(NEWS, path.join(staging, "news"));
+      newsMoved = true;
+    }
+    if (fs.existsSync(args.out)) fs.renameSync(args.out, oldPath);
+    fs.renameSync(staging, args.out);
   } catch (e) {
-    if (newsBackup) {
-      try {
-        fs.mkdirSync(args.out, { recursive: true });
-        fs.renameSync(path.join(newsBackup, "news"), NEWS);
-        newsBackup = null;
-      } catch (e2) {
-        console.error("НЕ УДАЛОСЬ ВЕРНУТЬ ПАПКУ news. Она лежит здесь: " + path.join(newsBackup, "news"));
+    try {
+      if (!fs.existsSync(args.out) && fs.existsSync(oldPath)) fs.renameSync(oldPath, args.out);
+      if (newsMoved && !fs.existsSync(path.join(args.out, "news"))) {
+        fs.renameSync(path.join(staging, "news"), path.join(args.out, "news"));
       }
+      fs.rmSync(staging, { recursive: true, force: true });
+    } catch (e2) {
+      console.error("НЕ УДАЛОСЬ ВЕРНУТЬ СБОРОЧНЫЕ ФАЙЛЫ. Новая папка лежит здесь: " + staging);
     }
     throw e;
   }
-
-  if (newsBackup) {
-    try {
-      fs.renameSync(path.join(newsBackup, "news"), NEWS);
-      fs.rmSync(newsBackup, { recursive: true, force: true });
-    } catch (e) {
-      console.error("НЕ УДАЛОСЬ ВЕРНУТЬ ПАПКУ news. Она лежит здесь: " + path.join(newsBackup, "news"));
-      throw e;
-    }
+  try {
+    fs.rmSync(oldPath, { recursive: true, force: true });
+  } catch (e) {
+    console.error("Старая папка не удалилась, её можно стереть вручную: " + oldPath);
   }
 
   console.log("папка: " + args.out);

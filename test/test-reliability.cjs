@@ -1716,7 +1716,7 @@ async function main() {
       fs.mkdirSync(path.join(out, "news", "Тема"), { recursive: true });
       fs.writeFileSync(path.join(out, "news", "Тема", "01.jpg"), Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
       fs.writeFileSync(path.join(out, "старый.txt"), "мусор");
-      execFileSync(process.execPath, [path.join(PATHS.REPO, "tools", "build-extension.cjs"), "--out", out, "--no-zip"], { stdio: "pipe" });
+      execFileSync(process.execPath, [path.join(PATHS.REPO, "tools", "build-extension.cjs"), "--out", out, "--no-zip", "--force"], { stdio: "pipe" });
       const kept = fs.readFileSync(path.join(out, "news", "Тема", "01.jpg"));
       check("news/<тема>/01.jpg пережил пересборку",
         kept.length === 4 && kept[0] === 0xff && kept[3] === 0xe0, JSON.stringify(Array.from(kept)));
@@ -1726,6 +1726,74 @@ async function main() {
       check("пересборка с news не роняет набор", false, String((e && e.message) || e));
     } finally {
       if (out) fs.rmSync(out, { recursive: true, force: true });
+    }
+  }
+
+  console.log("\n=== 36. сборщик: строгие аргументы и защита чужой папки ===");
+  {
+    // Опечатка в имени аргумента раньше молча оставляла путь по умолчанию —
+    // живую папку установки, — и сборщик сносил её. Непонятный аргумент обязан
+    // остановить сборку до первого удаления.
+    const os = require("os");
+    const { spawnSync } = require("child_process");
+    const BUILDER = path.join(PATHS.REPO, "tools", "build-extension.cjs");
+    const run = (args) => spawnSync(process.execPath, [BUILDER, ...args], { encoding: "utf8" });
+    let root = "";
+    try {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), "bld-args-"));
+
+      const eq = path.join(root, "dzen-rewriter");
+      const eqRes = run(["--out=" + eq, "--no-zip"]);
+      check("форма --out=… понимается",
+        eqRes.status === 0 && fs.existsSync(path.join(eq, "manifest.json")),
+        String(eqRes.status) + " " + String(eqRes.stderr).slice(0, 120));
+
+      const typo = run(["--outt", path.join(root, "dzen-rewriter-typo"), "--no-zip"]);
+      check("опечатка в аргументе останавливает сборку", typo.status !== 0, String(typo.status));
+      check("опечатка названа в stderr", /--outt/.test(String(typo.stderr)), String(typo.stderr).slice(0, 160));
+
+      const noVal = run(["--out"]);
+      check("--out без значения останавливает сборку", noVal.status !== 0, String(noVal.status));
+
+      const backup = path.join(root, "dzen-rewriter-backup");
+      fs.mkdirSync(backup);
+      fs.writeFileSync(path.join(backup, "живое.txt"), "не трогать");
+      const bd = run(["--out", backup, "--no-zip"]);
+      check("папка не с именем установки без --force не тронута",
+        bd.status !== 0 && fs.existsSync(path.join(backup, "живое.txt")), String(bd.status));
+      const bf = run(["--out", backup, "--no-zip", "--force"]);
+      check("--force разрешает перезапись",
+        bf.status === 0 && fs.existsSync(path.join(backup, "manifest.json")) && !fs.existsSync(path.join(backup, "живое.txt")),
+        String(bf.status));
+
+      const exact = path.join(root, "exact", "dzen-rewriter");
+      fs.mkdirSync(exact, { recursive: true });
+      fs.writeFileSync(path.join(exact, "старый.txt"), "мусор");
+      const ex = run(["--out", exact, "--no-zip"]);
+      check("папка с точным именем пересобирается без --force",
+        ex.status === 0 && !fs.existsSync(path.join(exact, "старый.txt")), String(ex.status));
+
+      // Манифест ссылается на файл, которого нет в списке сборки: пакет
+      // получился бы незагружаемым. Сборщик обязан сказать это до сноса папки.
+      const copyRoot = path.join(root, "copy");
+      fs.cpSync(path.join(PATHS.REPO, "src"), path.join(copyRoot, "src"), { recursive: true });
+      fs.mkdirSync(path.join(copyRoot, "tools"), { recursive: true });
+      fs.copyFileSync(BUILDER, path.join(copyRoot, "tools", "build-extension.cjs"));
+      const manPath = path.join(copyRoot, "src", "extension-src", "manifest.json");
+      const man = JSON.parse(fs.readFileSync(manPath, "utf8"));
+      man.background.service_worker = "background2.js";
+      fs.writeFileSync(manPath, JSON.stringify(man, null, 2));
+      const badMan = spawnSync(
+        process.execPath,
+        [path.join(copyRoot, "tools", "build-extension.cjs"), "--out", path.join(root, "dzen-rewriter-copy"), "--no-zip"],
+        { encoding: "utf8" }
+      );
+      check("манифест со ссылкой на файл вне сборки останавливает сборку", badMan.status !== 0, String(badMan.status));
+      check("пропавший файл назван", /background2\.js/.test(String(badMan.stderr)), String(badMan.stderr).slice(0, 160));
+    } catch (e) {
+      check("строгие аргументы сборщика не роняют набор", false, String((e && e.message) || e));
+    } finally {
+      if (root) fs.rmSync(root, { recursive: true, force: true });
     }
   }
 
