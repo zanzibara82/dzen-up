@@ -605,6 +605,15 @@ check("README говорит про папку news", inReadme("news/"));
 check("README называет потолок 3 МБ", /3\s*МБ/.test(readme));
 check("README называет диапазон от 5 до 10", /от 5 до 10/.test(readme));
 
+// Команда «запустить» рассылается во все фреймы (all_frames). Проверка window.top
+// живёт только в boot(), а встроенная карточка Дзена — отдельный фрейм: без
+// стража у обработчика run там вспыхивал красный отказ при живом редакторе рядом.
+check(
+  "команда run не срабатывает в чужом фрейме",
+  /msg\.type\s*===\s*"run"[\s\S]{0,400}window\.top !== window\.self[\s\S]{0,200}run\(\)/.test(content),
+  "обработчик run"
+);
+
 // ------------------------------------------------------ 5. состав пакета совпадает ---
 const listed = ["manifest.json", "background.js", "content.js", "rewriter.js", "presets.js", "content.css"];
 for (const f of listed) {

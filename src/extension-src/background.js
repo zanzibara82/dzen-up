@@ -229,7 +229,9 @@ const CACHE_MAX = 500;
 const CONCURRENCY_GOOGLE = 4;
 const CONCURRENCY_MYMEMORY = 2;
 
-// активные переводы: requestId -> AbortController (для отмены из контент-скрипта)
+// активные переводы: requestId -> { ac, tabId }. Вкладка нужна, чтобы закрыть
+// прогон вместе с ней: панель исчезает, а платный вызов и сотни запросов
+// перевода продолжались бы в пустоту.
 const activeRequests = new Map();
 
 // Отмена, пришедшая в паузе между фазами одного прогона, иначе терялась: панель
@@ -241,10 +243,10 @@ const activeRequests = new Map();
 const cancelledRequests = new Set();
 
 /** Регистрирует фазу прогона; отменённый раньше id стартует уже отменённым. */
-function registerRequest(id) {
+function registerRequest(id, tabId) {
   const ac = new AbortController();
   if (cancelledRequests.has(id)) ac.abort(abortErr());
-  activeRequests.set(id, ac);
+  activeRequests.set(id, { ac, tabId: tabId == null ? null : tabId });
   return ac;
 }
 
@@ -504,8 +506,30 @@ function redactSecrets(text, secrets = []) {
   return out;
 }
 
-/** Простой пул: не больше `limit` одновременных задач, порядок результата сохраняется. */
-async function mapPool(items, limit, worker, signal) {
+/**
+ * Ждёт обещание, но не дольше `ms` и не переживает отмену.
+ *
+ * Нужен там, где работу нельзя прервать: `chrome.scripting.executeScript` не
+ * смотрит ни на signal, ни на таймаут, и без своего потолка «Отменить» ждало бы,
+ * пока чужой скрипт доработает на странице.
+ */
+function withDeadline(promise, signal, ms, timeoutMessage) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) return reject(abortErr());
+    let timer = null;
+    const done = (fn, v) => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      fn(v);
+    };
+    const onAbort = () => done(reject, abortErr());
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => done(reject, new Error(timeoutMessage)), ms);
+    promise.then((v) => done(resolve, v), (e) => done(reject, e));
+  });
+}
+
+/** Простой пул: не больше `limit` одновременных задач, порядок результата сохраняется. */async function mapPool(items, limit, worker, signal) {
   const out = new Array(items.length);
   let next = 0;
   let failure = null;
@@ -1976,6 +2000,7 @@ async function buildLinks(text, settings, opts = {}) {
 // что и у карт сайтов.
 
 const SOURCE_TIMEOUT_MS = 20000; // чужая страница грузится долго, но не вечно
+const SOURCE_PARSE_TIMEOUT_MS = 30000; // разбор уже загруженной страницы — это секунды
 const SOURCE_MIN_CHARS = 400; // тот же порог «это текст, а не обломки», что у панели
 const SOURCE_TABS_KEY = "dzrSourceTabs"; // вкладки забора, пережившие убийство воркера
 
@@ -2112,15 +2137,20 @@ async function fetchSourceText(url, opts = {}) {
     liveSourceTabs.add(tabId);
     await syncSourceTabs();
     await waitLoaded();
-    const injected = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: extractArticle,
-      // ISOLATED, а не MAIN: разбор читает DOM, ему не нужны переменные
-      // страницы. В мире страницы сайт подменил бы cloneNode или геттер
-      // innerHTML — и вернул бы нам произвольную разметку, которая затем
-      // попадает в предпросмотр и в статью.
-      world: "ISOLATED"
-    });
+    const injected = await withDeadline(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        func: extractArticle,
+        // ISOLATED, а не MAIN: разбор читает DOM, ему не нужны переменные
+        // страницы. В мире страницы сайт подменил бы cloneNode или геттер
+        // innerHTML — и вернул бы нам произвольную разметку, которая затем
+        // попадает в предпросмотр и в статью.
+        world: "ISOLATED"
+      }),
+      opts.signal,
+      SOURCE_PARSE_TIMEOUT_MS,
+      "Разбор страницы не уложился в " + Math.round(SOURCE_PARSE_TIMEOUT_MS / 1000) + " с"
+    );
     const found = injected && injected[0] ? injected[0].result : null;
     if (!found) throw new Error("На странице не нашлось текста.");
     // Порог ловит и заглушку антибота, и paywall, и страницу-описание: страница
@@ -2963,6 +2993,17 @@ if (chrome.windows && chrome.windows.onRemoved) {
   });
 }
 
+// Прогон живёт в вкладке панели. Закрыли вкладку — отменяем все фазы этой
+// вкладки: иначе сотни запросов перевода дорабатывали бы в пустоту, а платный
+// вызов модели дожевывался бы после исчезновения того, кому отвечать.
+if (chrome.tabs && chrome.tabs.onRemoved) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    for (const entry of activeRequests.values()) {
+      if (entry.tabId === tabId) entry.ac.abort(abortErr());
+    }
+  });
+}
+
 /**
  * Все байты нового пакета, ни один файл на диске ещё не тронут.
  *
@@ -3028,7 +3069,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       if (msg.type === "cancelTranslate") {
         const id = msg.requestId;
-        const ac = activeRequests.get(id);
+        const entry = activeRequests.get(id);
+        const ac = entry && entry.ac;
         if (ac) ac.abort(abortErr());
         else if (id) {
           // фазы между собой разделяет await — отмена могла прийти в зазоре,
@@ -3043,7 +3085,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === "translate") {
         const id = msg.requestId || "r" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
         const settings = { ...(await getSettings()), ...(msg.overrides || {}) };
-        const ac = registerRequest(id);
+        const ac = registerRequest(id, sender.tab && sender.tab.id);
 
         // прогресс не чаще 8 раз в секунду, чтобы не заваливать контент-скрипт
         let lastSent = 0;
@@ -3072,7 +3114,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Ключ обязателен только для чужого сервиса: свой принимает запрос без него.
         if (!aiHasAccess(settings)) throw new Error("Не указан API-ключ в настройках расширения");
         const id = msg.requestId || "a" + Date.now();
-        const ac = registerRequest(id);
+        const ac = registerRequest(id, sender.tab && sender.tab.id);
         // Панель должна знать, что ждать долго, — иначе неподвижное «Рерайчу…»
         // неотличимо от зависания. О самом адресе знает только фон.
         if (sender.tab && sender.tab.id != null) {
@@ -3097,7 +3139,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // закрывает `finally` внутри fetchSourceText.
       if (msg.type === "fetchSource") {
         const id = msg.requestId || "s" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-        const ac = registerRequest(id);
+        const ac = registerRequest(id, sender.tab && sender.tab.id);
         try {
           sendResponse({ ok: true, source: await fetchSourceText(msg.url, { signal: ac.signal }) });
         } finally {
@@ -3111,7 +3153,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Подбор ссылок — сетевой шаг (чужие карты сайтов), и он отменяется тем
         // же путём, что перевод и забор текста: контроллер на время шага.
         const id = msg.requestId || "l" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-        const ac = registerRequest(id);
+        const ac = registerRequest(id, sender.tab && sender.tab.id);
         try {
           const res = await buildLinks(msg.text, settings, { refresh: !!msg.refresh, signal: ac.signal });
           sendResponse({ ok: true, links: res.links, stats: res.stats });

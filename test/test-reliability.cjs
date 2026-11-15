@@ -151,13 +151,14 @@ function mockWorkerChrome(box, store = {}) {
       getManifest: () => ({ version: manifestVersion })
     },
     contextMenus: { removeAll() {}, create() {}, onClicked: { addListener() {} } },
-    commands: { onCommand: { addListener() {} } },
+    commands: { onCommand: { addListener: (fn) => { box.command = fn; } } },
     tabs: {
       sendMessage: async () => {},
       query: async () => [],
       create: async () => ({ id: 1 }),
       remove: async () => {},
-      onUpdated: { addListener() {}, removeListener() {} },
+      onUpdated: { addListener: (fn) => { box.tabUpdated = fn; }, removeListener: () => {} },
+      onRemoved: { addListener: (fn) => { box.tabRemoved = fn; } },
       update: async () => {}
     },
     permissions: { contains: async () => true, request: async () => true },
@@ -1794,6 +1795,71 @@ async function main() {
       check("строгие аргументы сборщика не роняют набор", false, String((e && e.message) || e));
     } finally {
       if (root) fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  console.log("\n=== 37. забор текста: «Отменить» не ждёт executeScript ===");
+  {
+    // chrome.scripting.executeScript не смотрит ни на отмену, ни на таймаут.
+    // Без своего потолка «Отменить» ждала бы, пока чужой скрипт доработает на
+    // странице, — а человек уже нажал кнопку.
+    const box = {};
+    const knob = mockWorkerChrome(box);
+    knob.scripting.executeScript = () => new Promise(() => {}); // страница «зависла»
+    new Function("chrome", src)(knob);
+    const listener = box.listener;
+    if (!listener) throw new Error("обработчик сообщений не подписан");
+    const send = (msg, sender) => new Promise((r) => listener(msg, sender || {}, r));
+
+    const pending = send({ type: "fetchSource", url: "https://example.com/article", requestId: "src-1" }, { tab: { id: 9 } });
+    await sleep(5);
+    if (box.tabUpdated) box.tabUpdated(1, { status: "complete" }); // страница догрузилась
+    await sleep(5);
+    await send({ type: "cancelTranslate", requestId: "src-1" }, { tab: { id: 9 } });
+    const res = await Promise.race([pending, sleep(1000).then(() => null)]);
+    check("отмена забора не ждёт executeScript", !!res && res.ok === false && res.cancelled === true, JSON.stringify(res));
+  }
+
+  console.log("\n=== 38. закрытая вкладка отменяет прогон ===");
+  {
+    // Панель исчезла вместе с вкладкой, а платный вызов модели продолжался:
+    // ответ уходил в несуществующий порт, и человек платил за оборванный прогон.
+    const box = {};
+    new Function("chrome", src)(mockWorkerChrome(box));
+    const listener = box.listener;
+    if (!listener) throw new Error("обработчик сообщений не подписан");
+    check("слушатель закрытия вкладок подписан", typeof box.tabRemoved === "function", typeof box.tabRemoved);
+
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (url, opts = {}) =>
+      new Promise((resolve, reject) => {
+        const onAbort = () => {
+          const e = new Error("aborted");
+          e.name = "AbortError";
+          reject(e);
+        };
+        if (opts.signal) {
+          if (opts.signal.aborted) onAbort();
+          else opts.signal.addEventListener("abort", onAbort, { once: true });
+        }
+      });
+    try {
+      const send = (msg, sender) => new Promise((r) => listener(msg, sender || {}, r));
+      const pending = send(
+        {
+          type: "aiRewrite",
+          text: "привет мир.",
+          requestId: "tab-1",
+          overrides: { aiKey: "sk-test", aiModel: "m", aiPrompt: "перепиши" }
+        },
+        { tab: { id: 7 } }
+      );
+      await sleep(20); // запрос к модели уже ушёл
+      if (box.tabRemoved) box.tabRemoved(7);
+      const res = await Promise.race([pending, sleep(1000).then(() => null)]);
+      check("закрытие вкладки отменяет вызов модели", !!res && res.ok === false && res.cancelled === true, JSON.stringify(res));
+    } finally {
+      globalThis.fetch = prevFetch;
     }
   }
 

@@ -3327,7 +3327,13 @@
   // ----------------------------------------------------------- запуск ---
 
   chrome.runtime.onMessage.addListener(function (msg) {
-    if (msg.type === "run") run();
+    if (msg.type === "run") {
+      // Команда рассылается во все фреймы, а встроенная карточка Дзена — тоже
+      // фрейм: без этой проверки там вспыхивал бы красный отказ «нет редактора»,
+      // хотя редактор жив во фрейме рядом.
+      if (window.top !== window.self && !hasWorkableEditor()) return;
+      run();
+    }
     if (msg.type === "progress" && msg.stage === "translate") {
       var p = msg.percent != null ? msg.percent : 0;
       var tail = msg.total ? " (" + msg.done + "/" + msg.total + ")" : "";
