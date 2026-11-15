@@ -16,7 +16,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const PATHS = require("./paths.cjs");
 
 const ROOT = PATHS.REPO;
@@ -372,7 +372,7 @@ async function main() {
     bad.forEach((b) => console.log("  FAIL: %s (%s)", b.name, b.detail));
     process.exitCode = bad.length ? 1 : 0;
   } finally {
-    try { execSync("taskkill /F /T /PID " + chrome.pid, { stdio: "ignore" }); } catch {}
+    PATHS.killChrome(chrome);
   }
 }
 

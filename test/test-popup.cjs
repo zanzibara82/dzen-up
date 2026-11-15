@@ -5,7 +5,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const PATHS = require("./paths.cjs");
 
 const ROOT = PATHS.REPO;
@@ -15,6 +15,14 @@ const USER_DATA = PATHS.testProfile("popup");
 const SRC_EXT = PATHS.normalize(process.argv[2] || PATHS.EXT);
 const CHROME = PATHS.CHROME;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Домен проверки обновлений не дублируем строкой: тест обязан краснеть вместе
+// с кодом, если константу в попапе поменяют.
+const UPDATE_ORIGIN = (() => {
+  const src = fs.readFileSync(path.join(ROOT, "src", "extension-src", "popup.js"), "utf8");
+  const m = /var\s+UPDATE_ORIGIN\s*=\s*"([^"]*)"/.exec(src);
+  return m ? m[1] : null;
+})();
 
 function copyDir(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
@@ -94,6 +102,21 @@ async function main() {
       if (r.exceptionDetails) throw new Error(JSON.stringify(r.exceptionDetails).slice(0, 500));
       return r.result.value;
     };
+
+    // Ожидание состояния вместо фиксированной паузы. Определение ставится и в
+    // текущий документ, и на каждую следующую загрузку: попап перезагружается,
+    // и таймер, угадывающий скорость машины, к этому моменту уже не годится.
+    const WAIT_SRC = `window.__dzrWaitFor = async function (fn, ms) {
+      const end = Date.now() + (ms || 5000);
+      let v = fn();
+      while (!v && Date.now() < end) {
+        await new Promise((r) => setTimeout(r, 50));
+        v = fn();
+      }
+      return v;
+    };`;
+    await c.send("Page.addScriptToEvaluateOnNewDocument", { source: WAIT_SRC }, sessionId);
+    await evalJs(WAIT_SRC);
 
     for (let i = 0; i < 30; i++) {
       if (await evalJs(`!!document.getElementById('save')`)) break;
@@ -218,7 +241,7 @@ async function main() {
     // и это доезжает до хранилища
     const savedPreset = await evalJs(`(async () => {
       document.getElementById('save').click();
-      await new Promise((r) => setTimeout(r, 1200));
+      await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
       const res = await new Promise((r) => chrome.runtime.sendMessage({ type: 'getSettings' }, (x) => r(x || {})));
       const s = res.settings || {};
       return { preset: s.aiPreset, tail: String(s.aiPrompt || '').slice(-14) };
@@ -245,7 +268,7 @@ async function main() {
       ta.value = ta.value + ' Без воды.';
       ta.dispatchEvent(new Event('input'));
       document.getElementById('save').click();
-      await new Promise((r) => setTimeout(r, 1200));
+      await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
       return document.getElementById('aiPreset').value;
     })()`);
     await evalJs(`location.reload()`);
@@ -288,7 +311,7 @@ async function main() {
     check("поле каналов Дзена есть", linkUi.channels.exists === true && linkUi.channels.tag === 'textarea', JSON.stringify(linkUi.channels));
     check("кнопка переобхода каналов есть", linkUi.refresh === true);
     check("кнопка выгрузки sitemap есть", linkUi.exportBtn === true);
-    check("статус переобхода не пустует после нажатия без каналов", typeof linkUi.status === 'string', String(linkUi.status));
+    check("статус переобхода пуст до нажатия", linkUi.status === "", String(linkUi.status));
     check("число ссылок по умолчанию — 2", linkUi.count.exists === true && linkUi.count.value === '2', JSON.stringify(linkUi.count));
     check("поле числа ссылок — числовое, с границами 1..10",
       linkUi.count.type === 'number' && linkUi.count.min === '1' && linkUi.count.max === '10',
@@ -301,7 +324,7 @@ async function main() {
     const noChannels = await evalJs(`(async () => {
       document.getElementById('linkChannels').value = '# только комментарий\\n   ';
       document.getElementById('channels-refresh').click();
-      await new Promise((r) => setTimeout(r, 400));
+      await __dzrWaitFor(() => /хотя бы один канал/.test(document.getElementById('channels-status').textContent));
       const st = document.getElementById('channels-status');
       return { text: st.textContent, cls: st.className };
     })()`);
@@ -325,7 +348,7 @@ async function main() {
       const field = document.getElementById('linkSites');
       field.value = 'Photo: Subaru of America, Inc.\\nauto-dom24.ru';
       document.getElementById('link-allow').click();
-      await new Promise((r) => setTimeout(r, 700));
+      await __dzrWaitFor(() => /Photo: Subaru/.test(document.getElementById('link-perm').textContent));
       const out = {
         text: document.getElementById('link-perm').textContent,
         errs: window.__errs.slice(),
@@ -348,7 +371,7 @@ async function main() {
     // отдать пустой файл «на всякий случай».
     const noExport = await evalJs(`(async () => {
       document.getElementById('channels-export').click();
-      await new Promise((r) => setTimeout(r, 400));
+      await __dzrWaitFor(() => /хотя бы один канал/.test(document.getElementById('channels-status').textContent));
       const st = document.getElementById('channels-status');
       return { text: st.textContent, cls: st.className };
     })()`);
@@ -383,7 +406,7 @@ async function main() {
 
       document.getElementById('linkChannels').value = 'auto-dom24.ru';
       document.getElementById('channels-export').click();
-      await new Promise((r) => setTimeout(r, 500));
+      await __dzrWaitFor(() => !/Готовлю карту/.test(document.getElementById('channels-status').textContent));
 
       const st = document.getElementById('channels-status');
       const blobs = [];
@@ -433,7 +456,7 @@ async function main() {
       HTMLAnchorElement.prototype.click = function () {};
       document.getElementById('linkChannels').value = 'auto-dom24.ru';
       document.getElementById('channels-export').click();
-      await new Promise((r) => setTimeout(r, 400));
+      await __dzrWaitFor(() => !/Готовлю карту/.test(document.getElementById('channels-status').textContent));
       const st = document.getElementById('channels-status');
       const out = { status: st.textContent, cls: st.className };
       HTMLAnchorElement.prototype.click = realClick;
@@ -455,7 +478,7 @@ async function main() {
       };
       document.getElementById('linkChannels').value = 'auto-dom24.ru';
       document.getElementById('channels-export').click();
-      await new Promise((r) => setTimeout(r, 400));
+      await __dzrWaitFor(() => !/Готовлю карту/.test(document.getElementById('channels-status').textContent));
       const st = document.getElementById('channels-status');
       const out = { status: st.textContent, cls: st.className };
       chrome.runtime.sendMessage = realSend;
@@ -510,13 +533,20 @@ async function main() {
       const realWrite = clip.writeText;
       clip.writeText = (t) => { copied.push(t); return Promise.resolve(); };
 
+      // «Проверяю…» ставится не сразу: перед ним попап ждёт ответа на запрос
+      // права. Ожидание «нет Проверяю» прошло бы по ещё не тронутому статусу.
+      const stEl = document.getElementById('update-status');
+      const prevStatus = stEl.textContent;
       document.getElementById('update-check').click();
-      await new Promise((r) => setTimeout(r, 400));
-      const st1 = document.getElementById('update-status');
+      await __dzrWaitFor(() => {
+        const t = stEl.textContent;
+        return t !== prevStatus && !/Проверяю/.test(t);
+      });
+      const st1 = stEl;
       const found = { status: st1.textContent, cls: st1.className, copyHidden: document.getElementById('update-copy').hidden,
                       btnDisabled: document.getElementById('update-check').disabled };
       document.getElementById('update-copy').click();
-      await new Promise((r) => setTimeout(r, 300));
+      await __dzrWaitFor(() => /Скопировано|буфер/.test(document.getElementById('update-status').textContent));
       const out = { found, asked, msgs, copied, copyStatus: document.getElementById('update-status').textContent };
       clip.writeText = realWrite;
       chrome.runtime.sendMessage = realSend;
@@ -526,8 +556,8 @@ async function main() {
     })()`);
     console.log("находка обновления: %j", updNewer);
     check("доступ спрашивается ровно к домену манифеста",
-      JSON.stringify(updNewer.asked) === JSON.stringify([["https://raw.githubusercontent.com/*"]]),
-      JSON.stringify(updNewer.asked));
+      !!UPDATE_ORIGIN && JSON.stringify(updNewer.asked) === JSON.stringify([[UPDATE_ORIGIN]]),
+      JSON.stringify({ asked: updNewer.asked, ждали: UPDATE_ORIGIN }));
     check("находка названа обоими номерами",
       /2\.1\.1/.test(updNewer.found.status) && /2\.2\.0/.test(updNewer.found.status),
       JSON.stringify(updNewer.found.status));
@@ -549,9 +579,16 @@ async function main() {
           if (msg && msg.type === 'checkUpdate') { cb(res); return; }
           return realSend.call(chrome.runtime, msg, cb);
         };
+        const stEl = document.getElementById('update-status');
+        const prevStatus = stEl.textContent;
         document.getElementById('update-check').click();
-        await new Promise((r) => setTimeout(r, 400));
-        const st = document.getElementById('update-status');
+        // Прошлый итог в статусе не пуст: ждём именно смену текста, а не
+        // «нет Проверяю» — иначе ожидание закончилось бы до клика.
+        await __dzrWaitFor(() => {
+          const t = stEl.textContent;
+          return t !== prevStatus && !/Проверяю/.test(t);
+        }, 8000);
+        const st = stEl;
         return { status: st.textContent, cls: st.className, copyHidden: document.getElementById('update-copy').hidden };
       };
       out.latest = await run({ ok: true, state: 'latest', current: '2.1.1', remote: '2.1.1' });
@@ -588,9 +625,14 @@ async function main() {
         if (msg && msg.type === 'checkUpdate') { msgs.push(msg.type); cb({ ok: true, state: 'update', current: '1', remote: '2' }); return; }
         return realSend.call(chrome.runtime, msg, cb);
       };
+      const stEl = document.getElementById('update-status');
+      const prevStatus = stEl.textContent;
       document.getElementById('update-check').click();
-      await new Promise((r) => setTimeout(r, 400));
-      const st = document.getElementById('update-status');
+      await __dzrWaitFor(() => {
+        const t = stEl.textContent;
+        return t !== prevStatus && !/Проверяю/.test(t);
+      }, 8000);
+      const st = stEl;
       const out = { status: st.textContent, cls: st.className, msgs,
                     btnDisabled: document.getElementById('update-check').disabled,
                     copyHidden: document.getElementById('update-copy').hidden };
@@ -697,15 +739,41 @@ async function main() {
                 // Метка в chrome.storage: обновление не должно трогать настройки
                 // и ключ — они живут в профиле, а не в папке установки.
                 await chrome.storage.local.set({ dzrSentinel: 'секрет-не-трогать' });
-                // Микрозадача, поставленная до клика, отмечает «стек размотался»:
-                // жест, вызванный раньше неё, синхронный (до первого await).
-                Promise.resolve().then(function () { p.afterClick = true; });
+                // Микрозадача, поставленная непосредственно перед кликом, отмечает
+                // «стек размотался»: жест, вызванный раньше неё, синхронный.
+                // Ставить её заранее нельзя — «Дописать» ждёт появления кнопки,
+                // и метка успела бы сработать до самого клика.
+                function markClick() {
+                  p.afterClick = false; p.gestureSync = null;
+                  Promise.resolve().then(function () { p.afterClick = true; });
+                }
                 var action = ${JSON.stringify(o.action || "apply")};
-                if (action === 'apply') { var btn = document.getElementById('update-apply'); btn.hidden = false; btn.click(); }
-                else if (action === 'resume') { document.getElementById('update-resume').click(); }
-                else if (action === 'restore') { document.getElementById('update-restore').click(); }
-                await new Promise((r) => setTimeout(r, 1200));
-                var st = document.getElementById('update-status');
+                var stEl = document.getElementById('update-status');
+                var prev = stEl.textContent;
+                if (action === 'apply') { var btn = document.getElementById('update-apply'); btn.hidden = false; markClick(); btn.click(); }
+                else if (action === 'resume') {
+                  // Кнопка появляется после разбора журнала; клик до этого молча
+                  // теряется, потому что «Дописать» без журнала ничего не делает.
+                  await __dzrWaitFor(() => !document.getElementById('update-resume').hidden);
+                  markClick();
+                  document.getElementById('update-resume').click();
+                }
+                else if (action === 'restore') {
+                  await __dzrWaitFor(() => !document.getElementById('update-restore').hidden);
+                  markClick();
+                  document.getElementById('update-restore').click();
+                }
+                // Итог узнаём по метке-слову: «📁 Готовлю запись…» — ещё не итог,
+                // а пустой статус и прежний текст ждут асинхронного ответа.
+                await __dzrWaitFor(() => {
+                  var t = stEl.textContent;
+                  if (!t || /⏳/.test(t)) return false;
+                  // Разбор журнала идёт при открытии попапа: его итог может уже
+                  // стоять в статусе, поэтому смену текста требуем только от клика.
+                  if (action !== 'inspect' && t === prev) return false;
+                  return action === 'inspect' ? /^[✅⚠️❌]/.test(t) : /^[✅❌⚠️↩️📋]/.test(t);
+                }, 8000);
+                var st = stEl;
                 var files = {};
                 Object.keys(p.root.__files).forEach(function (k) { files[k] = new TextDecoder().decode(p.root.__files[k]); });
                 var intentRes = await chrome.storage.local.get('dzrUpdateIntent');
@@ -1144,7 +1212,7 @@ async function main() {
       document.getElementById('linkChannels').value = 'https://dzen.ru/auto-dom24.ru\\n# второй\\nhttps://dzen.ru/id/123';
       document.getElementById('linkCount').value = '7';
       document.getElementById('save').click();
-      await new Promise((r) => setTimeout(r, 1200));
+      await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
       const res = await new Promise((r) => chrome.runtime.sendMessage({ type: 'getSettings' }, (x) => r(x || {})));
       const s = res.settings || {};
       const loc = await chrome.storage.local.get('linkSites');
@@ -1224,7 +1292,7 @@ async function main() {
       const save = async (v) => {
         field.value = v;
         document.getElementById('save').click();
-        await new Promise((r) => setTimeout(r, 1200));
+        await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
         const res = await new Promise((r) => chrome.runtime.sendMessage({ type: 'getSettings' }, (x) => r(x || {})));
         return { stored: (res.settings || {}).linkCount, shown: field.value };
       };
@@ -1255,7 +1323,7 @@ async function main() {
     const savedStrip = await evalJs(`(async () => {
       document.getElementById('stripLinks').value = 'drop';
       document.getElementById('save').click();
-      await new Promise((r) => setTimeout(r, 1200));
+      await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
       const res = await new Promise((r) => chrome.runtime.sendMessage({ type: 'getSettings' }, (x) => r(x || {})));
       const syn = await chrome.storage.sync.get('stripLinks');
       return { stored: (res.settings || {}).stripLinks, sync: syn.stripLinks };
@@ -1305,7 +1373,7 @@ async function main() {
       document.getElementById('signature').checked = true;
       document.getElementById('signatureText').value = 'Свой текст приписки для проверки.';
       document.getElementById('save').click();
-      await new Promise((r) => setTimeout(r, 1200));
+      await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
       const res = await new Promise((r) => chrome.runtime.sendMessage({ type: 'getSettings' }, (x) => r(x || {})));
       const syn = await chrome.storage.sync.get(['signature', 'signatureText']);
       const s = res.settings || {};
@@ -1319,7 +1387,7 @@ async function main() {
     const saved = await evalJs(`(async () => {
       document.getElementById('skipSameLang').checked = false;
       document.getElementById('save').click();
-      await new Promise((r) => setTimeout(r, 1200));
+      await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
       const res = await new Promise((r) => chrome.runtime.sendMessage({ type: 'getSettings' }, (x) => r(x || {})));
       return { status: document.getElementById('settings-status').textContent, value: (res.settings || {}).skipSameLang };
     })()`);
@@ -1540,7 +1608,7 @@ async function main() {
         document.getElementById('aiModel').value = 'qwen2.5:7b';
         document.getElementById('aiKey').value = '';
         document.getElementById('save').click();
-        await new Promise((r) => setTimeout(r, 1200));
+        await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
         return true;
       })()`);
       const aiRun = await evalJs(`(async () => {
@@ -1552,7 +1620,7 @@ async function main() {
         };
         document.getElementById('src').value = 'Текст статьи для проверки.';
         document.getElementById('run').click();
-        await new Promise((r) => setTimeout(r, 1500));
+        await __dzrWaitFor(() => !!document.getElementById('out').value);
         chrome.runtime.sendMessage = real;
         return { seen: seen, out: document.getElementById('out').value };
       })()`);
@@ -1572,7 +1640,7 @@ async function main() {
         document.getElementById('aiBaseUrl').value = '';
         document.getElementById('aiKey').value = '';
         document.getElementById('save').click();
-        await new Promise((r) => setTimeout(r, 1200));
+        await __dzrWaitFor(() => /Сохранено/.test(document.getElementById('settings-status').textContent));
         document.getElementById('src').value = '';
         document.getElementById('out').value = '';
         return true;
@@ -1662,13 +1730,13 @@ async function main() {
           const initial = st.textContent;
           document.getElementById('tab-settings').click();
           document.getElementById('save').click();
-          await new Promise((r) => setTimeout(r, 900));
+          await __dzrWaitFor(() => /не прочитан/i.test(st.textContent));
           const afterSave = st.textContent;
           // Кнопка доступа тоже сохраняет поля списков до запроса права. При
           // непрочитанных настройках она не должна затирать соседний список.
           document.getElementById('linkSites').value = 'auto-dom24.ru';
           document.getElementById('link-allow').click();
-          await new Promise((r) => setTimeout(r, 600));
+          await __dzrWaitFor(() => /не прочитан/i.test(document.getElementById('link-perm').textContent));
           return { initial, afterSave, afterAllow: document.getElementById('link-perm').textContent,
                    sent: window.__loadFail.sent.slice() };
         })()`);
@@ -1690,7 +1758,7 @@ async function main() {
     bad.forEach((b) => console.log("  FAIL: %s (%s)", b.name, b.detail));
     process.exitCode = bad.length ? 1 : 0;
   } finally {
-    try { execSync("taskkill /F /T /PID " + chrome.pid, { stdio: "ignore" }); } catch {}
+    PATHS.killChrome(chrome);
   }
 }
 

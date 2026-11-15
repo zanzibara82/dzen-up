@@ -360,7 +360,7 @@ async function main() {
       errs.slice(-6).forEach((e) => console.log("  ", JSON.stringify(e.params).slice(0, 250)));
     }
   } finally {
-    killChrome(chrome);
+    PATHS.killChrome(chrome);
     server.close();
   }
 }
@@ -375,13 +375,4 @@ main()
   })
   .catch((e) => { console.error("ОШИБКА ТЕСТА:", e.message || e); process.exit(1); });
 
-/** На Windows chrome.kill() не убивает дерево процессов — добиваем taskkill. */
-function killChrome(child) {
-  try {
-    if (process.platform === "win32" && child.pid) {
-      require("child_process").execSync("taskkill /F /T /PID " + child.pid, { stdio: "ignore" });
-    } else {
-      child.kill("SIGKILL");
-    }
-  } catch {}
-}
+

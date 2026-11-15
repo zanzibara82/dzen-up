@@ -12,7 +12,7 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const PATHS = require("./paths.cjs");
 
 const ROOT = PATHS.REPO;
@@ -56,10 +56,15 @@ function check(name, ok, detail) {
 }
 
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-// ВНИМАНИЕ: без квадратных скобок — они добавляются при сборке шаблона.
-// Если написать здесь "[0-9A-Za-z]", получится [^[0-9A-Za-z]]: вложенный класс,
-// который почти никогда не срабатывает (ловится только начало строки).
-const W = "0-9A-Za-zА-Яа-яЁё_";
+// Класс «словесных» символов берём из самого контент-скрипта: если правило
+// границы там поменяют (добавят дефис, апостроф, другую письменность),
+// ожидаемый текст обязан поменяться вместе с ним, а не разойтись молча.
+const CONTENT_SRC = fs.readFileSync(path.join(ROOT, "src", "extension-src", "content.js"), "utf8");
+const WORD_CLASS = (() => {
+  const m = /function isWordChar\(ch\) \{\s*return !!ch && \/\[([^\]]+)\]\//.exec(CONTENT_SRC);
+  return m ? m[1] : null;
+})();
+const W = WORD_CLASS || "0-9A-Za-zА-Яа-яЁё_";
 
 /** То же правило, что в расширении: целое слово, длинные термины первыми. */
 function applyGlossary(text) {
@@ -221,6 +226,7 @@ async function main() {
     })()`);
 
     const before = await snapshot();
+    check("правило границы слова прочитано из content.js", !!WORD_CLASS, "isWordChar не найден");
     check("в статье есть термины для проверки", /Outback/.test(before.text) && /Wilderness/.test(before.text));
     check("картинка на месте до правки", before.imgs === 1, "img=" + before.imgs);
 
@@ -297,7 +303,7 @@ async function main() {
     const errs = c.events.filter((e) => e.method === "Runtime.exceptionThrown");
     check("в странице нет исключений", errs.length === 0, errs.length ? JSON.stringify(errs[0].params).slice(0, 200) : "");
   } finally {
-    try { execSync("taskkill /F /T /PID " + chrome.pid, { stdio: "ignore" }); } catch (e) {}
+    PATHS.killChrome(chrome);
     try { server.close(); } catch (e) {}
     const bad = results.filter((r) => !r.ok);
     console.log("");

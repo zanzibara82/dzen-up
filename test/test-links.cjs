@@ -52,7 +52,7 @@ const SRC_TEXT = fs.readFileSync(SRC, "utf8");
 const api = new Function(
   "chrome",
   SRC_TEXT +
-    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap, sitemapFor, SITE_MAX_BYTES, SITEMAP_CACHE_KEY };"
+    "\nreturn { DEFAULTS, findModels, slugTokens, parseSiteList, parseSitemap, isSitemapIndex, sitemapCandidates, pickArticle, buildLinks, loadSitemap, sitemapFor, SITE_MAX_BYTES, SITEMAP_MAX_TAGS, SITEMAP_CACHE_KEY };"
 )(chrome);
 
 const {
@@ -68,6 +68,7 @@ const {
   buildLinks,
   loadSitemap,
   SITE_MAX_BYTES,
+  SITEMAP_MAX_TAGS,
   SITEMAP_CACHE_KEY
 } = api;
 
@@ -579,10 +580,10 @@ async function main() {
 
   // Лимит: карта крупного сайта содержит тысячи меток, в подборе нужно несколько.
   const manyTags = [];
-  for (let i = 0; i < 600; i++) manyTags.push("https://n.ru/tag/t" + i + "/");
+  for (let i = 0; i < SITEMAP_MAX_TAGS + 100; i++) manyTags.push("https://n.ru/tag/t" + i + "/");
   routes = { "https://n.ru/sitemap.xml": { body: sm(manyTags.concat(["https://n.ru/article/"])) } };
   map = await sitemapFor("https://n.ru", null, true);
-  eq("карта: рубриков не больше лимита", map.tags.length, 500);
+  eq("карта: рубриков не больше лимита", map.tags.length, SITEMAP_MAX_TAGS);
   eq("карта: метки сверх лимита в статьи не попадают", map.urls, ["https://n.ru/article/"]);
 
   // Старый кэш (прошлая версия расширения) не содержит рубрик — профиль
@@ -691,7 +692,7 @@ async function main() {
   // прошёл по лимиту, ни когда у него длинный хвост. Если бы он возвращался в
   // пуле статей, ссылка встала бы на подборку молча, без пометки в отчёте.
   const filled = [];
-  for (let i = 0; i < 500; i++) filled.push("https://cap.ru/tag/t" + i + "/");
+  for (let i = 0; i < SITEMAP_MAX_TAGS; i++) filled.push("https://cap.ru/tag/t" + i + "/");
   routes = { "https://cap.ru/sitemap.xml": { body: sm(filled.concat(["https://cap.ru/tag/kia-sportage/"])) } };
   res = await buildLinks("Kia Sportage подорожала", { linkSites: "cap.ru" }, { refresh: true, rand: () => 0 });
   eq("рубрика сверх лимита не стала ссылкой", res.links, []);

@@ -23,6 +23,25 @@ const CHROME = PATHS.CHROME;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Набор сам считает проверки и сам выставляет код возврата: раньше вердикт
+// брался из слова «Готово» в тосте, а оно означало лишь то, что живой
+// переводчик ответил.
+const results = [];
+function check(name, ok, detail) {
+  results.push({ name, ok });
+  console.log("  %s %s%s", ok ? "PASS" : "FAIL", name, detail ? "  — " + detail : "");
+}
+function verdict() {
+  const bad = results.filter((r) => !r.ok);
+  console.log("\nвсего проверок: %d, провалов: %d", results.length, bad.length);
+  bad.forEach((b) => console.log("  FAIL: %s", b.name));
+  process.exitCode = bad.length ? 1 : 0;
+}
+
+// Перевод подменяем подставным каналом: без сети один и тот же результат на
+// любой машине, а вставку и успех панели проверяем по существу.
+const FAKE = "ПЕРЕВЕДЕНО: проверка вставки без сети";
+
 function copyDir(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
@@ -177,7 +196,8 @@ async function main() {
       await sleep(250);
     }
     console.log("панель появилась  : %s", barReady);
-    if (!barReady) { console.log("ПРОВАЛ: контент-скрипт не внедрился"); return; }
+    check("контент-скрипт внедрился и панель готова", barReady);
+    if (!barReady) { verdict(); return; }
 
     // 1) выделяем фрагмент — второй пункт списка, как в скриншоте
     const selected = process.env.NOSELECT
@@ -218,6 +238,8 @@ async function main() {
 
     // 3) настоящий клик мышью
     await evalJs(`document.documentElement.setAttribute("data-dzr-debug","1")`);
+    // Подставной перевод до клика: иначе набор зависит от живого переводчика.
+    await evalJs(`document.documentElement.setAttribute("data-dzr-fake-translate", ${JSON.stringify(FAKE)})`);
     await c.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y, button: "none" }, sessionId);
     await c.send("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
     await c.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 }, sessionId);
@@ -233,7 +255,8 @@ async function main() {
       selLen: window.getSelection().toString().length,
       sel: window.getSelection().toString().slice(0,80),
       bodyHtml: document.querySelector('.body').innerHTML,
-      bodyText: document.querySelector('.body').innerText
+      bodyText: document.querySelector('.body').innerText,
+      lis: document.querySelectorAll('.body li').length
     }))()`;
     let after = await evalJs(snapshot);
     const deadline = Date.now() + 20000;
@@ -262,6 +285,12 @@ async function main() {
       console.log("\nисключения в странице:");
       errs.slice(-8).forEach((e) => console.log("  ", JSON.stringify(e.params).slice(0, 300)));
     }
+    check("панель сообщает об успехе", /Готово/.test(after.status) || /Готово/.test(after.toast),
+      JSON.stringify({ status: after.status, toast: after.toast }).slice(0, 200));
+    check("подставной перевод вставлен в статью", after.bodyText.indexOf(FAKE) >= 0, after.bodyText.slice(0, 120));
+    check("выделенный английский текст заменён", after.bodyText.indexOf("Standard features include") < 0);
+    check("пункты списка не потеряны", after.lis >= 3, "li=" + after.lis);
+    check("исключений на странице нет", errs.length === 0, String(errs.length));
 
     const logs = c.events.filter((e) => e.method === "Runtime.consoleAPICalled");
     if (logs.length) {
@@ -276,21 +305,13 @@ async function main() {
     const shotPath = path.join(TMP, `shot-${path.basename(PAGE, ".html")}.png`);
     fs.writeFileSync(shotPath, Buffer.from(shot.data, "base64"));
     console.log("\nскриншот: %s", shotPath);
+    verdict();
   } finally {
-    killChrome(chrome);
+    PATHS.killChrome(chrome);
     server.close();
   }
 }
 
 main().catch((e) => { console.error("ОШИБКА ТЕСТА:", e.message || e); process.exit(1); });
 
-/** На Windows chrome.kill() не убивает дерево процессов — добиваем taskkill. */
-function killChrome(child) {
-  try {
-    if (process.platform === "win32" && child.pid) {
-      require("child_process").execSync("taskkill /F /T /PID " + child.pid, { stdio: "ignore" });
-    } else {
-      child.kill("SIGKILL");
-    }
-  } catch {}
-}
+

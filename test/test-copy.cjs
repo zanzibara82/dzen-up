@@ -18,7 +18,7 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const PATHS = require("./paths.cjs");
 
 const ROOT = PATHS.REPO;
@@ -118,7 +118,7 @@ function pipeCdp(child) {
 
 function killChrome(child) {
   if (!child) return;
-  try { execSync("taskkill /F /T /PID " + child.pid, { stdio: "ignore" }); } catch (e) {}
+  PATHS.killChrome(child);
 }
 
 async function main() {

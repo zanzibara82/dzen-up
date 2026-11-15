@@ -3,6 +3,11 @@
  * Сценарий A: выделен абзац с <strong>/<em>/<a>  → разметка должна выжить.
  * Сценарий B: ничего не выделено (вся статья)     → картинка/фигура/разметка должны выжить.
  *            Перед обработкой всей статьи панель просит подтверждение — кликаем дважды.
+ *
+ * ВНИМАНИЕ: сценарии A, B, D и E идут через ЖИВОЙ переводчик (translate.googleapis.com):
+ * подставной канал включён только в C. Набору нужна сеть и квота Google; в CI он не
+ * запускается (там только юнит-наборы). Без сети эти сценарии краснеют по внешней
+ * причине, а не из-за разметки.
  */
 const fs = require("fs");
 const path = require("path");
@@ -587,20 +592,11 @@ async function main() {
     console.log("всего проверок: %d, провалов: %d", results.length, bad.length);
     bad.forEach((b) => console.log("  FAIL: %s (%s)", b.name, b.detail));
   } finally {
-    killChrome(chrome);
+    PATHS.killChrome(chrome);
     server.close();
   }
 }
 
-/** На Windows chrome.kill() не убивает дерево процессов — добиваем taskkill. */
-function killChrome(child) {
-  try {
-    if (process.platform === "win32" && child.pid) {
-      require("child_process").execSync("taskkill /F /T /PID " + child.pid, { stdio: "ignore" });
-    } else {
-      child.kill("SIGKILL");
-    }
-  } catch {}
-}
+
 
 main().catch((e) => { console.error("ОШИБКА ТЕСТА:", e.message || e); process.exit(1); });

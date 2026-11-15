@@ -13,7 +13,7 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const PATHS = require("./paths.cjs");
 
 const ROOT = PATHS.REPO;
@@ -345,7 +345,7 @@ async function main() {
     void ROOT;
   } finally {
     try { server.close(); } catch (e) {}
-    try { execSync("taskkill /F /T /PID " + chrome.pid, { stdio: "ignore" }); } catch (e) {}
+    PATHS.killChrome(chrome);
   }
 }
 

@@ -258,11 +258,17 @@ async function main() {
       google: ({ q }) => (q.includes("ЖИВОЙ") ? { body: googleBody(q.toUpperCase()) } : { status: 500 }),
       mymemory: () => ({ status: 500 })
     };
-    const res = await translateText("ЖИВОЙ кусок.\n\nМёртвый кусок.", SETTINGS);
-    check("stats.failed = 1", res.stats.failed === 1, JSON.stringify(res.stats));
-    check("непереведённый кусок оставлен как есть", res.text.includes("Мёртвый кусок."), JSON.stringify(res.text));
-    check("остальное переведено", res.text.includes("ЖИВОЙ КУСОК."), JSON.stringify(res.text));
-    check("не бросил исключение", true);
+    let res = null;
+    let err = null;
+    try {
+      res = await translateText("ЖИВОЙ кусок.\n\nМёртвый кусок.", SETTINGS);
+    } catch (e) {
+      err = e;
+    }
+    check("не бросил исключение", !err, err ? String(err.message || err) : "исключения нет");
+    check("stats.failed = 1", !!res && res.stats.failed === 1, res ? JSON.stringify(res.stats) : "результата нет");
+    check("непереведённый кусок оставлен как есть", !!res && res.text.includes("Мёртвый кусок."), res ? JSON.stringify(res.text) : "результата нет");
+    check("остальное переведено", !!res && res.text.includes("ЖИВОЙ КУСОК."), res ? JSON.stringify(res.text) : "результата нет");
   }
 
   console.log("\n=== 7. Мертвы ВСЕ куски → явная ошибка ===");

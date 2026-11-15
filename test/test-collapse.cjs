@@ -15,7 +15,7 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const PATHS = require("./paths.cjs");
 
 const ROOT = PATHS.REPO;
@@ -245,7 +245,7 @@ async function main() {
     const errs = c.events.filter((e) => e.method === "Runtime.exceptionThrown");
     check("в страницах нет исключений", errs.length === 0, errs.length ? JSON.stringify(errs[0].params).slice(0, 200) : "");
   } finally {
-    try { execSync("taskkill /F /T /PID " + chrome.pid, { stdio: "ignore" }); } catch (e) {}
+    PATHS.killChrome(chrome);
     try { server.close(); } catch (e) {}
     const bad = results.filter((r) => !r.ok);
     console.log("");

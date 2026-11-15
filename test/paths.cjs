@@ -210,6 +210,25 @@ function scratchExt(tag) {
   return path.join(SCRATCH, "test-ext-" + tag);
 }
 
+/**
+ * Гасит Chrome харнесса вместе с деревом процессов.
+ *
+ * На Windows child.kill() оставляет дочерние процессы жить, поэтому нужен
+ * taskkill. На остальных платформах taskkill просто нет — без ветки по
+ * платформе упавший вызов глушится, Chrome остаётся с занятым портом и
+ * заблокированным профилем, и следующий набор краснеет не по своей вине.
+ */
+function killChrome(child) {
+  if (!child || !child.pid) return;
+  try {
+    if (process.platform === "win32") {
+      require("child_process").execSync("taskkill /F /T /PID " + child.pid, { stdio: "ignore" });
+    } else {
+      child.kill("SIGKILL");
+    }
+  } catch (e) {}
+}
+
 module.exports = {
   REPO,
   SCRATCH,
@@ -220,5 +239,6 @@ module.exports = {
   testProfile,
   chromeFlags,
   clearStorage,
-  scratchExt
+  scratchExt,
+  killChrome
 };

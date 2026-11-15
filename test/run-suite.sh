@@ -143,16 +143,20 @@ want signature   && run signature   "приписка в конце статьи
 want ai-local    && run ai-local    "своя модель (Ollama) в панели" node test-ai-local.cjs "$EXT"
 want ui          && run ui          "панель: крестик и края"      node test-ui.cjs "$EXT"
 want source      && run source      "забор текста со страницы"     node test-source.cjs "$EXT"
-# Здесь проверок не печатает сам харнесс, поэтому считаем их тут: каждый мок
-# обязан закончиться «✅ Готово». Иначе провал прошёл бы незамеченным.
+# Проверки считает сам харнесс: раньше вердикт брался из слова «Готово»,
+# а оно говорило лишь о том, что живой переводчик ответил.
 want mocks       && run mocks       "моки выделения"              bash -c "
-  ok=0; bad=0
+  total=0; bad=0
   for p in mock.html mock2.html mock3.html; do
-    t=\$(node test-ext2.cjs '$EXT' \$p 2>&1 | grep -E '^тост')
-    echo \"--- \$p: \$t\"
-    case \"\$t\" in *Готово*) ok=\$((ok+1));; *) bad=\$((bad+1));; esac
+    out=\$(node test-ext2.cjs '$EXT' \$p 2>&1); rc=\$?
+    echo \"--- \$p: код \$rc\"
+    echo \"\$out\" | grep -E '^  FAIL|^всего проверок' || true
+    t=\$(echo \"\$out\" | grep -oE 'всего проверок: [0-9]+' | grep -oE '[0-9]+' | tail -1)
+    f=\$(echo \"\$out\" | grep -oE 'провалов: [0-9]+' | grep -oE '[0-9]+' | tail -1)
+    total=\$((total + \${t:-0})); bad=\$((bad + \${f:-0}))
+    if [ \$rc -ne 0 ] && [ -z \"\${f:-}\" ]; then bad=\$((bad + 1)); fi
   done
-  echo \"всего проверок: \$((ok+bad)), провалов: \$bad\"
+  echo \"всего проверок: \$total, провалов: \$bad\"
 "
 
 echo ""

@@ -22,7 +22,7 @@
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const PATHS = require("./paths.cjs");
 
 const MOCK_DIR = PATHS.MOCK_DIR;
@@ -143,7 +143,7 @@ function pipeCdp(child) {
 
 function killChrome(child) {
   if (!child) return;
-  try { execSync("taskkill /F /T /PID " + child.pid, { stdio: "ignore" }); } catch (e) {}
+  PATHS.killChrome(child);
 }
 
 /** Сколько фоновых вкладок с таким адресом осталось открыто. */
