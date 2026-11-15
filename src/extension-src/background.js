@@ -325,6 +325,10 @@ function backoffMs(attempt) {
  */
 async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = REQUEST_TIMEOUT_MS, method, headers, body, errorBody = false, timeoutNote = "", networkNote = " Проверьте адрес API и доступ расширения к его домену.", rawBytes = false } = {}) {
   let lastErr = null;
+  // Шаблоны ловят только ключи вида «sk-…» и подписанные api_key. Свой прокси
+  // повторяет присланный токен как есть, поэтому вычёркиваем то, что реально
+  // ушло в заголовке этого запроса.
+  const secrets = secretValues(headers);
 
   for (let attempt = 0; attempt < tries; attempt++) {
     if (signal && signal.aborted) throw abortErr();
@@ -349,7 +353,7 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
         // Тело осмысленно и здесь: на превышение лимита AI-сервисы отвечают
         // текстом («rate limit…»), и без него в панели осталось бы сухое
         // «HTTP 429» — человек не понял бы, что дело в лимите, а не в ключе.
-        const why = errorBody ? await shortBody(res) : "";
+        const why = errorBody ? await shortBody(res, 300, secrets) : "";
         lastErr = new Error(label + ": HTTP " + res.status + (why ? " — " + why : ""));
         cleanup();
         if (attempt < tries - 1) {
@@ -360,7 +364,7 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
 
       if (!res.ok) {
         // 4xx (кроме 408/429) повторять бессмысленно
-        const why = errorBody ? await shortBody(res) : "";
+        const why = errorBody ? await shortBody(res, 300, secrets) : "";
         lastErr = new Error(label + ": HTTP " + res.status + (why ? " — " + why : ""));
         cleanup();
         break;
@@ -399,7 +403,7 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
       try {
         data = JSON.parse(raw);
       } catch (e) {
-        lastErr = new Error(label + ": сервис вернул не JSON — " + headOf(raw));
+        lastErr = new Error(label + ": сервис вернул не JSON — " + headOf(raw, secrets));
         break;
       }
       return data;
@@ -448,13 +452,34 @@ async function fetchJson(url, { signal, label, tries = RETRY_TRIES, timeout = RE
  * 4xx страницей на мегабайты, не должен заставлять расширение глотать весь
  * ответ ради строки в тосте.
  */
-async function shortBody(res, limit = 300) {
+async function shortBody(res, limit = 300, secrets = []) {
   try {
     const t = await readLimited(res, limit * 4); // 4 байта — верх для одного знака utf-8
-    return redactSecrets(String(t || "").replace(/\s+/g, " ")).trim().slice(0, limit);
+    return redactSecrets(String(t || "").replace(/\s+/g, " "), secrets).trim().slice(0, limit);
   } catch (e) {
     return "";
   }
+}
+
+/**
+ * Точные значения секретов, ушедших в заголовках запроса.
+ *
+ * Короткие значения пропускаем: заголовок со значением «1» или «true»
+ * вычеркнул бы из объяснения причины каждую единицу текста.
+ */
+function secretValues(headers) {
+  const out = [];
+  for (const [name, value] of Object.entries(headers || {})) {
+    const raw = String(value == null ? "" : value).trim();
+    if (!raw) continue;
+    if (/authorization|cookie/i.test(name)) {
+      const m = /^Bearer\s+(.+)$/i.exec(raw);
+      out.push(m ? m[1].trim() : raw);
+    } else if (/key|token|secret/i.test(name)) {
+      out.push(raw);
+    }
+  }
+  return out.filter((s) => s.length >= 6);
 }
 
 /**
@@ -464,12 +489,19 @@ async function shortBody(res, limit = 300) {
  * (кавычка, запятая, скобка), а не любой непробельный: жадный `\S+` в однострочном
  * JSON уносил бы и `"type":"invalid_request_error"`, то есть всё объяснение
  * причины, ради которого тело 4xx к ошибке и прикладывается.
+ *
+ * `secrets` — точные значения из заголовков запроса: их шаблон не описывает.
  */
-function redactSecrets(text) {
-  return String(text || "").replace(
+function redactSecrets(text, secrets = []) {
+  let out = String(text || "").replace(
     /(sk-[A-Za-z0-9_-]{8,}|Bearer\s+[^"',}\s]+|api[_-]?key"?\s*[:=]\s*"?[^"',}\s]+)/gi,
     "[ключ скрыт]"
   );
+  for (const s of secrets) {
+    const esc = String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(esc, "g"), "[ключ скрыт]");
+  }
+  return out;
 }
 
 /** Простой пул: не больше `limit` одновременных задач, порядок результата сохраняется. */
@@ -2595,8 +2627,8 @@ async function aiRewrite(text, settings, opts = {}) {
 }
 
 /** Начало ответа для текста ошибки: без него форма ответа не видна. */
-function headOf(xml) {
-  return redactSecrets(String(xml || "").replace(/\s+/g, " ")).trim().slice(0, 300);
+function headOf(text, secrets = []) {
+  return redactSecrets(String(text || "").replace(/\s+/g, " "), secrets).trim().slice(0, 300);
 }
 
 // ------------------------------------------------------- проверка ключей ---

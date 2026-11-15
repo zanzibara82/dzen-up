@@ -937,6 +937,46 @@ async function main() {
     globalThis.fetch = prevFetch;
     check("ключ из не-JSON ответа тоже вычищен", !!err2 && !/ZZZZ/.test(err2.message) && /\[ключ скрыт\]/.test(err2.message), err2 && err2.message.slice(0, 120));
     check("начало ответа при этом показано", !!err2 && /auth loop/.test(err2.message), err2 && err2.message.slice(0, 120));
+
+    // Ключ бывает без «sk-» и без подписи api_key: свой прокси повторяет
+    // присланный токен как есть. Шаблоны такое не ловят — значение надо
+    // вычёркивать по факту отправки, из заголовков запроса.
+    let err3 = null;
+    globalThis.fetch = async () => ({
+      ok: false, status: 400, headers: { get: () => null },
+      text: async () => '{"error":"unknown token plain-Secret-Abc12345","type":"auth_error"}',
+      json: async () => ({})
+    });
+    try {
+      await fetchJson("https://api.example.com/v1/chat/completions", {
+        label: "AI", tries: 1, timeout: 500, errorBody: true,
+        headers: { Authorization: "Bearer plain-Secret-Abc12345" }
+      });
+    } catch (e) {
+      err3 = e;
+    }
+    check("ключ без шаблона вычищен из тела 4xx",
+      !!err3 && !/plain-Secret-Abc12345/.test(err3.message), err3 && err3.message.slice(0, 160));
+    check("объяснение причины при этом осталось",
+      !!err3 && /unknown token/.test(err3.message) && /auth_error/.test(err3.message), err3 && err3.message.slice(0, 160));
+
+    let err4 = null;
+    globalThis.fetch = async () => ({
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => "<html>proxy echoed plain-Secret-Abc12345</html>",
+      json: async () => { throw new SyntaxError('Unexpected token "<"'); }
+    });
+    try {
+      await fetchJson("https://api.example.com/v1/chat/completions", {
+        label: "AI", tries: 1, timeout: 500,
+        headers: { Authorization: "Bearer plain-Secret-Abc12345" }
+      });
+    } catch (e) {
+      err4 = e;
+    }
+    globalThis.fetch = prevFetch;
+    check("ключ без шаблона вычищен из не-JSON ответа",
+      !!err4 && !/plain-Secret-Abc12345/.test(err4.message), err4 && err4.message.slice(0, 160));
   }
 
   console.log("\n=== 27. тело ответа API читается с потолком ===");
