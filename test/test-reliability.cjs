@@ -1664,6 +1664,31 @@ async function main() {
     }
   }
 
+  console.log("\n=== 35. сборка сохраняет папку news ===");
+  {
+    // Сборщик сносит выходную папку целиком. Без отдельного переноса он унёс бы
+    // подобранные фотографии — и человек узнал бы об этом только по пустой news.
+    const os = require("os");
+    const { execFileSync } = require("child_process");
+    let out = "";
+    try {
+      out = fs.mkdtempSync(path.join(os.tmpdir(), "dzen-rewriter-news-"));
+      fs.mkdirSync(path.join(out, "news", "Тема"), { recursive: true });
+      fs.writeFileSync(path.join(out, "news", "Тема", "01.jpg"), Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+      fs.writeFileSync(path.join(out, "старый.txt"), "мусор");
+      execFileSync(process.execPath, [path.join(PATHS.REPO, "tools", "build-extension.cjs"), "--out", out, "--no-zip"], { stdio: "pipe" });
+      const kept = fs.readFileSync(path.join(out, "news", "Тема", "01.jpg"));
+      check("news/<тема>/01.jpg пережил пересборку",
+        kept.length === 4 && kept[0] === 0xff && kept[3] === 0xe0, JSON.stringify(Array.from(kept)));
+      check("файлы расширения при этом обновились", fs.existsSync(path.join(out, "manifest.json")));
+      check("чужой файл из папки установки убран", !fs.existsSync(path.join(out, "старый.txt")));
+    } catch (e) {
+      check("пересборка с news не роняет набор", false, String((e && e.message) || e));
+    } finally {
+      if (out) fs.rmSync(out, { recursive: true, force: true });
+    }
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);

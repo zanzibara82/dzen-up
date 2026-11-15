@@ -597,6 +597,14 @@ check(
   "package.json: " + pkg.version + ", манифест: " + ver
 );
 
+// Подбор изображений кладёт файлы внутрь папки установки — там же, где живёт
+// расширение. README обязан назвать путь, потолок веса и диапазон количества:
+// иначе человек ищет скачанные фото по всему диску.
+check("README называет подбор изображений", inReadme("Подбор изображений"));
+check("README говорит про папку news", inReadme("news/"));
+check("README называет потолок 3 МБ", /3\s*МБ/.test(readme));
+check("README называет диапазон от 5 до 10", /от 5 до 10/.test(readme));
+
 // ------------------------------------------------------ 5. состав пакета совпадает ---
 const listed = ["manifest.json", "background.js", "content.js", "rewriter.js", "presets.js", "content.css"];
 for (const f of listed) {

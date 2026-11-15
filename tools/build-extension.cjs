@@ -19,6 +19,8 @@ const REPO = path.resolve(__dirname, "..");
 const SRC = path.join(REPO, "src", "extension-src");
 
 // Файлы, без которых расширение не работает. Иконки лежат в icons/.
+// news в zip не попадает: zip собирается из этого списка, а папка news — данные
+// пользователя, которые пересборка сохраняет, но не распространяет.
 const FILES = [
   "manifest.json",
   "background.js",
@@ -146,11 +148,44 @@ function main() {
     process.exit(1);
   }
 
-  fs.rmSync(args.out, { recursive: true, force: true });
-  for (const rel of payload) {
-    const dst = path.join(args.out, rel);
-    fs.mkdirSync(path.dirname(dst), { recursive: true });
-    fs.copyFileSync(path.join(SRC, rel), dst);
+  // Подобранные фотографии лежат внутри папки установки, а сборка сносит её
+  // целиком. Переносим news в соседний временный путь до rmSync и возвращаем
+  // после копирования; сосед — та же файловая система, иначе rename упрётся в EXDEV.
+  const NEWS = path.join(args.out, "news");
+  let newsBackup = null;
+  if (fs.existsSync(NEWS)) {
+    newsBackup = fs.mkdtempSync(path.join(path.dirname(args.out), ".dzr-news-"));
+    fs.renameSync(NEWS, path.join(newsBackup, "news"));
+  }
+
+  try {
+    fs.rmSync(args.out, { recursive: true, force: true });
+    for (const rel of payload) {
+      const dst = path.join(args.out, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(path.join(SRC, rel), dst);
+    }
+  } catch (e) {
+    if (newsBackup) {
+      try {
+        fs.mkdirSync(args.out, { recursive: true });
+        fs.renameSync(path.join(newsBackup, "news"), NEWS);
+        newsBackup = null;
+      } catch (e2) {
+        console.error("НЕ УДАЛОСЬ ВЕРНУТЬ ПАПКУ news. Она лежит здесь: " + path.join(newsBackup, "news"));
+      }
+    }
+    throw e;
+  }
+
+  if (newsBackup) {
+    try {
+      fs.renameSync(path.join(newsBackup, "news"), NEWS);
+      fs.rmSync(newsBackup, { recursive: true, force: true });
+    } catch (e) {
+      console.error("НЕ УДАЛОСЬ ВЕРНУТЬ ПАПКУ news. Она лежит здесь: " + path.join(newsBackup, "news"));
+      throw e;
+    }
   }
 
   console.log("папка: " + args.out);
