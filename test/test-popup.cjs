@@ -893,6 +893,252 @@ async function main() {
       }
     }
 
+    // ---- подбор изображений (окно images.html) ----------------------------
+    // Панель — контент-скрипт: у неё нет ни рукояти папки, ни права просить
+    // доступ к чужим сайтам. Всё делает окно расширения; проверки ниже гоняют
+    // его с подставными fetch, рукоятью, IndexedDB и правами.
+    {
+      try {
+        const realName = JSON.parse(fs.readFileSync(path.join(SRC_EXT, "manifest.json"), "utf8")).name;
+        const fixSrc = ["fake-dir-handle.cjs", "memory-idb.cjs"]
+          .map((f) => fs.readFileSync(path.join(__dirname, "fixtures", f), "utf8")).join("\n;\n");
+        const b64 = (parts) => Buffer.concat(parts.map((p) => Buffer.from(p))).toString("base64");
+        const IMG = {
+          jpg: b64([[0xff, 0xd8, 0xff, 0xe0], "one"]),
+          png: b64([[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], "two"]),
+          webp: b64(["RIFF", [0, 0, 0, 0], "WEBP", "four"]),
+          gif: b64(["GIF89a", "five"]),
+          jpg2: b64([[0xff, 0xd8, 0xff, 0xe0], "six"])
+        };
+        const BING = '{"murl&quot;:&quot;https://img.test/a.jpg&quot;} {"murl":"https://img.test/heavy.jpg"} {"murl":"https://img.test/notimage.jpg"}';
+        const YANDEX = '{"origUrl":"https://img.test/b.png"} {"origUrl":"https://img.test/c.webp"} {"origUrl":"https://img.test/d.gif"} {"origUrl":"https://img.test/e.jpg"} {"origUrl":"https://img.test/a.jpg"}';
+        const images = {
+          "https://img.test/a.jpg": { kind: "bytes", b64: IMG.jpg },
+          "https://img.test/heavy.jpg": { kind: "heavy" },
+          "https://img.test/notimage.jpg": { kind: "html" },
+          "https://img.test/b.png": { kind: "bytes", b64: IMG.png },
+          "https://img.test/c.webp": { kind: "bytes", b64: IMG.webp },
+          "https://img.test/d.gif": { kind: "bytes", b64: IMG.gif },
+          "https://img.test/e.jpg": { kind: "bytes", b64: IMG.jpg2 }
+        };
+        const goodManifest = JSON.stringify({ manifest_version: 3, name: realName, version: "2.4.0" });
+        const seedFiles = { "manifest.json": goodManifest };
+
+        const imagesCase = async (o) => {
+          const { targetId } = await c.send("Target.createTarget", { url: "about:blank" });
+          const attached = await c.send("Target.attachToTarget", { targetId, flatten: true });
+          const sid = attached.sessionId;
+          await c.send("Runtime.enable", {}, sid);
+          await c.send("Page.enable", {}, sid);
+          const ev = async (expr) => {
+            const res = await c.send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true }, sid);
+            if (res.exceptionDetails) throw new Error(JSON.stringify(res.exceptionDetails).slice(0, 300));
+            return res.result.value;
+          };
+          const setup = `(function () {
+            if (!/^chrome-extension:/.test(location.protocol)) return;
+            var root = makeFakeRoot(${JSON.stringify(o.files || seedFiles)}, {
+              permission: ${JSON.stringify(o.permission || "granted")},
+              request: ${o.ask === false ? "false" : "true"}
+            });
+            var mem = globalThis.memoryIdb;
+            var db = mem.open('dzr-update').__db;
+            db.createObjectStore('handles');
+            ${o.seed ? "mem.seed(db, root);" : ""}
+            Object.defineProperty(window, 'indexedDB', { configurable: true, value: { open: function (n) { return mem.open(n); } } });
+            window.__img = { root: root, db: db, fetches: [], tabs: [], permRequests: [], picker: null };
+            chrome.storage.sync.get = function (defaults, cb) { cb(Object.assign({}, defaults, { imageCount: ${o.count == null ? 8 : Number(o.count)} })); };
+            chrome.permissions.contains = function (d, cb) { cb(${o.net !== false}); };
+            chrome.permissions.request = function (d, cb) { window.__img.permRequests.push(((d && d.origins) || []).join()); cb(${o.grantNet !== false}); };
+            chrome.tabs.create = function (d) { window.__img.tabs.push(d && d.url); };
+            window.showDirectoryPicker = function (opts) {
+              window.__img.picker = (opts && opts.mode) || "?";
+              return ${o.picker === false ? "Promise.reject(Object.assign(new Error('cancel'), { name: 'AbortError' }))" : "Promise.resolve(root)"};
+            };
+            var imgs = ${JSON.stringify(o.images || images)};
+            function resp(body, status) { return new Response(body, { status: status || 200 }); }
+            window.fetch = function (url, opts) {
+              var u = String(url);
+              window.__img.fetches.push(u);
+              if (u.indexOf('bing.com') >= 0) return Promise.resolve(resp(${JSON.stringify(o.bing == null ? BING : o.bing)}));
+              if (u.indexOf('yandex.ru') >= 0) return Promise.resolve(resp(${JSON.stringify(o.yandex == null ? YANDEX : o.yandex)}));
+              var desc = imgs[u];
+              if (!desc) return Promise.resolve(resp('', 404));
+              var make = function () {
+                if (desc.kind === 'heavy') {
+                  var big = new Uint8Array(3 * 1024 * 1024 + 1);
+                  big[0] = 0xff; big[1] = 0xd8; big[2] = 0xff;
+                  var hs = new ReadableStream({ start: function (cc) { cc.enqueue(big); cc.close(); } });
+                  return new Response(hs, { status: 200 });
+                }
+                if (desc.kind === 'html') return new Response('<!doctype html><h1>не картинка</h1>', { status: 200 });
+                if (desc.status) return new Response('', { status: desc.status });
+                var raw = atob(desc.b64);
+                var bytes = new Uint8Array(raw.length);
+                for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+                var rs = new ReadableStream({ start: function (cc) { cc.enqueue(bytes); cc.close(); } });
+                return new Response(rs, { status: 200 });
+              };
+              var wait = ${Number(o.delay) || 0};
+              if (!wait) return Promise.resolve(make());
+              return new Promise(function (resolve, reject) {
+                var timer = setTimeout(function () { resolve(make()); }, wait);
+                if (opts && opts.signal) opts.signal.addEventListener('abort', function () {
+                  clearTimeout(timer);
+                  reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+                });
+              });
+            };
+          })();`;
+          const added = await c.send("Page.addScriptToEvaluateOnNewDocument", { source: fixSrc + "\n;\n" + setup }, sid);
+          try {
+            const title = o.title == null ? "" : o.title;
+            const url = `chrome-extension://${extId}/images.html` + (title ? "?title=" + encodeURIComponent(title) : "");
+            await c.send("Page.navigate", { url }, sid);
+            for (let i = 0; i < 100; i++) {
+              const state = await ev(`document.documentElement && document.documentElement.getAttribute('data-dzr-images')`);
+              if (o.stop) {
+                if (state === "running" && (await ev(`!document.getElementById('stop').hidden`))) break;
+                if (state === "blocked" || state === "done") break;
+              } else if (o.title) {
+                if (state === "done" || state === "blocked") break;
+              } else if (state === "ready" || state === "blocked") break;
+              await sleep(100);
+            }
+            if (o.stop) {
+              await ev(`document.getElementById('stop').click()`);
+              for (let i = 0; i < 40; i++) {
+                if (await ev(`document.documentElement.getAttribute('data-dzr-images') === 'done'`)) break;
+                await sleep(150);
+              }
+            }
+            if (o.after) await ev(o.after);
+            return await ev(`(function () {
+              var p = window.__img;
+              var files = Object.keys(p.root.__files).filter(function (k) { return k.indexOf('news/') === 0; });
+              var sizes = {};
+              files.forEach(function (k) { sizes[k] = p.root.__files[k].length; });
+              return {
+                status: document.getElementById('status').textContent,
+                cls: document.getElementById('status').className,
+                count: document.getElementById('count').textContent,
+                chooseHidden: document.getElementById('choose-dir').hidden,
+                writeHidden: document.getElementById('allow-write').hidden,
+                netHidden: document.getElementById('allow-net').hidden,
+                startHidden: document.getElementById('start').hidden,
+                stopHidden: document.getElementById('stop').hidden,
+                files: files, sizes: sizes,
+                fetches: p.fetches, tabs: p.tabs, permRequests: p.permRequests,
+                saved: !!p.db.__store['install-dir'],
+                sameHandle: p.db.__store['install-dir'] === p.root,
+                picker: p.picker
+              };
+            })()`);
+          } finally {
+            await c.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: added.identifier }, sid);
+            await c.send("Target.closeTarget", { targetId });
+          }
+        };
+
+        // Порядок скачивания зависит от того, чей воркер закончил первым, поэтому
+        // проверяем состав и последовательность номеров, а не конкретную раскладку
+        // расширений по номерам.
+        const extOf = (p) => (p.split(".").pop() || "").toLowerCase();
+        const happy = await imagesCase({ title: "Новая модель Subaru", count: 5, seed: true });
+        console.log("подбор: счастливый путь: %j", { status: happy.status, files: happy.files });
+        const namesOk = happy.files.length === 5 &&
+          happy.files.every((p) => /^news\/Новая модель Subaru\/0[1-5]\.(jpg|png|webp|gif)$/.test(p));
+        const extList = happy.files.map(extOf).sort().join(",");
+        check("окно скачало пять фото в news/<заголовок>",
+          namesOk && extList === "gif,jpg,jpg,png,webp",
+          JSON.stringify({ files: happy.files, ext: extList }));
+        check("тяжёлая картинка и HTML вместо фото отброшены",
+          happy.files.every((p) => !/heavy|notimage/.test(p)) && happy.files.length === 5,
+          JSON.stringify(happy.files));
+        check("статус называет папку и число записанных",
+          /5 из 5/.test(happy.status) && /news\/Новая модель Subaru/.test(happy.status), happy.status);
+        check("ссылка-дубль скачана один раз",
+          happy.fetches.filter((u) => /\/a\.jpg$/.test(u)).length === 1,
+          JSON.stringify(happy.fetches));
+
+        const fewer = await imagesCase({
+          title: "Короткая выдача", count: 5, seed: true,
+          bing: '{"murl":"https://img.test/a.jpg"} {"murl":"https://img.test/b.png"}',
+          yandex: ""
+        });
+        check("нехватка картинок: записаны найденные, статус «2 из 5»",
+          fewer.files.length === 2 && /2 из 5/.test(fewer.status),
+          JSON.stringify({ files: fewer.files, status: fewer.status }));
+
+        const empty = await imagesCase({ title: "Пустая выдача", count: 5, seed: true, bing: "", yandex: "" });
+        check("пустая выдача: папки нет и причина названа",
+          empty.files.length === 0 && /ссылк/i.test(empty.status),
+          JSON.stringify({ files: empty.files, status: empty.status }));
+
+        const noNet = await imagesCase({
+          title: "Без сети", seed: true, net: false, grantNet: false,
+          after: `(async () => { document.getElementById('allow-net').click(); await new Promise((r) => setTimeout(r, 300)); })()`
+        });
+        check("без широкого права показана кнопка доступа", noNet.netHidden === false, JSON.stringify(noNet));
+        check("отказ в доступе к сайтам — причина, запросов нет",
+          /err/.test(noNet.cls) && /доступ|сайт/i.test(noNet.status) && noNet.fetches.length === 0,
+          JSON.stringify({ status: noNet.status, fetches: noNet.fetches }));
+
+        const noWrite = await imagesCase({
+          title: "Без записи", seed: true, permission: "prompt", ask: false,
+          after: `(async () => { document.getElementById('allow-write').click(); await new Promise((r) => setTimeout(r, 300)); })()`
+        });
+        check("без права записи показана кнопка разрешения", noWrite.writeHidden === false, JSON.stringify(noWrite));
+        check("отказ в записи назван причиной, файлов нет",
+          /err/.test(noWrite.cls) && /запис/i.test(noWrite.status) && noWrite.files.length === 0,
+          JSON.stringify({ status: noWrite.status, files: noWrite.files }));
+
+        const noHandle = await imagesCase({});
+        check("без рукояти предложен выбор папки", noHandle.chooseHidden === false, JSON.stringify(noHandle));
+
+        const chosen = await imagesCase({
+          after: `(async () => { document.getElementById('choose-dir').click(); await new Promise((r) => setTimeout(r, 400)); })()`
+        });
+        check("выбранная папка сохранена в IndexedDB",
+          chosen.saved === true && chosen.sameHandle === true && chosen.picker === "readwrite",
+          JSON.stringify({ saved: chosen.saved, same: chosen.sameHandle, picker: chosen.picker }));
+
+        const evil = await imagesCase({ title: "../../evil", count: 5, seed: true });
+        check("имя папки очищено: ни одного «..», всё внутри news/",
+          evil.files.length > 0 && evil.files.every((p) => p.indexOf("news/evil/") === 0 && p.indexOf("..") < 0),
+          JSON.stringify(evil.files));
+
+        const clampLow = await imagesCase({ count: 4, seed: true });
+        const clampHigh = await imagesCase({ count: 99, seed: true });
+        check("настройка 4 читается как 5", /Сколько фото: 5/.test(clampLow.count), clampLow.count);
+        check("настройка 99 ограничена 10", /Сколько фото: 10/.test(clampHigh.count), clampHigh.count);
+
+        const settingsCase = await imagesCase({
+          seed: true,
+          after: `document.getElementById('settings').click()`
+        });
+        check("кнопка «Настройки» открывает popup.html",
+          settingsCase.tabs.length === 1 && /popup\.html$/.test(settingsCase.tabs[0]),
+          JSON.stringify(settingsCase.tabs));
+
+        const many = {};
+        const bingMany = [];
+        for (let i = 0; i < 20; i++) {
+          many["https://img.test/s" + i + ".jpg"] = { kind: "bytes", b64: IMG.jpg };
+          bingMany.push('{"murl":"https://img.test/s' + i + '.jpg"}');
+        }
+        const stopped = await imagesCase({
+          title: "Долгая загрузка", count: 5, seed: true, stop: true, delay: 1000,
+          bing: bingMany.join(" "), yandex: "", images: many
+        });
+        check("остановка не ждёт загрузок и называет записанное",
+          /Остановлено/.test(stopped.status) && stopped.files.length === 0 && stopped.startHidden === false,
+          JSON.stringify({ status: stopped.status, files: stopped.files }));
+      } catch (e) {
+        check("окно подбора не роняет набор", false, String((e && e.message) || e));
+      }
+    }
+
     const savedLinks = await evalJs(`(async () => {
       document.getElementById('linkSites').value = 'auto-dom24.ru\\n# мой второй канал\\nhttps://example.com/';
       document.getElementById('linkChannels').value = 'https://dzen.ru/auto-dom24.ru\\n# второй\\nhttps://dzen.ru/id/123';

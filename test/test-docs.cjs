@@ -123,6 +123,11 @@ const bg = read("background.js");
 const content = read("content.js");
 const popup = read("popup.js");
 const popupHtml = read("popup.html");
+// Окно подбора переезжает в сборку в этой же версии. Пустое чтение превращает
+// пропавший файл в обычный провал проверки, а не в падение всего набора.
+const imagesHtml = (() => {
+  try { return read("images.html"); } catch (e) { return ""; }
+})();
 const presets = read("presets.js");
 const manifest = JSON.parse(read("manifest.json"));
 const readme = read("README.md");
@@ -705,12 +710,18 @@ console.log("\n=== состав обновления против списка �
   }
   const updSrc = fs.readFileSync(path.join(paths.REPO, "src", "extension-src", "update.js"), "utf8");
   const upd = new Function(updSrc + "\nreturn DzenUpdate;")();
-  const need = upd.updateFileSet(manifest, { "popup.html": popupHtml });
+  const need = upd.updateFileSet(manifest, { "popup.html": popupHtml, "images.html": imagesHtml });
   check("обновление просит ненулевой состав", need.length > 0, need.join(", "));
   const absent = need.filter((p) => shipped.indexOf(p) < 0);
   check("каждый нужный файл в списке сборки", absent.length === 0, absent.join(", "));
   const notThere = need.filter((p) => !fs.existsSync(path.join(EXT, p)));
   check("каждый нужный файл лежит в собранной папке", notThere.length === 0, notThere.join(", "));
+  check("манифест: окно подбора — страница параметров",
+    manifest.options_ui && manifest.options_ui.page === "images.html",
+    JSON.stringify(manifest.options_ui));
+  check("окно подбора подключает свой скрипт",
+    /<script\b[^>]*\ssrc\s*=\s*["']images-page\.js["']/.test(imagesHtml),
+    "нет images-page.js в images.html");
   // Обратная связь: сборщик не должен носить файл, о котором обновление не знает,
   // иначе в пакете заведётся мёртвый груз и «обновить» его никогда не принесёт.
   const extra = shipped.filter((p) => p !== "README.md" && need.indexOf(p) < 0);

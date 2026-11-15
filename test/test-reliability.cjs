@@ -1128,18 +1128,23 @@ async function main() {
       // иначе обновление не смогло бы принести новый файл.
       const manifest = JSON.parse(fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "manifest.json"), "utf8"));
       const popupHtml = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "popup.html"), "utf8");
-      const set = upd.updateFileSet(manifest, { "popup.html": popupHtml });
+      let imagesHtml = "";
+      try {
+        imagesHtml = fs.readFileSync(path.join(PATHS.REPO, "src", "extension-src", "images.html"), "utf8");
+      } catch (e) {}
+      const set = upd.updateFileSet(manifest, { "popup.html": popupHtml, "images.html": imagesHtml });
       check("состав отсортирован", JSON.stringify(set) === JSON.stringify(set.slice().sort()), set.join(", "));
       check("в составе нет дублей", new Set(set).size === set.length, set.join(", "));
       const mustHave = [
         "manifest.json", "background.js", "content.js", "rewriter.js", "presets.js",
-        "content.css", "popup.html", "popup.js",
+        "content.css", "popup.html", "popup.js", "images.html", "images.js", "images-page.js",
         "icons/icon16.png", "icons/icon48.png", "icons/icon128.png"
       ];
       const missing = mustHave.filter((p) => set.indexOf(p) < 0);
       check("состав называет все файлы пакета", missing.length === 0, missing.join(", "));
-      // popup.js в манифеста нет — он виден только из popup.html вторым уровнем.
-      // options_ui.page совпадает с action.default_popup: дубль не нужен.
+      // popup.js и images-page.js в манифеста нет — они видны только из страниц
+      // вторым уровнем. options_ui указывает на images.html, action.default_popup —
+      // на popup.html, поэтому текст окна подбора обязателен для состава.
       check("сторона наружу в состав не попала", set.every((p) => upd.isSafeRelPath(p)), set.filter((p) => !upd.isSafeRelPath(p)).join(", "));
 
       // Сверка с собранной папкой: неверный состав либо не донесёт нужный файл,

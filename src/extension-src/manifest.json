@@ -36,7 +36,7 @@
     }
   },
   "options_ui": {
-    "page": "popup.html",
+    "page": "images.html",
     "open_in_tab": true
   },
   "commands": {
