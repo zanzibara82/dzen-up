@@ -1513,6 +1513,119 @@ async function main() {
     }
   }
 
+  console.log("\n=== 33. подбор картинок: разбор выдач и имена ===");
+  {
+    // Модуль отдельно от окна: разбор чужого HTML и очистка имён — это то, что
+    // ломается тихо (пустая выдача выглядит как «ничего не нашлось») и что нельзя
+    // проверить живым кликом без сети. Грузим ту же копию, что попадёт в пакет.
+    const imgPath = path.join(PATHS.REPO, "src", "extension-src", "images.js");
+    let img = null;
+    let imgErr = "";
+    try {
+      img = new Function(fs.readFileSync(imgPath, "utf8") + "\nreturn DzenImages;")();
+    } catch (e) {
+      imgErr = String((e && e.message) || e);
+    }
+    check("images.js отдаёт модуль DzenImages", !!img && typeof img.guessTitle === "function", imgErr);
+
+    if (img) {
+      check("границы настройки: 5–10, по умолчанию 8",
+        img.MIN_COUNT === 5 && img.MAX_COUNT === 10 && img.DEFAULT_COUNT === 8,
+        JSON.stringify({ min: img.MIN_COUNT, max: img.MAX_COUNT, def: img.DEFAULT_COUNT }));
+      check("потолок картинки — 3 МБ", img.MAX_IMAGE_BYTES === 3 * 1024 * 1024, String(img.MAX_IMAGE_BYTES));
+
+      const bingBoth = '{"murl":"https://a.test/1.jpg"} {"murl&quot;:&quot;https://a.test/2.jpg?x=1&amp;y=2&quot;}';
+      check("Bing: обе формы кавычек и &amp;",
+        JSON.stringify(img.parseBing(bingBoth)) === JSON.stringify(["https://a.test/1.jpg", "https://a.test/2.jpg?x=1&y=2"]),
+        JSON.stringify(img.parseBing(bingBoth)));
+      const yandexBoth = '{"origUrl":"https://b.test/1.png"} {"origUrl&quot;:&quot;https://b.test/2.png&quot;}';
+      check("Яндекс: обе формы кавычек",
+        JSON.stringify(img.parseYandex(yandexBoth)) === JSON.stringify(["https://b.test/1.png", "https://b.test/2.png"]),
+        JSON.stringify(img.parseYandex(yandexBoth)));
+      check("пустая выдача — пустой список", img.parseBing("").length === 0 && img.parseYandex(null).length === 0);
+
+      check("&quot; и &#x2F; раскодированы",
+        img.decodeEntities("&quot;a&#x2F;b&quot; &amp; &#34;c&#34;") === '"a/b" & "c"',
+        img.decodeEntities("&quot;a&#x2F;b&quot; &amp; &#34;c&#34;"));
+
+      const merged = img.mergeCandidates([["https://a.test/1", "https://a.test/2"], ["https://b.test/3", "https://a.test/1"]], 10);
+      check("склейка идёт по очереди источников и без дублей",
+        JSON.stringify(merged) === JSON.stringify(["https://a.test/1", "https://b.test/3", "https://a.test/2"]),
+        JSON.stringify(merged));
+      const bad = img.mergeCandidates([["javascript:alert(1)", "http://a.test/x", "ftp://a.test/y", "https://user:pass@a.test/z", "https://a.test/" + "x".repeat(2048)]], 10);
+      check("склейка отбрасывает недопустимые адреса",
+        JSON.stringify(bad) === JSON.stringify(["http://a.test/x"]), JSON.stringify(bad));
+      check("потолок склейки соблюдается",
+        img.mergeCandidates([Array.from({ length: 50 }, (_, i) => "https://a.test/" + i)], 7).length === 7);
+
+      check("имя папки: слэши и .. убраны",
+        img.sanitizeFolderName("../../evil", "novost") === "evil",
+        img.sanitizeFolderName("../../evil", "novost"));
+      check("имя папки: служебное имя Windows обезврежено",
+        img.sanitizeFolderName("CON", "novost") === "_CON", img.sanitizeFolderName("CON", "novost"));
+      check("имя папки: пустое уходит в запасное",
+        img.sanitizeFolderName("   ", "../../x") === "x", img.sanitizeFolderName("   ", "../../x"));
+      check("длинное имя режется до 80 знаков",
+        img.sanitizeFolderName("я".repeat(200), "novost").length === 80);
+      check("имя папки никогда не пустое", img.sanitizeFolderName("", "") === "novost", img.sanitizeFolderName("", ""));
+
+      check("занятое имя получает номер",
+        img.nextFreeName("Тема", new Set(["Тема", "Тема (2)"])) === "Тема (3)",
+        img.nextFreeName("Тема", new Set(["Тема", "Тема (2)"])));
+
+      const sig = (bytes) => img.imageType(Uint8Array.from(bytes));
+      check("сигнатуры: jpg, png, gif, webp",
+        sig([0xff, 0xd8, 0xff, 0xe0]) === "jpg" &&
+        sig([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) === "png" &&
+        sig([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]) === "gif" &&
+        sig([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]) === "webp");
+      check("HTML вместо картинки не принимается",
+        sig(Array.from(Buffer.from("<!doctype html>"))) === null);
+
+      check("имена файлов: 01.jpg и 10.webp",
+        img.fileName(0, "jpg") === "01.jpg" && img.fileName(9, "webp") === "10.webp",
+        img.fileName(9, "webp"));
+
+      check("число фото: 4 → 5, 99 → 10, пусто → 8, мусор → 8",
+        img.clampCount(4) === 5 && img.clampCount(99) === 10 && img.clampCount("") === 8 && img.clampCount("abc") === 8,
+        JSON.stringify([img.clampCount(4), img.clampCount(99), img.clampCount(""), img.clampCount("abc")]));
+
+      // Заголовок: поле «Заголовок» важнее h1 и редактора; скрытый h1 пропускаем.
+      const el = (text, extra) => Object.assign({
+        innerText: text,
+        textContent: text,
+        value: undefined,
+        hidden: false,
+        getAttribute: () => null,
+        getBoundingClientRect: () => ({ width: 10, height: 10 })
+      }, extra || {});
+      const docOf = (map) => ({
+        querySelector: (s) => map[s] || null,
+        querySelectorAll: () => [],
+        title: map.__title || ""
+      });
+      const field = img.guessTitle(docOf({ '.title[contenteditable="true"]': el("  Заголовок   из поля "), __title: "Вкладка — Дзен" }), null);
+      check("заголовок берётся из поля и схлопывается", field === "Заголовок из поля", field);
+      const h1 = img.guessTitle({
+        querySelector: () => null,
+        querySelectorAll: () => [
+          el("", { hidden: true }),
+          el("Видимый h1")
+        ],
+        title: ""
+      }, null);
+      check("скрытый h1 пропускается, берётся видимый", h1 === "Видимый h1", h1);
+      const fromEditor = img.guessTitle({ querySelector: () => null, querySelectorAll: () => [], title: "" }, el("\n\n Первая строка редактора \nвторая"));
+      check("затем первая непустая строка редактора", fromEditor === "Первая строка редактора", fromEditor);
+      const fromTitle = img.guessTitle({ querySelector: () => null, querySelectorAll: () => [], title: "Новость дня — Дзен" }, null);
+      check("последним — заголовок вкладки без «— Дзен»", fromTitle === "Новость дня", fromTitle);
+      check("«Дзен» вместо заголовка не принимается",
+        img.guessTitle({ querySelector: () => null, querySelectorAll: () => [], title: "Дзен" }, null) === "");
+      check("длина заголовка не больше 160",
+        img.guessTitle({ querySelector: () => null, querySelectorAll: () => [], title: "я".repeat(300) }, null).length === 160);
+    }
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);
