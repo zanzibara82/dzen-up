@@ -1639,10 +1639,24 @@ async function main() {
       const added = await c.send("Page.addScriptToEvaluateOnNewDocument", { source: stub }, sessionId);
       try {
         await evalJs(`location.reload()`);
+        // Признак готовности висит на documentElement и после reload на миг
+        // принадлежит ещё старому документу — по нему цикл выходил сразу, и
+        // клики попадали в страницу без обработчиков. Ждём также маркер,
+        // который ставит сама подстановка: в старом документе его нет.
         for (let i = 0; i < 40; i++) {
-          if (await evalJs(`document.documentElement?.getAttribute('data-dzr-popup') === 'ready'`)) break;
+          let ok = false;
+          try {
+            ok = await evalJs(`typeof window.__loadFail === 'object' &&
+              document.documentElement?.getAttribute('data-dzr-popup') === 'ready'`);
+          } catch (e) {
+            ok = false; // контекст прежнего документа мог исчезнуть посреди reload
+          }
+          if (ok) break;
           await sleep(150);
         }
+        check("сбой чтения: страница перезагружена с подстановкой",
+          await evalJs(`typeof window.__loadFail === 'object'`),
+          "ждали window.__loadFail от подстановки");
         const loadFail = await evalJs(`(async () => {
           const st = document.getElementById('settings-status');
           const initial = st.textContent;
