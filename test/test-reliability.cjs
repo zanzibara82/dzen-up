@@ -1626,6 +1626,29 @@ async function main() {
     }
   }
 
+  console.log("\n=== 34. рукоять папки: помощники update.js ===");
+  {
+    // Рукоять — единственный ключ к папке установки, и её читают уже двое: попап
+    // и окно подбора. Вторая копия имён базы и хранилища рано или поздно
+    // разъехалась бы, поэтому помощники живут в update.js, а не в попапе.
+    try {
+      const updPath = path.join(PATHS.REPO, "src", "extension-src", "update.js");
+      const mem = require("./fixtures/memory-idb.cjs");
+      const upd = new Function("indexedDB", fs.readFileSync(updPath, "utf8") + "\nreturn DzenUpdate;")(mem);
+      const names = ["openUpdateDb", "withUpdateStore", "saveDirHandle", "loadDirHandle", "forgetDirHandle"];
+      check("update.js отдаёт помощники рукояти",
+        names.every((n) => typeof upd[n] === "function"),
+        names.filter((n) => typeof upd[n] !== "function").join(", "));
+      const handle = { name: "dzen-rewriter", kind: "directory" };
+      await upd.saveDirHandle(handle);
+      check("рукоять читается той же", (await upd.loadDirHandle()) === handle);
+      await upd.forgetDirHandle();
+      check("рукоять забывается", (await upd.loadDirHandle()) === undefined);
+    } catch (e) {
+      check("помощники рукояти не роняют набор", false, String((e && e.message) || e));
+    }
+  }
+
   console.log("\n=== ИТОГ ===");
   const bad = results.filter((r) => !r.ok);
   console.log("всего проверок: %d, провалов: %d", results.length, bad.length);

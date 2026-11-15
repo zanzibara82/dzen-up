@@ -137,13 +137,68 @@ var DzenUpdate = (function () {
     return out;
   }
 
+  // ---------------------------------------------------------- рукоять папки ---
+  // Рукоять выбранной папки установки живёт в IndexedDB: класть её в
+  // chrome.storage нельзя — structured clone не переносит методы FileSystemHandle.
+  // Читают её попап и окно подбора, поэтому код один и лежит здесь.
+  function openUpdateDb() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = function () {
+        resolve(req.result);
+      };
+      req.onerror = function () {
+        reject(req.error || new Error("не открылась IndexedDB"));
+      };
+    });
+  }
+
+  function withUpdateStore(mode, fn) {
+    return openUpdateDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(IDB_STORE, mode);
+        var req = fn(tx.objectStore(IDB_STORE));
+        tx.oncomplete = function () {
+          db.close();
+          resolve(req ? req.result : undefined);
+        };
+        tx.onerror = function () {
+          db.close();
+          reject(tx.error || new Error("IndexedDB не приняла запись"));
+        };
+      });
+    });
+  }
+
+  function saveDirHandle(handle) {
+    return withUpdateStore("readwrite", function (s) {
+      return s.put(handle, IDB_KEY);
+    });
+  }
+
+  function loadDirHandle() {
+    return withUpdateStore("readonly", function (s) {
+      return s.get(IDB_KEY);
+    });
+  }
+
+  function forgetDirHandle() {
+    return withUpdateStore("readwrite", function (s) {
+      return s.delete(IDB_KEY);
+    });
+  }
+
   /**
    * Состав файлов, которые умеет приносить обновление: из манифеста и со
    * страниц, которые он называет. Второй уровень только у страниц — все
    * страницы уже перечислены в манифесте, а `popup.js` виден лишь из `popup.html`.
    *
    * Возвращается отсортированный набор без дублей: `options_ui.page` и
-   * `action.default_popup` — один файл, и просить его дважды незачем.
+   * `action.default_popup` могут совпадать, и включать такой файл дважды незачем.
    */
   function updateFileSet(manifest, htmlTexts) {
     var found = {};
@@ -313,6 +368,11 @@ var DzenUpdate = (function () {
     IDB_NAME: IDB_NAME,
     IDB_STORE: IDB_STORE,
     IDB_KEY: IDB_KEY,
+    openUpdateDb: openUpdateDb,
+    withUpdateStore: withUpdateStore,
+    saveDirHandle: saveDirHandle,
+    loadDirHandle: loadDirHandle,
+    forgetDirHandle: forgetDirHandle,
     isSafeRelPath: isSafeRelPath,
     updateFileSet: updateFileSet,
     planUpdate: planUpdate,

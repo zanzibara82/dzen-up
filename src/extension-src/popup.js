@@ -707,46 +707,14 @@
   // ---- рукоять папки установки и автообновление ----------------------------
   // Рукоять FileSystemDirectoryHandle не переживает chrome.storage: structured
   // clone не переносит её методы. Единственное место, где она хранится между
-  // открытиями попапа, — IndexedDB страницы расширения. Имена базы, хранилища и
-  // ключа живут в update.js: их сверяют и юнит-набор, и браузерный.
-  function openUpdateDb() {
-    return new Promise(function (resolve, reject) {
-      var req = indexedDB.open(DzenUpdate.IDB_NAME, 1);
-      req.onupgradeneeded = function () {
-        var db = req.result;
-        if (!db.objectStoreNames.contains(DzenUpdate.IDB_STORE)) db.createObjectStore(DzenUpdate.IDB_STORE);
-      };
-      req.onsuccess = function () { resolve(req.result); };
-      req.onerror = function () { reject(req.error || new Error("не открылась IndexedDB")); };
-    });
-  }
-
-  function withUpdateStore(mode, fn) {
-    return openUpdateDb().then(function (db) {
-      return new Promise(function (resolve, reject) {
-        var tx = db.transaction(DzenUpdate.IDB_STORE, mode);
-        var req = fn(tx.objectStore(DzenUpdate.IDB_STORE));
-        tx.oncomplete = function () { db.close(); resolve(req ? req.result : undefined); };
-        tx.onerror = function () { db.close(); reject(tx.error || new Error("IndexedDB не приняла запись")); };
-      });
-    });
-  }
-
-  function saveDirHandle(handle) {
-    return withUpdateStore("readwrite", function (s) { return s.put(handle, DzenUpdate.IDB_KEY); });
-  }
-  function loadDirHandle() {
-    return withUpdateStore("readonly", function (s) { return s.get(DzenUpdate.IDB_KEY); });
-  }
-  function forgetDirHandle() {
-    return withUpdateStore("readwrite", function (s) { return s.delete(DzenUpdate.IDB_KEY); });
-  }
+  // открытиями попапа, — IndexedDB страницы расширения. Читают её двое — попап
+  // и окно подбора, — поэтому помощники живут в update.js, а не здесь.
 
   // Рукоять читается при открытии попапа, а не в клик: право на папку Chrome
   // принимает только синхронно с жестом, и к моменту ответа IndexedDB жест уже
   // потрачен. Поэтому решение «диалог или запрос права» принимается по кэшу.
   var dirHandle = null;
-  loadDirHandle()
+  DzenUpdate.loadDirHandle()
     .then(function (h) { dirHandle = h || null; return inspectUpdateIntent(); })
     .catch(function () { dirHandle = null; });
 
@@ -754,7 +722,7 @@
   // открытие не предлагало писать не туда.
   function rejectInstallDir(reason) {
     dirHandle = null;
-    forgetDirHandle().catch(function () {});
+    DzenUpdate.forgetDirHandle().catch(function () {});
     setUpdateStatus("❌ " + reason + " — ни один файл не тронут. Выберите папку этого расширения заново.", "err");
   }
 
@@ -832,7 +800,7 @@
         rejectInstallDir(human);
         return;
       }
-      await saveDirHandle(root);
+      await DzenUpdate.saveDirHandle(root);
       var pkg = await send({ type: "updatePackage" });
       if (!pkg || !pkg.ok) {
         setUpdateStatus("❌ " + ((pkg && pkg.error) || "фон не ответил") + " — папка «" + root.name + "» не тронута.", "err");
